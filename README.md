@@ -32,8 +32,9 @@ cd "$UBS_ROOT"
 HCOM_BUILD_TYPE=release \
 HCOM_BUILD_SERVICE=on \
 HCOM_BUILD_RDMA=on \
-HCOM_BUILD_SOCK=on \
-HCOM_BUILD_SHM=on \
+HCOM_BUILD_UB=off \
+HCOM_BUILD_SOCK=off \
+HCOM_BUILD_SHM=off \
 HCOM_BUILD_TESTS=off \
 HCOM_BUILD_EXAMPLE=off \
 BUILD_HCOM=ON \
@@ -49,8 +50,9 @@ bash ./build.sh
 ```bash
 test -f "$UBS_ROOT/dist/hcom/lib/libhcom_static.a"
 test -f "$UBS_ROOT/dist/hcom/include/hcom/hcom_service.h"
-test -f "$UBS_ROOT/dist/hcom_3rdparty/libboundscheck/lib/libboundscheck.so"
-test -d "$UBS_ROOT/dist/hcom_3rdparty/umdk/urma/include"
+test -f "$UBS_ROOT/dist/hcom/include/hcom/hcom_service_context.h"
+test -f "$UBS_ROOT/dist/hcom_3rdparty/libboundscheck/lib/libboundscheck.so" || \
+  test -f "$UBS_ROOT/dist/hcom_3rdparty/libboundscheck/lib/libboundscheck.a"
 ```
 
 ### 2. 构建 rdma_600
@@ -75,22 +77,29 @@ bash ./build.sh --ubs-root "$UBS_ROOT" \
   --jobs 16
 ```
 
+若此前复用过旧构建目录，其中的 `CMakeCache.txt` 可能仍显示已经从工程中删除的
+缓存项。请改用新的 `--build-dir`，或先清理旧构建目录再重新配置；当前源工程不会
+读取这些旧缓存项。
+
 若 HCOM 安装目录不是标准的 `$UBS_ROOT/dist` 布局，可将每个路径作为脚本参数传入：
 
 ```bash
 bash ./build.sh \
   --hcom-include /absolute/path/to/dist/hcom/include \
   --hcom-lib /absolute/path/to/dist/hcom/lib \
-  --hcom-3rdparty /absolute/path/to/dist/hcom_3rdparty \
-  --urma-include /absolute/path/to/umdk/urma/include
+  --boundscheck-root /absolute/path/to/dist/hcom_3rdparty/libboundscheck
 ```
 
 也可通过环境变量 `UBS_ROOT`、`HCOM_INCLUDE_DIR`、`HCOM_LIB_DIR`、
-`HCOM_3RDPARTY_DIR`、`URMA_INCLUDE_DIR`、`BUILD_DIR`、`CMAKE_BUILD_TYPE` 和
+`BOUNDSCHECK_ROOT`、`BUILD_DIR`、`CMAKE_BUILD_TYPE` 和
 `JOBS` 提供同样的构建参数。若要传递其他 CMake 配置参数，将它们置于 `--` 后，
 例如 `bash ./build.sh --ubs-root "$UBS_ROOT" -- -G Ninja`。
 
-构建所需的已验证依赖名称与 ubs-comm 自带 perf CMake 一致：`hcom_static`、`boundscheck`、pthread、dl 与（存在时）rt。配置失败时先核实实际 `dist` 路径和目标机器的构建产物；不要把 Windows 路径复制到 Linux 命令中。
+本程序只使用 HCOM 的 RDMA service 公共 API。直接编译依赖为 HCOM 公共头文件、
+`libhcom_static.a` 和 `boundscheck`（公共头 `hcom_service_def.h` 直接包含
+`securec.h`），链接依赖为 pthread、dl 与平台存在时的 rt。程序不包含 URMA
+头文件；配套的 ubs-comm 构建也只启用 service/RDMA，显式关闭 UB、SOCK 和 SHM。
+配置失败时先核实实际 `dist` 路径和目标机器的构建产物；不要把 Windows 路径复制到 Linux 命令中。
 
 ## 无硬件逻辑检查
 
@@ -107,7 +116,7 @@ bash ./build.sh \
 先在 receiver 机器启动。`LISTENING` 仅供外部进程编排；真正的 READY 只会在 receiver 已分配、触页并注册 staging MR 后通过 HCOM HELLO/Reply 返回。
 
 ```bash
-export LD_LIBRARY_PATH="$UBS_ROOT/dist/hcom/lib:$UBS_ROOT/dist/hcom_3rdparty/libboundscheck/lib:${LD_LIBRARY_PATH:-}"
+export LD_LIBRARY_PATH="$UBS_ROOT/dist/hcom_3rdparty/libboundscheck/lib:${LD_LIBRARY_PATH:-}"
 
 ./build/rdma_600 --role receiver \
   --rdma-ip <receiver_nic0_rdma_ip> \
@@ -120,7 +129,7 @@ export LD_LIBRARY_PATH="$UBS_ROOT/dist/hcom/lib:$UBS_ROOT/dist/hcom_3rdparty/lib
 在 sender 机器启动匹配参数：
 
 ```bash
-export LD_LIBRARY_PATH="$UBS_ROOT/dist/hcom/lib:$UBS_ROOT/dist/hcom_3rdparty/libboundscheck/lib:${LD_LIBRARY_PATH:-}"
+export LD_LIBRARY_PATH="$UBS_ROOT/dist/hcom_3rdparty/libboundscheck/lib:${LD_LIBRARY_PATH:-}"
 
 ./build/rdma_600 --role sender \
   --rdma-ip <sender_nic0_rdma_ip> \
@@ -135,7 +144,10 @@ export LD_LIBRARY_PATH="$UBS_ROOT/dist/hcom/lib:$UBS_ROOT/dist/hcom_3rdparty/lib
 ## SSH 跑测脚本
 
 从示例生成本地私有配置，填入真实主机、绝对部署路径、OOB IP、RDMA IP 和 CPU；不要向该文件加入密码。
-每台主机的 `library_dirs` 必须同时包含 HCOM 与 `libboundscheck` 的库目录，脚本会按该列表组装远端 `LD_LIBRARY_PATH` 并记录每个实际路径。为兼容已有私有配置，旧的单值 `library_dir` 仍可使用，但应在下次运行前迁移为完整的 `library_dirs` 列表：
+HCOM 已静态链接进 `rdma_600`。每台主机的 `library_dirs` 只需列出实际的
+动态运行时依赖；默认构建使用共享 boundscheck 时，只保留其库目录即可。脚本会按
+该列表组装远端 `LD_LIBRARY_PATH` 并记录每个实际路径。为兼容已有私有配置，旧的
+单值 `library_dir` 仍可使用，但应在下次运行前迁移为 `library_dirs`：
 
 ```bash
 cp hosts.example.json hosts.json

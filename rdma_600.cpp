@@ -45,6 +45,8 @@
 #include <time.h>
 
 #include "hcom/hcom_service.h"
+// This HCOM release only forward-declares UBSHcomServiceContext in hcom_service.h.
+#include "hcom/hcom_service_context.h"
 
 #ifndef RDMA_600_GIT_COMMIT
 #define RDMA_600_GIT_COMMIT "unknown"

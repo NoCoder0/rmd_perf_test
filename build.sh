@@ -17,8 +17,7 @@ Options:
   --ubs-root <path>          ubs-comm root; derives all HCOM artifact paths.
   --hcom-include <path>      directory containing hcom/hcom_service.h.
   --hcom-lib <path>          directory containing libhcom_static.a.
-  --hcom-3rdparty <path>     dist/hcom_3rdparty directory.
-  --urma-include <path>      URMA include directory.
+  --boundscheck-root <path>  directory containing boundscheck include/ and lib/.
   --build-dir <path>         CMake build directory (default: ./build).
   --build-type <type>        CMake build type (default: Release).
   --jobs <count>             parallel build jobs (default: detected CPUs).
@@ -51,8 +50,7 @@ require_directory() {
 ubs_root="${UBS_ROOT:-}"
 hcom_include="${HCOM_INCLUDE_DIR:-}"
 hcom_lib="${HCOM_LIB_DIR:-}"
-hcom_3rdparty="${HCOM_3RDPARTY_DIR:-}"
-urma_include="${URMA_INCLUDE_DIR:-}"
+boundscheck_root="${BOUNDSCHECK_ROOT:-}"
 build_dir="${BUILD_DIR:-${SCRIPT_DIR}/build}"
 build_type="${CMAKE_BUILD_TYPE:-Release}"
 jobs="${JOBS:-}"
@@ -75,14 +73,9 @@ while [[ $# -gt 0 ]]; do
             hcom_lib="$2"
             shift 2
             ;;
-        --hcom-3rdparty)
+        --boundscheck-root)
             require_value "$@"
-            hcom_3rdparty="$2"
-            shift 2
-            ;;
-        --urma-include)
-            require_value "$@"
-            urma_include="$2"
+            boundscheck_root="$2"
             shift 2
             ;;
         --build-dir)
@@ -120,28 +113,25 @@ if [[ -n "$ubs_root" ]]; then
     ubs_root="$(cd -- "$ubs_root" && pwd -P)"
     hcom_include="${hcom_include:-${ubs_root}/dist/hcom/include}"
     hcom_lib="${hcom_lib:-${ubs_root}/dist/hcom/lib}"
-    hcom_3rdparty="${hcom_3rdparty:-${ubs_root}/dist/hcom_3rdparty}"
+    boundscheck_root="${boundscheck_root:-${ubs_root}/dist/hcom_3rdparty/libboundscheck}"
 fi
 
 [[ -n "$hcom_include" ]] || die "provide --ubs-root or --hcom-include"
 [[ -n "$hcom_lib" ]] || die "provide --ubs-root or --hcom-lib"
 
-if [[ -z "$hcom_3rdparty" ]]; then
+if [[ -z "$boundscheck_root" ]]; then
     hcom_dir="$(dirname -- "$hcom_include")"
     dist_dir="$(dirname -- "$hcom_dir")"
-    hcom_3rdparty="${dist_dir}/hcom_3rdparty"
+    boundscheck_root="${dist_dir}/hcom_3rdparty/libboundscheck"
 fi
-urma_include="${urma_include:-${hcom_3rdparty}/umdk/urma/include}"
 
 require_directory "--hcom-include" "$hcom_include"
 require_directory "--hcom-lib" "$hcom_lib"
-require_directory "--hcom-3rdparty" "$hcom_3rdparty"
-require_directory "--urma-include" "$urma_include"
+require_directory "--boundscheck-root" "$boundscheck_root"
 
 hcom_include="$(cd -- "$hcom_include" && pwd -P)"
 hcom_lib="$(cd -- "$hcom_lib" && pwd -P)"
-hcom_3rdparty="$(cd -- "$hcom_3rdparty" && pwd -P)"
-urma_include="$(cd -- "$urma_include" && pwd -P)"
+boundscheck_root="$(cd -- "$boundscheck_root" && pwd -P)"
 
 if [[ -z "$jobs" ]]; then
     if command -v nproc >/dev/null 2>&1; then
@@ -163,6 +153,5 @@ cmake -S "$SCRIPT_DIR" -B "$build_dir" \
     -DCMAKE_BUILD_TYPE="$build_type" \
     -DHCOM_INCLUDE_DIR="$hcom_include" \
     -DHCOM_LIB_DIR="$hcom_lib" \
-    -DHCOM_3RDPARTY_DIR="$hcom_3rdparty" \
-    -DURMA_INCLUDE_DIR="$urma_include"
+    -DBOUNDSCHECK_ROOT="$boundscheck_root"
 cmake --build "$build_dir" --parallel "$jobs"
