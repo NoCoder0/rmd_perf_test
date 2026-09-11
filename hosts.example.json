@@ -1,0 +1,37 @@
+{
+  "sender": {
+    "ssh": "user@sender-management-host",
+    "binary": "/absolute/deploy/path/rdma_600",
+    "library_dir": "/absolute/deploy/path/ubs-comm/dist/hcom/lib",
+    "rdma_ips": [
+      "<sender_nic0_rdma_ip>"
+    ],
+    "app_cpu": 2,
+    "worker_cpus": [
+      3
+    ]
+  },
+  "receiver": {
+    "ssh": "user@receiver-management-host",
+    "binary": "/absolute/deploy/path/rdma_600",
+    "library_dir": "/absolute/deploy/path/ubs-comm/dist/hcom/lib",
+    "oob_ip": "<receiver_oob_ip>",
+    "oob_ports": [
+      19000
+    ],
+    "rdma_ips": [
+      "<receiver_nic0_rdma_ip>"
+    ],
+    "app_cpu": 2,
+    "worker_cpus": [
+      3
+    ]
+  },
+  "stage1": {
+    "verify_rounds": 20,
+    "warmup_rounds": 1000,
+    "measure_rounds": 10000,
+    "timeout_sec": 10,
+    "process_timeout_sec": 600
+  }
+}
