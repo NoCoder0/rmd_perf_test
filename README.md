@@ -17,11 +17,46 @@
 
 ## 构建
 
-在目标 Linux 机器上先按 ubs-comm 的正常流程生成 RDMA HCOM 产物。此项目只链接这些已构建产物，不会自动下载依赖、构建 ubs-comm 或安装软件包。
+以下命令应在目标 Linux 机器上执行。本项目的 CMake 只会链接已构建的
+ubs-comm / HCOM 产物；它不会自动下载依赖、构建 ubs-comm 或安装软件包。
+
+### 1. 构建 ubs-comm 的 HCOM RDMA 产物
+
+先确保目标机上的 RDMA 驱动、设备和 ubs-comm 所需依赖已经按该项目要求就绪，
+然后在 ubs-comm 根目录运行其自带构建脚本：
+
+```bash
+UBS_ROOT=/absolute/path/to/ubs-comm
+cd "$UBS_ROOT"
+
+HCOM_BUILD_TYPE=release \
+HCOM_BUILD_SERVICE=on \
+HCOM_BUILD_RDMA=on \
+HCOM_BUILD_SOCK=on \
+HCOM_BUILD_SHM=on \
+HCOM_BUILD_TESTS=off \
+HCOM_BUILD_EXAMPLE=off \
+BUILD_HCOM=ON \
+bash ./build.sh
+```
+
+该脚本会创建（并在每次构建前重新生成）`$UBS_ROOT/tmp_build_dir` 和
+`$UBS_ROOT/dist/hcom`。如需清理这些生成目录，可显式执行
+`bash ./build.sh clean`；不要在其中保留未备份的手工文件。
+
+构建成功后，至少确认本测试需要的 HCOM 和第三方产物存在：
+
+```bash
+test -f "$UBS_ROOT/dist/hcom/lib/libhcom_static.a"
+test -f "$UBS_ROOT/dist/hcom/include/hcom/hcom_service.h"
+test -f "$UBS_ROOT/dist/hcom_3rdparty/libboundscheck/lib/libboundscheck.so"
+test -d "$UBS_ROOT/dist/hcom_3rdparty/umdk/urma/include"
+```
+
+### 2. 构建 rdma_600
 
 ```bash
 PERF_ROOT=/absolute/path/to/rmd_perf_test
-UBS_ROOT=/absolute/path/to/ubs-comm
 
 cmake -S "$PERF_ROOT" -B "$PERF_ROOT/build" \
   -DCMAKE_BUILD_TYPE=Release \
