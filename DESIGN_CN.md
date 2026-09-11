@@ -54,7 +54,7 @@ perf_test/
   DESIGN_CN.md            本设计
   rdma_600.cpp             后续：server/client 共用一个 C++ 程序
   CMakeLists.txt           后续：链接当前 ubs-comm 的构建产物
-  run.py                  后续：标准库 subprocess + ssh，启动并保存结果
+  run.py                  后续：标准库 subprocess，在每台主机启动本地角色并保存结果
 ```
 
 不新增通用 benchmark 框架，不复制 memfabric 抽象，不做自动重连、动态负载均衡、通用内存池、Python 数据面或自定义 RDMA QP 管理。
@@ -187,7 +187,7 @@ sender：  所有 rail READY，预生成描述符，然后开始验证和预热
 
 某一条 rail READY 不代表整组 READY。连接建立后不得再清零正在接收数据的 staging；所有代际状态从 generation=1 单调递增，验证、预热、测量切换时不重置 generation。
 
-Python 包装最小职责：通过系统 `ssh` 启动 receiver，读其 stdout 的 `LISTENING` 行，再启动 sender；等待退出、保存 JSONL/stdout/stderr。`LISTENING` 只是进程编排信号，真正数据面 READY 由 C++ 协议保证。
+Python 包装最小职责：receiver 主机以 `--role receiver` 启动本地 receiver 并实时输出 `LISTENING`；确认后，sender 主机以 `--role sender` 启动本地 sender。两端各自等待退出并保存本机 JSONL/stdout/stderr。`LISTENING` 只是进程编排信号，真正数据面 READY 由 C++ 协议保证。
 
 不需要 Python 交换 QPN、PSN、GID 或 MR key，也不需要 Python 每轮发消息。可直接在两个终端手工启动 C++ 程序，结果应与 Python 包装一致。
 

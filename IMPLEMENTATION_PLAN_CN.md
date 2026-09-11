@@ -6,12 +6,12 @@
 
 原始代码基线：ubs-comm `oneside-msge-merge`，`9e4c035a5d68ccca02d05fade3b6f5907db24ef4`。
 
-本机项目位置为 `C:/code/RDMA_DEMO`；实际构建、跑测在两台 Linux 鲲鹏服务器上完成。文中的 `PERF_ROOT`、`UBS_ROOT` 是部署机器的绝对目录，由实施者根据实际环境指定，不照搬 Windows 路径。
+本机项目位置为 `C:/code/RDMA_DEMO`；实际构建、跑测在两台目标 Linux RDMA 主机完成。文中的 `PERF_ROOT`、`UBS_ROOT` 是各自主机上的绝对目录，由实施者根据实际环境指定，不照搬 Windows 路径。
 
 ## 1. 交给实施模型的总约束
 
 1. 先读设计文档、本文及工作目录适用的 `AGENTS.md`，查看现有代码与 git 状态，保留已有修改。先复用已有阶段产物，再继续实现。
-2. 实现一个小型 C++ 可执行程序，不引入 memfabric，不搬入整个 hcom perf 框架。Python 只用标准库和系统 ssh，负责启动与结果归档。
+2. 实现一个小型 C++ 可执行程序，不引入 memfabric，不搬入整个 hcom perf 框架。Python 只用标准库在各自主机启动一个角色并负责本机结果归档。
 3. 顺序为：**单链接 baseline → 双链接与打点 → SGL → WRITE_WITH_IMM**。每阶段保持前一阶段用例可运行，逐阶段形成可独立审阅的 diff 和报告。
 4. 两端总有效数据固定为每轮 600 × 1024 字节。双链接每条 300 块；源/目标 stride=4096；staging 连续；最终完成口径包含 scatter 和 ACK。
 5. 所有主 case 使用异步提交；一个 service 对应一个 RDMA 设备，每个 channel `linkCount=1`、worker poll、关闭内建 multirail；应用提交线程和 scatter 线程各一个。
@@ -36,7 +36,7 @@ perf_test/
   rdma_600.cpp
   CMakeLists.txt
   run.py
-  hosts.example.json          两端地址、绝对路径、绑核配置示例，无密码
+  hosts.example.json          sender/receiver 主机参数、绝对路径、绑核配置示例
   README.md                   已验证的编译/手工运行/脚本运行命令
   PROGRESS.md                 阶段状态、验证命令、证据路径与遗留问题
   results/<run-id>/
@@ -68,32 +68,33 @@ perf_test/
 以下为待实现的运行接口，不是已经存在的脚本。实施者可以对参数命名作小幅调整，但最终 README 必须给出复制即可执行的实际命令。
 
 ```bash
+# receiver 主机
 python3 "$PERF_ROOT/run.py" --config "$PERF_ROOT/hosts.json" \
-  --suite stage1 --kind verify --output "$PERF_ROOT/results/<run-id>"
+  --role receiver --suite stage1 --kind verify \
+  --output "$PERF_ROOT/results/<run-id>-receiver"
 
+# sender 主机，待 receiver 输出 LISTENING 后执行
 python3 "$PERF_ROOT/run.py" --config "$PERF_ROOT/hosts.json" \
-  --suite stage1 --kind measure --repeat 5 \
-  --output "$PERF_ROOT/results/<run-id>"
+  --role sender --suite stage1 --kind verify \
+  --output "$PERF_ROOT/results/<run-id>-sender"
 ```
 
-后续只增加 `--suite stage2|stage3|stage4` 和第二阶段的 `--kind trace`，不复制出四套启动脚本。`--kind verify` 可以只做验证、不做正式计时；其 JSON 不应出现可误读的正式带宽。
+measure 使用相同的双主机顺序和 `--kind measure`。每个物理 repeat 使用新的两端输出目录；脚本不跨主机协调 repeat。后续只增加 `--suite stage2|stage3|stage4` 和第二阶段的 `--kind trace`，不复制出四套启动脚本。`--kind verify` 可以只做验证、不做正式计时；其 JSON 不应出现可误读的正式带宽。
 
 配置示例的语义如下，IP、CPU 和路径均由实际机器填写：
 
 ```json
 {
   "sender": {
-    "ssh": "user@sender-host",
-    "binary": "/absolute/deploy/path/rdma_600",
-    "library_dir": "/absolute/deploy/path/lib",
+    "binary": "/absolute/path/on/sender/rdma_600",
+    "library_dirs": ["/absolute/path/on/sender/lib"],
     "rdma_ips": ["<sender_nic0_ip>", "<sender_nic1_ip>"],
     "app_cpu": 2,
     "worker_cpus": [3, 4]
   },
   "receiver": {
-    "ssh": "user@receiver-host",
-    "binary": "/absolute/deploy/path/rdma_600",
-    "library_dir": "/absolute/deploy/path/lib",
+    "binary": "/absolute/path/on/receiver/rdma_600",
+    "library_dirs": ["/absolute/path/on/receiver/lib"],
     "oob_ip": "<receiver_oob_ip>",
     "oob_ports": [19000, 19001],
     "rdma_ips": ["<receiver_nic0_ip>", "<receiver_nic1_ip>"],
@@ -103,32 +104,29 @@ python3 "$PERF_ROOT/run.py" --config "$PERF_ROOT/hosts.json" \
 }
 ```
 
-阶段 1 配置只需要每端数组中的第一项。阶段 2 验证第二张 NIC、第二个端口和第二个 worker CPU 存在且不重复。应用不假定 ssh 地址就是 OOB IP 或 RDMA IP。
+阶段 1 配置只需要每端数组中的第一项。阶段 2 验证第二张 NIC、第二个端口和第二个 worker CPU 存在且不重复。应用不假定 OOB IP 就是 RDMA IP。
 
-脚本工作流程：
+脚本工作流程：两台主机各运行一次，receiver 的 `LISTENING` 由人工或外部调度器作为 sender 的启动信号。
 
 ```python
 cfg = load_and_validate_config()
-cases = select_cases_for_suite()
-for repeat in range(repeats):
-    for case in balanced_case_order(cases, repeat):
-        create_fresh_result_directory()
-        record_versions_and_effective_arguments()
-        receiver = start_via_ssh(receiver_argv, log_files)
-        wait_for_stdout_record(receiver, "LISTENING", startup_deadline)
-        sender = start_via_ssh(sender_argv, log_files)
-        wait_for_both_exit_with_deadline()
-        validate_exit_codes_and_result_records()
-        save_report_inputs()
-summarize_only_successful_measurements()
+role = parse_role_from_cli()
+create_fresh_local_result_directory()
+record_local_binary_and_library_identity(role)
+process = start_locally(role_argv(role), log_files)
+stream_local_stdout_and_stderr(process)
+wait_for_exit_with_deadline(process)
+if role == "sender":
+    validate_sender_result_record()
+    save_sender_report()
 ```
 
 最少必须做到：
 
-- `LISTENING` 明确 flush 后输出；接收进程报错退出或启动超时不能继续启动 sender。C++ 的 HELLO/READY 才是实际数据准备条件。
-- 使用 `subprocess` 参数数组；ssh 的远端命令使用正确 shell 引号。持续读取或重定向两端 stdout/stderr，不能因为管道未消费导致测试阻塞。
+- receiver 的 `LISTENING` 必须明确 flush 后输出；接收进程报错退出或启动超时，人工/外部调度器不得继续启动 sender。C++ 的 HELLO/READY 才是实际数据准备条件。
+- 使用 `subprocess` 参数数组直接启动本地进程。持续读取或重定向两端 stdout/stderr，不能因为管道未消费导致测试阻塞。
 - 两端退出码均检查；结果必须有 case、参数、轮数、校验状态。缺少记录、重复记录或参数不匹配均失败，禁止拿旧文件代替。
-- 失败/超时只清理当前 run 启动的进程；不能 `pkill` 全部同名程序。关闭 ssh 连接不保证远端进程退出，应使用该 run 的 PID/进程组或有界远端执行方式。
+- 失败/超时只清理当前主机、本次调用启动的本地进程组；不能 `pkill` 全部同名程序。
 - 第一版可以要求二进制提前部署，不自动编译/拷贝/安装系统依赖。README 给出手工部署和两终端运行方法，便于排除包装脚本问题。
 - 记录二进制和库的 hash、加载路径、源码 commit 及 dirty diff 标识，避免两端或两轮实际加载不同库却显示同一版本。
 

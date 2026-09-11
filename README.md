@@ -2,7 +2,7 @@
 
 这是 ubs-comm RDMA 穿刺测试的最小独立实现。当前代码只实现阶段 1 的单链接 baseline：`B1`。设计、协议边界和后续阶段请见 [DESIGN_CN.md](DESIGN_CN.md) 与 [IMPLEMENTATION_PLAN_CN.md](IMPLEMENTATION_PLAN_CN.md)。
 
-本仓库没有附带或伪造任何硬件性能数字。实际 RDMA 正确性和性能验证需要两台 Linux 鲲鹏服务器、可工作的 RDMA 路径、匹配版本的 ubs-comm 构建产物及可用 SSH 登录。
+本仓库没有附带或伪造任何硬件性能数字。实际 RDMA 正确性和性能验证需要两台目标 Linux 主机、可工作的 RDMA 路径及匹配版本的 ubs-comm 构建产物。`run.py` 只在启动它的当前主机上运行由 `--role` 指定的一个角色，不会通过 SSH 连接、部署或启动另一台机器。
 
 ## B1 的固定工作量
 
@@ -113,7 +113,7 @@ bash ./build.sh \
 
 ## 手工双端运行
 
-先在 receiver 机器启动。`LISTENING` 仅供外部进程编排；真正的 READY 只会在 receiver 已分配、触页并注册 staging MR 后通过 HCOM HELLO/Reply 返回。
+先在 receiver 主机启动 receiver 角色，再在 sender 主机启动 sender 角色。`LISTENING` 仅供进程编排；真正的 READY 只会在 receiver 已分配、触页并注册 staging MR 后通过 HCOM HELLO/Reply 返回。
 
 ```bash
 export LD_LIBRARY_PATH="$UBS_ROOT/dist/hcom_3rdparty/libboundscheck/lib:${LD_LIBRARY_PATH:-}"
@@ -126,7 +126,7 @@ export LD_LIBRARY_PATH="$UBS_ROOT/dist/hcom_3rdparty/libboundscheck/lib:${LD_LIB
   --links 1 --mode plain --chunk-items 30 --scatter pipeline --notify send
 ```
 
-在 sender 机器启动匹配参数：
+确认 receiver 已输出 `LISTENING` 后，在 sender 主机启动匹配参数的 sender：
 
 ```bash
 export LD_LIBRARY_PATH="$UBS_ROOT/dist/hcom_3rdparty/libboundscheck/lib:${LD_LIBRARY_PATH:-}"
@@ -141,44 +141,61 @@ export LD_LIBRARY_PATH="$UBS_ROOT/dist/hcom_3rdparty/libboundscheck/lib:${LD_LIB
 
 用 `--kind measure`、`--warmup 1000 --rounds 10000` 进入正式计时；该模式仍会先跑完整 verify。sender 只在正常结束时输出一行 JSON。`--kind verify` 中所有正式带宽/延迟字段为 `null`，避免将正确性运行误读为性能结果。
 
-## SSH 跑测脚本
+## 双机本地角色脚本
 
-从示例生成本地私有配置，填入真实主机、绝对部署路径、OOB IP、RDMA IP 和 CPU；不要向该文件加入密码。
-HCOM 已静态链接进 `rdma_600`。每台主机的 `library_dirs` 只需列出实际的
-动态运行时依赖；默认构建使用共享 boundscheck 时，只保留其库目录即可。脚本会按
-该列表组装远端 `LD_LIBRARY_PATH` 并记录每个实际路径。为兼容已有私有配置，旧的
-单值 `library_dir` 仍可使用，但应在下次运行前迁移为 `library_dirs`：
+从示例生成同一份配置并复制到两台主机，填入 sender/receiver 各自的绝对二进制/库路径、OOB IP、RDMA IP 和 CPU。
+HCOM 已静态链接进 `rdma_600`。`library_dirs` 只需列出实际的动态运行时依赖；默认构建使用共享 boundscheck 时，只保留其库目录即可。脚本会按当前角色的列表组装本机 `LD_LIBRARY_PATH` 并记录实际路径。旧的单值 `library_dir` 仍可使用，但建议迁移为 `library_dirs`：
 
 ```bash
 cp hosts.example.json hosts.json
 chmod 600 hosts.json
 ```
 
-`run.py` 假定二进制和库已部署、无交互 SSH 已可用。它启动 receiver，等待已 flush 的 `LISTENING`，再启动 sender；失败/超时时只会根据该 run 的唯一远端 PID 文件清理本次进程，绝不会 `pkill` 同名进程。
+`sender` 字段描述 sender 主机，`receiver` 字段描述 receiver 主机。两端都要保存同一份配置，但各自执行时只会检查并使用本机角色的 `binary`、`library_dirs`、RDMA IP 和 CPU。`receiver.oob_ip` 必须能从 sender 主机连接。
+
+在 receiver 主机先执行，终端会实时显示 `LISTENING`：
 
 ```bash
-python3 run.py --config hosts.json --suite stage1 --kind verify --output results/20260911-b1-verify
-
-python3 run.py --config hosts.json --suite stage1 --kind measure --repeat 5 \
-  --output results/20260911-b1-measure
+python3 run.py --config hosts.json --role receiver \
+  --suite stage1 --kind verify --output results/20260911-b1-verify-receiver
 ```
 
-每个 repeat 使用新的远端进程和新的本地目录。输出中包含：
+确认 `LISTENING` 后，在 sender 主机执行：
+
+```bash
+python3 run.py --config hosts.json --role sender \
+  --suite stage1 --kind verify --output results/20260911-b1-verify-sender
+```
+
+measure 时两端使用相同的 `--kind measure`，每个物理 repeat 都要先启动新的 receiver，再启动新的 sender，并使用新的输出目录：
+
+```bash
+# receiver 主机
+python3 run.py --config hosts.json --role receiver \
+  --suite stage1 --kind measure --output results/20260911-b1-measure-001-receiver
+
+# sender 主机，待 receiver 输出 LISTENING 后执行
+python3 run.py --config hosts.json --role sender \
+  --suite stage1 --kind measure --output results/20260911-b1-measure-001-sender
+```
+
+每个脚本调用只启动一个本地角色。失败或超时时只会终止本次调用启动的本地进程组，绝不会 `pkill` 同名进程。receiver 输出目录包含其 manifest 与日志；sender 输出目录还包含经过校验的结果和报告：
 
 ```text
-results/<run-id>/
+results/<run-id>-receiver/
   manifest.json
-  repeat-001/B1/
-    manifest.json
-    sender.stdout.log
-    sender.stderr.log
-    receiver.stdout.log
-    receiver.stderr.log
-    result.jsonl
+  receiver.stdout.log
+  receiver.stderr.log
+
+results/<run-id>-sender/
+  manifest.json
+  sender.stdout.log
+  sender.stderr.log
+  result.jsonl
   REPORT.md
 ```
 
-脚本会记录二进制 SHA-256、真实路径、`LD_LIBRARY_PATH` 下的 `ldd` 输出、命令参数、退出码和日志；只接受参数与 B1 约束完全匹配的 sender JSON。任一进程失败、超时、缺少/重复结果或参数不匹配都会使该 repeat 失败，且不会用旧结果替代。
+脚本会记录本机二进制 SHA-256、真实路径、`LD_LIBRARY_PATH` 下的 `ldd` 输出、命令参数、退出码和日志。sender 只接受参数与 B1 约束完全匹配的 JSON；失败、超时、缺少/重复结果或参数不匹配都会使本次 sender 调用失败，且不会用旧结果替代。
 
 ## 计时与验证口径
 

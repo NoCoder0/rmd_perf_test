@@ -1,34 +1,32 @@
 #!/usr/bin/env python3
-"""Run and archive the stage-1 B1 RDMA experiment over SSH.
+"""Run and archive one local role of the stage-1 B1 RDMA experiment.
 
 The data plane is always the C++ binary.  This wrapper deliberately uses only
-the Python standard library for process orchestration, log collection, result
-validation, and report generation.  It never builds, installs, or copies
-software on either host.
+the Python standard library for local process orchestration, log collection,
+result validation, and report generation.  It never builds, installs, or
+copies software. Run it separately with --role receiver and --role sender on
+the corresponding Linux RDMA hosts.
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import pathlib
-import queue
-import shlex
 import signal
-import statistics
 import subprocess
 import sys
 import threading
 import time
-import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 
 class RunFailure(RuntimeError):
-    """A failed or malformed remote experiment."""
+    """A failed or malformed local experiment."""
 
 
 @dataclass(frozen=True)
@@ -99,7 +97,7 @@ def require_absolute_posix_path_list(data: Dict[str, Any], key: str, owner: str)
 def require_library_dirs(data: Dict[str, Any], owner: str) -> List[str]:
     if "library_dirs" in data:
         return require_absolute_posix_path_list(data, "library_dirs", owner)
-    # Keep existing private hosts.json files usable. New configs should list
+    # Keep a one-entry legacy configuration usable. New configs should list
     # every required dynamic-library directory explicitly.
     return [
         require_absolute_posix_path(require_string(data, "library_dir", owner), f"{owner}.library_dir")
@@ -110,7 +108,6 @@ def validate_host(name: str, host: Any, receiver: bool) -> Dict[str, Any]:
     if not isinstance(host, dict):
         raise RunFailure(f"{name} must be an object")
     checked = dict(host)
-    checked["ssh"] = require_string(checked, "ssh", name)
     checked["binary"] = require_absolute_posix_path(require_string(checked, "binary", name), f"{name}.binary")
     checked["library_dirs"] = require_library_dirs(checked, name)
     checked["rdma_ips"] = require_string_list(checked, "rdma_ips", name)
@@ -167,16 +164,16 @@ def validate_config(raw: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, int]
     return {"sender": sender, "receiver": receiver}, stage
 
 
-def quote_command(arguments: Iterable[str]) -> str:
-    return " ".join(shlex.quote(str(argument)) for argument in arguments)
-
-
 def library_search_path(host: Dict[str, Any]) -> str:
     return ":".join(host["library_dirs"])
 
 
-def ssh_base(host: Dict[str, Any]) -> List[str]:
-    return ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=15", host["ssh"]]
+def local_environment(host: Dict[str, Any]) -> Dict[str, str]:
+    environment = os.environ.copy()
+    inherited = environment.get("LD_LIBRARY_PATH")
+    library_path = library_search_path(host)
+    environment["LD_LIBRARY_PATH"] = f"{library_path}:{inherited}" if inherited else library_path
+    return environment
 
 
 def stage1_argv(role: str, config: Dict[str, Any], stage: Dict[str, int], kind: str) -> List[str]:
@@ -229,46 +226,27 @@ def stage1_argv(role: str, config: Dict[str, Any], stage: Dict[str, int], kind: 
     ]
 
 
-def remote_launch_script(host: Dict[str, Any], argv: List[str], pid_file: str) -> str:
-    # The shell that owns the ssh command execs the benchmark.  Its PID is saved
-    # under a unique run directory so cleanup can target only this invocation.
-    binary_command = quote_command(argv)
-    library_path = shlex.quote(library_search_path(host))
-    quoted_pid = shlex.quote(pid_file)
-    return (
-        "umask 077; "
-        "mkdir -p /tmp; "
-        f"rm -f {quoted_pid}; "
-        f"echo $$ > {quoted_pid}; "
-        f"export LD_LIBRARY_PATH={library_path}${{LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}}; "
-        f"exec {binary_command}"
-    )
-
-
 class LinePump(threading.Thread):
-    def __init__(self, stream: Any, path: pathlib.Path, notify: Optional[queue.Queue[str]] = None) -> None:
+    def __init__(self, stream: Any, path: pathlib.Path, console: Optional[Any] = None) -> None:
         super().__init__(daemon=True)
         self._stream = stream
         self._path = path
-        self._notify = notify
+        self._console = console
 
     def run(self) -> None:
         with self._path.open("w", encoding="utf-8", errors="replace", newline="") as output:
             for line in iter(self._stream.readline, ""):
                 output.write(line)
                 output.flush()
-                if self._notify is not None:
-                    self._notify.put(line)
+                if self._console is not None:
+                    print(line, end="", file=self._console, flush=True)
         self._stream.close()
 
 
 @dataclass
-class RemoteProcess:
-    host: Dict[str, Any]
+class LocalProcess:
     role: str
     process: subprocess.Popen[str]
-    pid_file: str
-    stdout_queue: queue.Queue[str]
     stdout_pump: LinePump
     stderr_pump: LinePump
 
@@ -280,18 +258,13 @@ class RemoteProcess:
         self.stderr_pump.join(timeout=5)
 
 
-def start_remote(
-    host: Dict[str, Any], role: str, argv: List[str], work_dir: pathlib.Path, token: str
-) -> RemoteProcess:
-    pid_file = f"/tmp/rdma_600_{token}_{role}.pid"
-    remote_script = remote_launch_script(host, argv, pid_file)
-    command = [*ssh_base(host), remote_script]
+def start_local(host: Dict[str, Any], role: str, argv: List[str], work_dir: pathlib.Path) -> LocalProcess:
     stdout = subprocess.PIPE
     stderr = subprocess.PIPE
     if stdout is None or stderr is None:
         raise AssertionError("subprocess pipes were not created")
     process = subprocess.Popen(
-        command,
+        argv,
         stdin=subprocess.DEVNULL,
         stdout=stdout,
         stderr=stderr,
@@ -299,111 +272,94 @@ def start_remote(
         encoding="utf-8",
         errors="replace",
         bufsize=1,
+        env=local_environment(host),
         start_new_session=(os.name == "posix"),
     )
-    lines: queue.Queue[str] = queue.Queue()
-    stdout_pump = LinePump(process.stdout, work_dir / f"{role}.stdout.log", lines)
-    stderr_pump = LinePump(process.stderr, work_dir / f"{role}.stderr.log")
+    stdout_pump = LinePump(process.stdout, work_dir / f"{role}.stdout.log", sys.stdout)
+    stderr_pump = LinePump(process.stderr, work_dir / f"{role}.stderr.log", sys.stderr)
     stdout_pump.start()
     stderr_pump.start()
-    return RemoteProcess(host, role, process, pid_file, lines, stdout_pump, stderr_pump)
+    print(f"STARTED role={role} pid={process.pid}", flush=True)
+    return LocalProcess(role, process, stdout_pump, stderr_pump)
 
 
-def wait_for_listening(receiver: RemoteProcess, timeout_sec: int) -> None:
+def wait_for_exit(local: LocalProcess, timeout_sec: int, description: str) -> int:
     deadline = time.monotonic() + timeout_sec
     while time.monotonic() < deadline:
-        if receiver.poll() is not None:
-            raise RunFailure(f"receiver exited before LISTENING (exit={receiver.poll()})")
-        try:
-            line = receiver.stdout_queue.get(timeout=0.2)
-        except queue.Empty:
-            continue
-        if line.startswith("LISTENING "):
-            return
-    raise RunFailure("receiver did not emit a flushed LISTENING line before startup deadline")
-
-
-def wait_for_exit(remote: RemoteProcess, timeout_sec: int, description: str) -> int:
-    deadline = time.monotonic() + timeout_sec
-    while time.monotonic() < deadline:
-        code = remote.poll()
+        code = local.poll()
         if code is not None:
-            remote.join_pumps()
+            local.join_pumps()
             return code
         time.sleep(0.1)
     raise RunFailure(f"{description} exceeded its deadline")
 
 
-def stop_remote(remote: Optional[RemoteProcess]) -> None:
-    if remote is None:
+def stop_local(local: Optional[LocalProcess]) -> None:
+    if local is None:
         return
-    if remote.poll() is not None:
-        remote.join_pumps()
+    if local.poll() is not None:
+        local.join_pumps()
         return
-    # This command reads only the current run's unpredictable PID file.  It
-    # rejects non-numeric content and never kills by program name.
-    quoted_pid = shlex.quote(remote.pid_file)
-    cleanup = (
-        f"if test -r {quoted_pid}; then "
-        f"pid=$(cat {quoted_pid}); "
-        "case $pid in ''|*[!0-9]*) exit 0;; esac; "
-        "kill -TERM \"$pid\" 2>/dev/null || true; "
-        "fi"
-    )
-    try:
-        subprocess.run([*ssh_base(remote.host), cleanup], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                       stderr=subprocess.DEVNULL, timeout=15, check=False)
-    except (OSError, subprocess.TimeoutExpired):
-        pass
     try:
         if os.name == "posix":
-            os.killpg(remote.process.pid, signal.SIGTERM)
+            os.killpg(local.process.pid, signal.SIGTERM)
         else:
-            remote.process.terminate()
-        remote.process.wait(timeout=10)
+            local.process.terminate()
+        local.process.wait(timeout=10)
     except (OSError, subprocess.TimeoutExpired):
         try:
-            remote.process.kill()
+            local.process.kill()
         except OSError:
             pass
-    remote.join_pumps()
+    local.join_pumps()
 
 
-def remote_identity(host: Dict[str, Any]) -> Dict[str, Any]:
-    binary = shlex.quote(host["binary"])
-    library_path = shlex.quote(library_search_path(host))
-    library_identity = " ".join(
-        f"printf 'library_dir_{index}='; readlink -f {shlex.quote(directory)};"
-        for index, directory in enumerate(host["library_dirs"])
-    )
-    script = (
-        "set -eu; "
-        f"printf 'binary_realpath='; readlink -f {binary}; "
-        f"printf 'binary_sha256='; sha256sum {binary} | awk '{{print $1}}'; "
-        f"{library_identity} "
-        f"printf 'ldd='; LD_LIBRARY_PATH={library_path}${{LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}} ldd {binary} | tr '\\n' '|'; echo"
-    )
+def file_sha256(path: pathlib.Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        while True:
+            chunk = source.read(1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def local_identity(host: Dict[str, Any]) -> Dict[str, Any]:
+    binary = pathlib.Path(host["binary"])
+    if not binary.is_file():
+        raise RunFailure(f"local binary does not exist: {binary}")
+    if not os.access(binary, os.X_OK):
+        raise RunFailure(f"local binary is not executable: {binary}")
+    library_dirs = [pathlib.Path(directory) for directory in host["library_dirs"]]
+    for directory in library_dirs:
+        if not directory.is_dir():
+            raise RunFailure(f"local library directory does not exist: {directory}")
     try:
         completed = subprocess.run(
-            [*ssh_base(host), script],
+            ["ldd", str(binary)],
             stdin=subprocess.DEVNULL,
             capture_output=True,
             text=True,
             encoding="utf-8",
             errors="replace",
+            env=local_environment(host),
             timeout=30,
             check=False,
         )
     except (OSError, subprocess.TimeoutExpired) as error:
-        raise RunFailure(f"cannot inspect {host['ssh']}: {error}") from error
+        raise RunFailure(f"cannot inspect local binary {binary}: {error}") from error
     if completed.returncode != 0:
-        raise RunFailure(f"identity inspection failed on {host['ssh']}: {completed.stderr.strip()}")
-    result: Dict[str, Any] = {"ssh": host["ssh"], "raw": completed.stdout.strip()}
-    for line in completed.stdout.splitlines():
-        if "=" in line:
-            key, value = line.split("=", 1)
-            result[key] = value
-    return result
+        raise RunFailure(f"ldd failed for {binary}: {completed.stderr.strip()}")
+    if "not found" in completed.stdout:
+        raise RunFailure(f"ldd found missing shared libraries for {binary}: {completed.stdout.strip()}")
+    return {
+        "binary_realpath": str(binary.resolve()),
+        "binary_sha256": file_sha256(binary),
+        "library_dirs": [str(directory.resolve()) for directory in library_dirs],
+        "ldd": completed.stdout.strip(),
+        "ldd_stderr": completed.stderr.strip(),
+    }
 
 
 def parse_sender_result(path: pathlib.Path, case: Case) -> Dict[str, Any]:
@@ -456,140 +412,110 @@ def validate_result(result: Dict[str, Any], case: Case, kind: str, stage: Dict[s
             raise RunFailure(f"measure result {metric} must be a non-negative number")
 
 
-def write_report(output: pathlib.Path, kind: str, runs: List[Dict[str, Any]]) -> None:
-    lines = ["# Stage 1 run report", "", f"- Generated: {utc_now()}", f"- Requested kind: `{kind}`", ""]
-    successful = [entry["result"] for entry in runs if entry.get("status") == "ok" and "result" in entry]
-    failures = [entry for entry in runs if entry.get("status") != "ok"]
-    if kind == "measure" and successful:
-        e2e = [float(item["e2e_p50_us"]) for item in successful]
-        submit = [float(item["submit_p50_us"]) for item in successful]
-        bandwidth = [float(item["effective_GBps"]) for item in successful]
+def write_sender_report(output: pathlib.Path, kind: str, outcome: Dict[str, Any]) -> None:
+    lines = ["# Stage 1 sender report", "", f"- Generated: {utc_now()}", f"- Requested kind: `{kind}`", ""]
+    result = outcome.get("result")
+    if outcome.get("status") == "ok" and isinstance(result, dict) and kind == "measure":
         lines += [
-            "## Successful measurements",
+            "## Measurement",
             "",
-            "| Case | Successful repeats | Median e2e p50 (us) | Median submit p50 (us) | Median effective GB/s |",
-            "|---|---:|---:|---:|---:|",
-            f"| B1 | {len(successful)} | {statistics.median(e2e):.3f} | {statistics.median(submit):.3f} | {statistics.median(bandwidth):.3f} |",
+            "| Case | e2e p50 (us) | submit p50 (us) | effective GB/s |",
+            "|---|---:|---:|---:|",
+            f"| B1 | {float(result['e2e_p50_us']):.3f} | {float(result['submit_p50_us']):.3f} | {float(result['effective_GBps']):.3f} |",
             "",
-            "The table aggregates only sender JSON records validated by this wrapper. It is application effective throughput with one round in flight, including scatter and ACK; it is not a NIC peak claim.",
+            "This is one validated sender result. It is application effective throughput with one round in flight, including scatter and ACK; it is not a NIC peak claim.",
             "",
         ]
-    elif kind == "verify" and successful:
-        lines += ["## Verification", "", f"- Successful B1 verification runs: {len(successful)}", "- No formal bandwidth values are reported for `--kind verify`.", ""]
+    elif outcome.get("status") == "ok" and isinstance(result, dict) and kind == "verify":
+        lines += ["## Verification", "", "- B1 verification succeeded.", "- No formal bandwidth values are reported for `--kind verify`.", ""]
     else:
-        lines += ["## Result", "", "No successful formal measurement was produced.", ""]
-    if failures:
-        lines += ["## Failures", ""]
-        for failure in failures:
-            lines.append(f"- repeat {failure.get('repeat')}: {failure.get('error', 'unknown failure')}")
-        lines.append("")
+        lines += ["## Failure", "", f"- {outcome.get('error', 'No validated sender result was produced.')}", ""]
     lines += [
         "## Evidence",
         "",
-        "Each repeat has its own directory with immutable command metadata, host identity output, sender/receiver stdout and stderr, and `result.jsonl` when a result was valid.",
+        "This sender invocation has immutable command metadata, local identity output, stdout/stderr, and `result.jsonl` when a result was valid.",
         "",
     ]
     (output / "REPORT.md").write_text("\n".join(lines), encoding="utf-8")
 
 
-def run_case(
-    config: Dict[str, Any], stage: Dict[str, int], case: Case, kind: str, repeat: int, output: pathlib.Path
+def run_role(
+    config: Dict[str, Any],
+    stage: Dict[str, int],
+    case: Case,
+    role: str,
+    kind: str,
+    output: pathlib.Path,
+    config_path: pathlib.Path,
 ) -> Dict[str, Any]:
-    run_dir = output / f"repeat-{repeat:03d}" / case.name
-    run_dir.mkdir(parents=True, exist_ok=False)
-    token = uuid.uuid4().hex
-    sender_argv = stage1_argv("sender", config, stage, kind)
-    receiver_argv = stage1_argv("receiver", config, stage, kind)
+    argv = stage1_argv(role, config, stage, kind)
     manifest: Dict[str, Any] = {
-        "schema_version": 1,
+        "schema_version": 2,
         "created_at": utc_now(),
         "case": case.__dict__,
+        "role": role,
         "kind": kind,
-        "repeat": repeat,
-        "sender_argv": sender_argv,
-        "receiver_argv": receiver_argv,
+        "argv": argv,
+        "config_path": str(config_path.resolve()),
         "stage1": stage,
     }
-    json_dump(run_dir / "manifest.json", manifest)
+    json_dump(output / "manifest.json", manifest)
 
-    receiver: Optional[RemoteProcess] = None
-    sender: Optional[RemoteProcess] = None
+    local: Optional[LocalProcess] = None
     try:
-        manifest["sender_identity"] = remote_identity(config["sender"])
-        manifest["receiver_identity"] = remote_identity(config["receiver"])
-        json_dump(run_dir / "manifest.json", manifest)
-        receiver = start_remote(config["receiver"], "receiver", receiver_argv, run_dir, token)
-        wait_for_listening(receiver, max(stage["timeout_sec"], 30))
-        sender = start_remote(config["sender"], "sender", sender_argv, run_dir, token)
-        sender_code = wait_for_exit(sender, stage["process_timeout_sec"], "sender")
-        receiver_code = wait_for_exit(receiver, stage["process_timeout_sec"], "receiver")
-        manifest["sender_exit_code"] = sender_code
-        manifest["receiver_exit_code"] = receiver_code
-        if sender_code != 0 or receiver_code != 0:
-            raise RunFailure(f"non-zero exit: sender={sender_code}, receiver={receiver_code}")
-        result = parse_sender_result(run_dir / "sender.stdout.log", case)
-        validate_result(result, case, kind, stage)
-        (run_dir / "result.jsonl").write_text(json.dumps(result, ensure_ascii=False, sort_keys=True) + "\n", encoding="utf-8")
+        manifest["local_identity"] = local_identity(config[role])
+        json_dump(output / "manifest.json", manifest)
+        local = start_local(config[role], role, argv, output)
+        exit_code = wait_for_exit(local, stage["process_timeout_sec"], role)
+        manifest["exit_code"] = exit_code
+        if exit_code != 0:
+            raise RunFailure(f"{role} exited with {exit_code}")
+        outcome: Dict[str, Any] = {"repeat": 1, "case": case.name, "role": role, "status": "ok", "path": str(output)}
+        if role == "sender":
+            result = parse_sender_result(output / "sender.stdout.log", case)
+            validate_result(result, case, kind, stage)
+            (output / "result.jsonl").write_text(
+                json.dumps(result, ensure_ascii=False, sort_keys=True) + "\n", encoding="utf-8"
+            )
+            outcome["result"] = result
         manifest["finished_at"] = utc_now()
         manifest["status"] = "ok"
-        json_dump(run_dir / "manifest.json", manifest)
-        return {"repeat": repeat, "case": case.name, "status": "ok", "path": str(run_dir), "result": result}
+        json_dump(output / "manifest.json", manifest)
+        return outcome
     except Exception as error:
         manifest["finished_at"] = utc_now()
         manifest["status"] = "failed"
         manifest["error"] = str(error)
-        json_dump(run_dir / "manifest.json", manifest)
-        return {"repeat": repeat, "case": case.name, "status": "failed", "path": str(run_dir), "error": str(error)}
+        json_dump(output / "manifest.json", manifest)
+        return {"repeat": 1, "case": case.name, "role": role, "status": "failed", "path": str(output), "error": str(error)}
     finally:
-        stop_remote(sender)
-        stop_remote(receiver)
+        stop_local(local)
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--config", type=pathlib.Path, required=True, help="hosts JSON; passwords are never stored here")
+    parser.add_argument("--config", type=pathlib.Path, required=True, help="shared sender/receiver JSON configuration")
+    parser.add_argument("--role", choices=["sender", "receiver"], required=True, help="role to run on this host")
     parser.add_argument("--suite", choices=["stage1"], required=True)
     parser.add_argument("--kind", choices=["verify", "measure"], required=True)
-    parser.add_argument("--repeat", type=int, default=1, help="independent fresh-process repeats")
-    parser.add_argument("--output", type=pathlib.Path, required=True, help="new result directory")
+    parser.add_argument("--output", type=pathlib.Path, required=True, help="new local result directory")
     return parser.parse_args()
 
 
 def main() -> int:
     args = parse_args()
-    if args.repeat < 1:
-        raise RunFailure("--repeat must be greater than zero")
+    if sys.platform != "linux":
+        raise RunFailure("run.py starts one local RDMA role and must run on a Linux RDMA host")
+    raw = read_json(args.config)
+    config, stage = validate_config(raw)
     if args.output.exists() and any(args.output.iterdir()):
         raise RunFailure(f"--output already exists and is not empty: {args.output}")
     args.output.mkdir(parents=True, exist_ok=True)
-    raw = read_json(args.config)
-    config, stage = validate_config(raw)
-    root_manifest = {
-        "schema_version": 1,
-        "created_at": utc_now(),
-        "suite": args.suite,
-        "kind": args.kind,
-        "requested_repeats": args.repeat,
-        "config_path": str(args.config.resolve()),
-        "stage1": stage,
-        "cases": [B1.__dict__],
-    }
-    json_dump(args.output / "manifest.json", root_manifest)
-
-    runs: List[Dict[str, Any]] = []
-    # There is one case in stage 1.  Keeping the loop makes subsequent suites
-    # use the same archival contract without duplicating launcher code.
-    for repeat in range(1, args.repeat + 1):
-        runs.append(run_case(config, stage, B1, args.kind, repeat, args.output))
-    root_manifest["finished_at"] = utc_now()
-    root_manifest["runs"] = runs
-    root_manifest["successful_runs"] = sum(1 for run in runs if run["status"] == "ok")
-    root_manifest["failed_runs"] = sum(1 for run in runs if run["status"] != "ok")
-    json_dump(args.output / "manifest.json", root_manifest)
-    write_report(args.output, args.kind, runs)
-    print(json.dumps({"output": str(args.output), "successful_runs": root_manifest["successful_runs"],
-                      "failed_runs": root_manifest["failed_runs"]}, ensure_ascii=False))
-    return 0 if root_manifest["failed_runs"] == 0 else 1
+    outcome = run_role(config, stage, B1, args.role, args.kind, args.output, args.config)
+    if args.role == "sender":
+        write_sender_report(args.output, args.kind, outcome)
+    print(json.dumps({"output": str(args.output), "role": args.role, "status": outcome["status"]}, ensure_ascii=False))
+    return 0 if outcome["status"] == "ok" else 1
 
 
 if __name__ == "__main__":

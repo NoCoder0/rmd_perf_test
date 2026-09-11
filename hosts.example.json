@@ -1,9 +1,8 @@
 {
   "sender": {
-    "ssh": "user@sender-management-host",
-    "binary": "/absolute/deploy/path/rdma_600",
+    "binary": "/absolute/path/on/sender/rdma_600",
     "library_dirs": [
-      "/absolute/deploy/path/ubs-comm/dist/hcom_3rdparty/libboundscheck/lib"
+      "/absolute/path/on/sender/ubs-comm/dist/hcom_3rdparty/libboundscheck/lib"
     ],
     "rdma_ips": [
       "<sender_nic0_rdma_ip>"
@@ -14,10 +13,9 @@
     ]
   },
   "receiver": {
-    "ssh": "user@receiver-management-host",
-    "binary": "/absolute/deploy/path/rdma_600",
+    "binary": "/absolute/path/on/receiver/rdma_600",
     "library_dirs": [
-      "/absolute/deploy/path/ubs-comm/dist/hcom_3rdparty/libboundscheck/lib"
+      "/absolute/path/on/receiver/ubs-comm/dist/hcom_3rdparty/libboundscheck/lib"
     ],
     "oob_ip": "<receiver_oob_ip>",
     "oob_ports": [
