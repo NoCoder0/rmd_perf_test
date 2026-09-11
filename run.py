@@ -89,15 +89,30 @@ def require_string_list(data: Dict[str, Any], key: str, owner: str) -> List[str]
     return value
 
 
+def require_absolute_posix_path_list(data: Dict[str, Any], key: str, owner: str) -> List[str]:
+    return [
+        require_absolute_posix_path(value, f"{owner}.{key}[{index}]")
+        for index, value in enumerate(require_string_list(data, key, owner))
+    ]
+
+
+def require_library_dirs(data: Dict[str, Any], owner: str) -> List[str]:
+    if "library_dirs" in data:
+        return require_absolute_posix_path_list(data, "library_dirs", owner)
+    # Keep existing private hosts.json files usable. New configs should list
+    # every required dynamic-library directory explicitly.
+    return [
+        require_absolute_posix_path(require_string(data, "library_dir", owner), f"{owner}.library_dir")
+    ]
+
+
 def validate_host(name: str, host: Any, receiver: bool) -> Dict[str, Any]:
     if not isinstance(host, dict):
         raise RunFailure(f"{name} must be an object")
     checked = dict(host)
     checked["ssh"] = require_string(checked, "ssh", name)
     checked["binary"] = require_absolute_posix_path(require_string(checked, "binary", name), f"{name}.binary")
-    checked["library_dir"] = require_absolute_posix_path(
-        require_string(checked, "library_dir", name), f"{name}.library_dir"
-    )
+    checked["library_dirs"] = require_library_dirs(checked, name)
     checked["rdma_ips"] = require_string_list(checked, "rdma_ips", name)
     checked["app_cpu"] = require_int(checked, "app_cpu", name)
     checked["worker_cpus"] = require_string_list(
@@ -154,6 +169,10 @@ def validate_config(raw: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, int]
 
 def quote_command(arguments: Iterable[str]) -> str:
     return " ".join(shlex.quote(str(argument)) for argument in arguments)
+
+
+def library_search_path(host: Dict[str, Any]) -> str:
+    return ":".join(host["library_dirs"])
 
 
 def ssh_base(host: Dict[str, Any]) -> List[str]:
@@ -214,14 +233,14 @@ def remote_launch_script(host: Dict[str, Any], argv: List[str], pid_file: str) -
     # The shell that owns the ssh command execs the benchmark.  Its PID is saved
     # under a unique run directory so cleanup can target only this invocation.
     binary_command = quote_command(argv)
-    library_dir = shlex.quote(host["library_dir"])
+    library_path = shlex.quote(library_search_path(host))
     quoted_pid = shlex.quote(pid_file)
     return (
         "umask 077; "
         "mkdir -p /tmp; "
         f"rm -f {quoted_pid}; "
         f"echo $$ > {quoted_pid}; "
-        f"export LD_LIBRARY_PATH={library_dir}${{LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}}; "
+        f"export LD_LIBRARY_PATH={library_path}${{LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}}; "
         f"exec {binary_command}"
     )
 
@@ -352,13 +371,17 @@ def stop_remote(remote: Optional[RemoteProcess]) -> None:
 
 def remote_identity(host: Dict[str, Any]) -> Dict[str, Any]:
     binary = shlex.quote(host["binary"])
-    library = shlex.quote(host["library_dir"])
+    library_path = shlex.quote(library_search_path(host))
+    library_identity = " ".join(
+        f"printf 'library_dir_{index}='; readlink -f {shlex.quote(directory)};"
+        for index, directory in enumerate(host["library_dirs"])
+    )
     script = (
         "set -eu; "
         f"printf 'binary_realpath='; readlink -f {binary}; "
         f"printf 'binary_sha256='; sha256sum {binary} | awk '{{print $1}}'; "
-        f"printf 'library_dir='; readlink -f {library}; "
-        f"printf 'ldd='; LD_LIBRARY_PATH={library}${{LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}} ldd {binary} | tr '\\n' '|'; echo"
+        f"{library_identity} "
+        f"printf 'ldd='; LD_LIBRARY_PATH={library_path}${{LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}} ldd {binary} | tr '\\n' '|'; echo"
     )
     try:
         completed = subprocess.run(

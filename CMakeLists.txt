@@ -6,15 +6,15 @@ if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
     message(FATAL_ERROR "rdma_600 targets the Linux RDMA hosts; configure it on the deployment machine.")
 endif()
 
-set(HCOM_INCLUDE_DIR "" CACHE PATH "Directory containing hcom/hcom_service.h")
-set(HCOM_LIB_DIR "" CACHE PATH "Directory containing libhcom_static.a")
-set(HCOM_3RDPARTY_DIR "" CACHE PATH "ubs-comm dist/hcom_3rdparty directory")
+set(HCOM_INCLUDE_DIR "" CACHE PATH "Directory containing hcom/hcom_service.h; provide with -D or build.sh")
+set(HCOM_LIB_DIR "" CACHE PATH "Directory containing libhcom_static.a; provide with -D or build.sh")
+set(HCOM_3RDPARTY_DIR "" CACHE PATH "ubs-comm dist/hcom_3rdparty directory; provide with -D or build.sh")
 
 if(NOT HCOM_INCLUDE_DIR OR NOT EXISTS "${HCOM_INCLUDE_DIR}/hcom/hcom_service.h")
-    message(FATAL_ERROR "Set -DHCOM_INCLUDE_DIR=/absolute/path/to/dist/hcom/include")
+    message(FATAL_ERROR "HCOM_INCLUDE_DIR is required; pass -DHCOM_INCLUDE_DIR=... or run bash ./build.sh --ubs-root /path/to/ubs-comm")
 endif()
 if(NOT HCOM_LIB_DIR)
-    message(FATAL_ERROR "Set -DHCOM_LIB_DIR=/absolute/path/to/dist/hcom/lib")
+    message(FATAL_ERROR "HCOM_LIB_DIR is required; pass -DHCOM_LIB_DIR=... or run bash ./build.sh --ubs-root /path/to/ubs-comm")
 endif()
 
 if(NOT HCOM_3RDPARTY_DIR)
@@ -23,6 +23,15 @@ if(NOT HCOM_3RDPARTY_DIR)
     set(HCOM_3RDPARTY_DIR "${_dist_dir}/hcom_3rdparty")
 endif()
 
+# find_library/find_path cache successful lookups. Clear only these derived
+# lookup results so reconfiguring one build directory with a new --ubs-root
+# cannot keep linking headers or libraries from the old deployment.
+unset(HCOM_STATIC_LIBRARY)
+unset(HCOM_STATIC_LIBRARY CACHE)
+unset(BOUNDSCHECK_INCLUDE_DIR)
+unset(BOUNDSCHECK_INCLUDE_DIR CACHE)
+unset(BOUNDSCHECK_LIBRARY)
+unset(BOUNDSCHECK_LIBRARY CACHE)
 find_library(HCOM_STATIC_LIBRARY
     NAMES hcom_static
     PATHS "${HCOM_LIB_DIR}"
@@ -42,9 +51,12 @@ if(NOT BOUNDSCHECK_INCLUDE_DIR OR NOT BOUNDSCHECK_LIBRARY)
     message(FATAL_ERROR "libboundscheck headers/library were not found below ${HCOM_3RDPARTY_DIR}")
 endif()
 
-set(URMA_INCLUDE_DIR "${HCOM_3RDPARTY_DIR}/umdk/urma/include" CACHE PATH "URMA header directory")
+set(URMA_INCLUDE_DIR "" CACHE PATH "URMA header directory; provide with -D or build.sh")
+if(NOT URMA_INCLUDE_DIR)
+    set(URMA_INCLUDE_DIR "${HCOM_3RDPARTY_DIR}/umdk/urma/include")
+endif()
 if(NOT EXISTS "${URMA_INCLUDE_DIR}")
-    message(FATAL_ERROR "Set -DURMA_INCLUDE_DIR=/absolute/path/to/umdk/urma/include")
+    message(FATAL_ERROR "URMA_INCLUDE_DIR is required; pass -DURMA_INCLUDE_DIR=... or use build.sh")
 endif()
 
 find_package(Threads REQUIRED)

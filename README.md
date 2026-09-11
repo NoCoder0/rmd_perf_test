@@ -55,22 +55,40 @@ test -d "$UBS_ROOT/dist/hcom_3rdparty/umdk/urma/include"
 
 ### 2. 构建 rdma_600
 
+`CMakeLists.txt` 不写死任何本地的 HCOM 路径；`build.sh` 会把路径作为 CMake
+配置参数传入。常规部署只需传入已构建 ubs-comm 的根目录：
+
 ```bash
 PERF_ROOT=/absolute/path/to/rmd_perf_test
+UBS_ROOT=/absolute/path/to/ubs-comm
+cd "$PERF_ROOT"
 
-cmake -S "$PERF_ROOT" -B "$PERF_ROOT/build" \
-  -DCMAKE_BUILD_TYPE=Release \
-  -DHCOM_INCLUDE_DIR="$UBS_ROOT/dist/hcom/include" \
-  -DHCOM_LIB_DIR="$UBS_ROOT/dist/hcom/lib"
-cmake --build "$PERF_ROOT/build" -j
+bash ./build.sh --ubs-root "$UBS_ROOT"
 ```
 
-`CMakeLists.txt` 从 `HCOM_INCLUDE_DIR` 推导 `dist/hcom_3rdparty`。若部署目录不同，显式传入：
+脚本默认创建 `$PERF_ROOT/build`，并通过 `nproc` 自动选择并行度。可按需覆盖：
 
 ```bash
--DHCOM_3RDPARTY_DIR=/absolute/path/to/dist/hcom_3rdparty \
--DURMA_INCLUDE_DIR=/absolute/path/to/umdk/urma/include
+bash ./build.sh --ubs-root "$UBS_ROOT" \
+  --build-dir /tmp/rdma_600-debug \
+  --build-type Debug \
+  --jobs 16
 ```
+
+若 HCOM 安装目录不是标准的 `$UBS_ROOT/dist` 布局，可将每个路径作为脚本参数传入：
+
+```bash
+bash ./build.sh \
+  --hcom-include /absolute/path/to/dist/hcom/include \
+  --hcom-lib /absolute/path/to/dist/hcom/lib \
+  --hcom-3rdparty /absolute/path/to/dist/hcom_3rdparty \
+  --urma-include /absolute/path/to/umdk/urma/include
+```
+
+也可通过环境变量 `UBS_ROOT`、`HCOM_INCLUDE_DIR`、`HCOM_LIB_DIR`、
+`HCOM_3RDPARTY_DIR`、`URMA_INCLUDE_DIR`、`BUILD_DIR`、`CMAKE_BUILD_TYPE` 和
+`JOBS` 提供同样的构建参数。若要传递其他 CMake 配置参数，将它们置于 `--` 后，
+例如 `bash ./build.sh --ubs-root "$UBS_ROOT" -- -G Ninja`。
 
 构建所需的已验证依赖名称与 ubs-comm 自带 perf CMake 一致：`hcom_static`、`boundscheck`、pthread、dl 与（存在时）rt。配置失败时先核实实际 `dist` 路径和目标机器的构建产物；不要把 Windows 路径复制到 Linux 命令中。
 
@@ -116,7 +134,8 @@ export LD_LIBRARY_PATH="$UBS_ROOT/dist/hcom/lib:$UBS_ROOT/dist/hcom_3rdparty/lib
 
 ## SSH 跑测脚本
 
-从示例生成本地私有配置，填入真实主机、绝对部署路径、OOB IP、RDMA IP 和 CPU；不要向该文件加入密码：
+从示例生成本地私有配置，填入真实主机、绝对部署路径、OOB IP、RDMA IP 和 CPU；不要向该文件加入密码。
+每台主机的 `library_dirs` 必须同时包含 HCOM 与 `libboundscheck` 的库目录，脚本会按该列表组装远端 `LD_LIBRARY_PATH` 并记录每个实际路径。为兼容已有私有配置，旧的单值 `library_dir` 仍可使用，但应在下次运行前迁移为完整的 `library_dirs` 列表：
 
 ```bash
 cp hosts.example.json hosts.json
