@@ -18,6 +18,8 @@
 
 阶段 1 明确拒绝双链接、SGL、旧的 `--chunk-items` / `--scatter` / `--notify` 参数和 `WRITE_WITH_IMM`；它们不属于这个 direct baseline。
 
+后续顺序为 **1.5 热路径优化 → 2 direct 双链接 → 3 SGL＋scatter → 4 WRITE_WITH_IMM**。阶段 1.5 保留当前协议，只优化数据面等待和记账；阶段 2 在同一实现下对比 B1/B2，不增加 scatter。上述均尚未编码，现有命令不因此新增参数，详见 [实施计划](C:/code/RDMA_DEMO/perf_test/IMPLEMENTATION_PLAN_CN.md) 与 [设计文档](C:/code/RDMA_DEMO/perf_test/DESIGN_CN.md)。
+
 ## 构建
 
 以下命令应在目标 Linux 机器上执行。本项目的 CMake 只会链接已构建的
@@ -214,7 +216,9 @@ sender 使用本机 `CLOCK_MONOTONIC_RAW` 记录：
 
 - 每个 `--rdma-ip` 必须是本机预期网卡 IP；OOB 管理网地址可以不同。
 - app CPU 与 HCOM worker CPU 应使用不同物理核心，并记录 NIC/内存 NUMA 关系。
-- 检查双方部署的是同一源码提交和同一套 HCOM 动态库；脚本的 manifest 会保留可追溯信息。
+- 检查双方部署的是同一源码提交、相同 hcom_static 链接输入及兼容的运行时依赖；当前 CMake 静态链接 hcom。脚本记录二进制 hash、ldd 等本机信息，静态库输入 hash/源码 dirty diff 需额外保存，不能仅凭 ldd 证明 hcom 版本相同。
 - 先运行 `verify`，再运行 `measure`。真实结果应同时保存端口计数、设备/QP 映射和 CPU 使用量；当前脚本不把建链日志当作 NIC 流量证据。
 
 当前实现和验证状态见 [PROGRESS.md](PROGRESS.md)。
+
+review 目录中的历史审阅报告只对应报告注明的提交快照；涉及旧 staging/scatter B1 的描述不代表当前 direct B1 行为。

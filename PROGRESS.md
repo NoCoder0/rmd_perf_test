@@ -5,7 +5,8 @@
 | 阶段 | 实现 | 验证 | 说明 |
 |---|---|---|---|
 | 1 — 单链接 B1 | IMPLEMENTED | NOT_RUN | 已提供最小 C++、CMake、双机本地角色脚本、配置示例和 README；尚未在目标 Linux/RDMA 环境构建或运行。 |
-| 2 — 双链接与 trace | NOT_STARTED | NOT_RUN | 不在阶段 1 二进制中实现。 |
+| 1.5 — direct 热路径优化 | NOT_STARTED | NOT_RUN | 仅已补充实施计划：数据面忙轮询、降低时钟频率、精简原子记账；callback 分配是否优化由 profile 决定。代码未改。 |
+| 2 — direct 双链接与 trace | NOT_STARTED | NOT_RUN | 在阶段 1 direct 结构上扩展双链接；B1/B2 采用相同阶段 1.5 优化，无 staging/scatter。 |
 | 3 — SGL | NOT_STARTED | NOT_RUN | 不在阶段 1 二进制中实现。 |
 | 4 — WRITE_WITH_IMM | NOT_STARTED | NOT_RUN | 未修改 ubs-comm。 |
 
@@ -13,7 +14,7 @@
 
 - 固定 B1 参数：单 service/device/channel/QP，`linkCount=1`，worker poll，内部 multirail 关闭。
 - `600 × 1 KiB` 异步普通 `Put`；第 `i` 个请求从 `src + i * 4096` 直接写到最终 `dst + i * 4096`。没有 staging 分配、staging MR 或 CPU scatter。
-- 每轮 600 个 Put 后在同一 channel/QP 发送一个 `ROUND_READY`，receiver 完成 verify 校验（measure 结束后校验）后返回 `ROUND_ACK`；generation 与 FINISH/FINISH_ACK drain 保留。
+- 每轮 600 个 Put 后在同一 channel/QP 发送一个 `ROUND_READY`。verify 轮先完整校验再发本轮 ACK；warmup/measure 轮直接发本轮 ACK，所有测量轮结束后才最终校验，成功后 FINISH_ACK。generation 与 FINISH/FINISH_ACK drain 保留。
 - 显式 HELLO/READY、ROUND_READY、ACK、FINISH wire 编解码；READY 只在接收端最终 destination 初始化及 MR 注册后回复。
 - HCOM service 在 `Start()` 前显式 `SetTlsOptions(enableTls=false)`，不初始化 TLS context，也不要求证书、私钥或 PSK 回调。
 - 发送和接收 callback/API 返回/超时/消息合法性检查；正常路径在释放 MR、channel 或状态前等待所有本地 callback。错误路径若无法在有界时间内 drain，则进程直接退出而非释放仍可能被 callback 使用的状态。
@@ -33,6 +34,8 @@
 | 双机 RDMA verify / measure | NOT_RUN | 尚未提供两台目标 Linux 主机、网卡、驱动/provider、NUMA 或可用 RDMA 路径。 |
 
 ## 下一步：真实硬件验证
+
+2026-09-12 文档更新：执行顺序为 1 → 1.5 → 2 → 3 → 4。先保留当前 B1 的基线与硬件验证证据，再按实施计划完成阶段 1.5 的 original/A/AB 对照；阶段 2 只增加 direct 双链接并测量收益。以下仍是当前阶段 1 的实际跑测步骤，不表示阶段 1.5 已实现。
 
 1. 在 sender/receiver 两台目标 Linux 主机上以同一 ubs-comm 版本构建并部署 `rdma_600`；记录两端二进制和库 hash。
 2. 填写相同的 `hosts.json`（从 `hosts.example.json` 复制）并复制到两台主机，确认两端 OOB IP、RDMA IP、独立 app/worker CPU 和库目录。

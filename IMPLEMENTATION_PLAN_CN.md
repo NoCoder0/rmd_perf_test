@@ -1,6 +1,6 @@
 # 分阶段实施与验证任务书：ubs-comm RDMA 600 × 1 KiB
 
-状态：阶段 1 direct B1 已实现；目标 Linux/RDMA 构建与硬件跑测尚未执行。日期：2026-09-11。
+状态：阶段 1 direct B1 已实现；阶段 1.5、2、3、4 尚未实现。目标 Linux/RDMA 构建与硬件跑测尚未执行。更新日期：2026-09-12。当前实现参考 perf_test `0f5e382`。
 
 配套设计：[DESIGN_CN.md](C:/code/RDMA_DEMO/perf_test/DESIGN_CN.md)。本文规定实施顺序、交付物和阶段验收，协议与内存布局以设计文档为准。执行模型若发现两份文档与源码存在冲突，应说明依据并记录最小修正，不应默默改变测试口径。
 
@@ -12,16 +12,16 @@
 
 1. 先读设计文档、本文及工作目录适用的 `AGENTS.md`，查看现有代码与 git 状态，保留已有修改。先复用已有阶段产物，再继续实现。
 2. 实现一个小型 C++ 可执行程序，不引入 memfabric，不搬入整个 hcom perf 框架。Python 只用标准库在各自主机启动一个角色并负责本机结果归档。
-3. 顺序为：**单链接 baseline → 双链接与打点 → SGL → WRITE_WITH_IMM**。每阶段保持前一阶段用例可运行，逐阶段形成可独立审阅的 diff 和报告。
+3. 顺序为：**阶段 1 单链接 direct baseline → 阶段 1.5 热路径优化 → 阶段 2 direct 双链接与打点 → 阶段 3 SGL＋scatter → 阶段 4 WRITE_WITH_IMM**。每阶段保持前一阶段用例可运行，逐阶段形成可独立审阅的 diff 和报告。
 4. 两端总有效数据固定为每轮 600 × 1024 字节。阶段 1 的源/最终目标均为 stride=4096；第 `i` 个 Put 直接写 `dst + i*4096`，最终完成口径包含一个轮次完成通知和 ACK，不包含 staging 或 scatter。
 5. 所有主 case 使用异步提交；一个 service 对应一个 RDMA 设备，每个 channel `linkCount=1`、worker poll、关闭内建 multirail；阶段 1 每端各一个应用线程。
-6. 阶段 1 不使用 `chunk_items`、chunk 通知或流水 scatter。后续若为 PutV 引入连续 staging/scatter，必须另设同布局的 plain 对照，不能把其结果与 direct B1 当成相同工作量的 e2e 对比。
+6. 阶段 1/1.5/2 不使用 `chunk_items`、chunk 通知或 scatter。阶段 3 的 SGL＋scatter 与 direct 完成相同最终任务，主表比较整体策略 e2e；内部开销不同，不能把全部收益称为纯 SGL 合并收益。只有需要单独归因时才增加 plain-staged 诊断对照。
 7. 阶段 1 单轮在途：同一 QP 上的 600 次 WRITE 后只发一个 `ROUND_READY` Send，再等待 ACK。实现局部函数、固定数组和必要的状态，不增加跨轮窗口、通用线程池、动态调度、自动重连或 selective signaling。
 8. 第一至第三阶段优先只改 `perf_test`；第四阶段改 ubs-comm。若前期发现库缺陷确实阻塞正确性，单独提交最小修复并重新跑 baseline，不将修复收益归入双链接/SGL/IMM。
 9. API 返回码、本地 callback 错误、接收消息合法性、超时、缓冲复用和退出 drain 都必须处理。不要为“代码最少”省略这些正确性条件。
 10. 硬件结果只来自真实运行。编译通过、mock 通过、脚本可启动都不等于 RDMA 验证通过；不得生成示意数字冒充测量结果。
 
-每次只交办一个阶段时，实施模型完成该阶段及可执行验证后交付，不擅自扩展到下一阶段。若收到四阶段整体实施指令，可按顺序推进；阶段验收是技术条件，不是额外的人工审批流程。
+每次只交办一个阶段时，实施模型完成该阶段及可执行验证后交付，不擅自扩展到下一阶段。若收到整体实施指令，按 1 → 1.5 → 2 → 3 → 4 推进；阶段验收是技术条件，不是额外的人工审批流程。
 
 无目标硬件时，继续完成不依赖硬件的代码、构建检查、脚本和交付文档，将硬件验收明确保留为 pending。后续本地准备可以继续，但不能将后续性能结论建立在未验证的上一阶段之上。
 
@@ -39,15 +39,13 @@ perf_test/
   hosts.example.json          sender/receiver 主机参数、绝对路径、绑核配置示例
   README.md                   已验证的编译/手工运行/脚本运行命令
   PROGRESS.md                 阶段状态、验证命令、证据路径与遗留问题
-  results/<run-id>/
+  results/<run-id>-<role>/   当前两端分别保存，不是一个目录自动汇总两端
     manifest.json             参数、版本、库路径、构建、机器元信息
-    sender.stdout.log
-    sender.stderr.log
-    receiver.stdout.log
-    receiver.stderr.log
-    result.jsonl              正式计时结果
-    trace.jsonl               第二阶段开始：单独诊断运行的打点
-    REPORT.md                 本次结果、比较、失败/跳过原因
+    <role>.stdout.log
+    <role>.stderr.log
+    result.jsonl              sender 端结果；receiver 不生成这份记录
+    trace.jsonl               阶段 2 计划：单独诊断运行的打点
+    REPORT.md                 当前 sender 报告；跨运行比较由实施者汇总
 ```
 
 不是每个 run 都必须生成 trace。不为脚本增加另一套插件或配置框架。原始日志和数据使用新的 run-id 保存，不覆盖上一阶段结果。
@@ -65,7 +63,7 @@ perf_test/
 
 ## 3. 共用脚本契约：阶段 1 就交付
 
-以下为待实现的运行接口，不是已经存在的脚本。实施者可以对参数命名作小幅调整，但最终 README 必须给出复制即可执行的实际命令。
+阶段 1 已实现下述每主机本地角色脚本接口，尚未在目标机跑测。阶段 1.5 复用 `--suite stage1`，通过二进制/提交/hash 区分优化版本，不增加一套启动器。后续阶段的参数扩展仍为计划，实际已支持命令以 README 为准。
 
 ```bash
 # receiver 主机
@@ -104,7 +102,7 @@ measure 使用相同的双主机顺序和 `--kind measure`。每个物理 repeat
 }
 ```
 
-阶段 1 配置只需要每端数组中的第一项。阶段 2 验证第二张 NIC、第二个端口和第二个 worker CPU 存在且不重复。应用不假定 OOB IP 就是 RDMA IP。
+上例的两条 rail 是阶段 2 的配置草案；当前 stage1 配置只使用一条，按仓库 hosts.example.json 填写（包括 stage1 轮数/超时设置）。阶段 2 才扩展并验证第二张 NIC、第二个端口和第二个 worker CPU，不能暗示当前解析器已经支持它们。应用不假定 OOB IP 就是 RDMA IP。
 
 脚本工作流程：两台主机各运行一次，receiver 的 `LISTENING` 由人工或外部调度器作为 sender 的启动信号。
 
@@ -125,14 +123,14 @@ if role == "sender":
 
 - receiver 的 `LISTENING` 必须明确 flush 后输出；接收进程报错退出或启动超时，人工/外部调度器不得继续启动 sender。C++ 的 HELLO/READY 才是实际数据准备条件。
 - 使用 `subprocess` 参数数组直接启动本地进程。持续读取或重定向两端 stdout/stderr，不能因为管道未消费导致测试阻塞。
-- 两端退出码均检查；结果必须有 case、参数、轮数、校验状态。缺少记录、重复记录或参数不匹配均失败，禁止拿旧文件代替。
+- 两端本地脚本分别检查自己启动的进程退出码；sender 校验结果记录。当前脚本不自动收集另一台机器的退出码，人工汇总或外部调度器必须确认双方成功后才接受整次跑测。缺少记录、重复记录或参数不匹配均失败，禁止拿旧文件代替。
 - 失败/超时只清理当前主机、本次调用启动的本地进程组；不能 `pkill` 全部同名程序。
 - 第一版可以要求二进制提前部署，不自动编译/拷贝/安装系统依赖。README 给出手工部署和两终端运行方法，便于排除包装脚本问题。
-- 记录二进制和库的 hash、加载路径、源码 commit 及 dirty diff 标识，避免两端或两轮实际加载不同库却显示同一版本。
+- 当前脚本记录本机 binary hash、命令、ldd 与本地退出状态；性能对比时另行保存静态 hcom 链接输入 hash、源码 commit/dirty diff，人工对齐两端构建。不要把尚未自动收集的证据描述为脚本已有能力。
 
 构建依据：[ubs-comm build.sh](C:/code/RDMA_DEMO/ubs-comm/build.sh) 支持 service/RDMA 构建开关，默认产物位于 `dist/hcom`；[现有 perf CMakeLists.txt](C:/code/RDMA_DEMO/ubs-comm/test/hcom/tools/perf_test/CMakeLists.txt) 可参考 include、hcom、boundscheck 等依赖。实施者需核实实际产物，不凭记忆杜撰 include 路径或库名。
 
-计划中的独立构建命令如下，`HCOM_INCLUDE_DIR/HCOM_LIB_DIR` 由新 CMakeLists 明确定义：
+当前 CMakeLists 已定义 `HCOM_INCLUDE_DIR/HCOM_LIB_DIR`，构建命令如下；也可使用现有 build.sh，具体依赖路径以 README 为准：
 
 ```bash
 cmake -S "$PERF_ROOT" -B "$PERF_ROOT/build" \
@@ -150,7 +148,7 @@ boundscheck 等额外依赖按实测构建需求补充显式路径。链接动�
 
 `B1: links=1, mode=plain, direct dst stride=4096, tls=disabled`。
 
-每轮：600 次异步 `Put(1024)`，第 `i` 次写入最终 `dst + i*4096`；随后同一 QP 追加一次 `Send(ROUND_READY)`。receiver 在 verify 轮检查最终 dst，在 measure 结束后统一检查，随后发 1 个 ACK；没有 stage 和 CPU scatter。
+每轮：600 次异步 `Put(1024)`，第 `i` 次写入最终 `dst + i*4096`；随后同一 QP 追加一次 `Send(ROUND_READY)`。verify 轮先完整检查 dst 再发本轮 ACK；warmup/measure 轮收到 ROUND_READY 就发本轮 ACK，不逐轮扫描。全部 measure 轮结束后才做最终内容检查，成功后 FINISH_ACK；该扫描不进入每轮 e2e，失败仍使 run 无效。没有 stage 和 CPU scatter。
 
 预期每轮 600 个数据 WR、1 个 `ROUND_READY` WR、1 个反向 ACK WR；有效数据 614400 字节。HCOM 在 `Start()` 前必须显式 `SetTlsOptions(enableTls=false)`，避免默认 TLS 初始化。第一版即可记录 `submit_us`、`e2e_us` 和整体有效带宽，为下一阶段提供稳定参考。
 
@@ -179,13 +177,101 @@ boundscheck 等额外依赖按实测构建需求补充显式路径。链接动�
 
 阶段 1 交付：可构建代码、可用脚本、README、B1 原始结果与报告、PROGRESS 状态。没有硬件时交付上述可完成部分和准确的待执行命令，性能字段保留未测。
 
-## 5. 阶段 2：双链接、性能对比与打点
+## 4.5. 阶段 1.5：direct B1 热路径优化（未实现）
+
+### 1.5.1 目标与不变项
+
+只处理两个有明确代码依据的问题：`WaitUntil` 的逐次 clock/OS yield，以及每个 1 KiB 请求的 callback 分配和过密原子记账。目标是减少应用管理成本，判断它是否限制当前 hcom 穿刺性能；不预先承诺提速比例。
+
+保持：600 次异步 Put、source/dst stride=4096、1 ROUND_READY＋1 ACK、单轮在途、相同线程数量/绑核、队列、TLS、MR、verify 和完成口径。继续使用现有 hcom，每个 WRITE signaled，不改协议版本或引入跨轮窗口。
+
+原始对照记为 B1-original（perf_test `0f5e382` 或明确记录的当前快照）；优化后仍输出 case=B1，以版本/hash 标识。两个子改动分别保留独立 diff：B1-A 仅等待优化，B1-AB 为等待＋记账优化。不必为旧行为永久保留一组运行时开关；可保留三个独立构建产物。
+
+### 1.5.2 优化 A：数据面忙轮询，降低超时检查频率
+
+当前 `WaitUntil` 每次谓词未满足都会检查错误、读取时钟并 `std::this_thread::yield()`。它同时用于 sender 的 round completion、receiver 的 ROUND_READY 和 ACK 本地完成，因此这项开销进入 e2e。
+
+实施方案：
+
+1. 仅数据面等待采用忙轮询；建链、FINISH、错误 drain 保留有界的非性能等待。避免全局替换所有等待函数。
+2. 首选固定 `deadline_check_interval=256`（2 的幂），不新增无必要的 CLI 参数。每次 acquire 读取完成状态、快速检查 fatal，计数满 256 次再读时钟。入口和成功返回时检查错误，超时时抛出原有错误。
+3. 数据面不逐次调用 OS yield/sleep。可用目标平台轻量 CPU relax 提示；不要将 ARM 的处理器 hint 与 `std::this_thread::yield()` 混为一谈，也不要引入没有明确唤醒机制的 WFE/休眠。
+4. 运行前明确 app/worker 使用不同物理核心。配置不满足时拒绝该性能对比或保留旧模式并明确标记，不把共享单核的结果与绑核忙轮询结果混比。
+5. 每轮等待仍有 deadline，网络断开和不再发生回调时也必须退出；不能因为移除 yield 就改成无界循环。
+
+```cpp
+WaitData(predicate) {
+    CheckFatal();
+    const auto deadline = steady_now() + timeout;
+    uint32_t spins = 0;
+    while (!predicate()) {             // 谓词保持 acquire
+        if (fatal.load(acquire)) ThrowRecordedFailure();
+        CpuRelax();                    // 轻量提示，可为平台上的安全空操作
+        if ((++spins & 255) == 0 && steady_now() >= deadline)
+            ThrowTimeout();
+    }
+    CheckFatal();
+}
+```
+
+先运行 B1-original 与 B1-A，各 5 次，比较 e2e avg/p50/p95/p99、submit p50、有效 GB/s 和 CPU 使用量；独立短诊断可检查 sched_yield 调用与上下文切换，不在正式测量中启用 syscall tracing。忙轮询提高应用 CPU 占用属于预期代价，必须报告。
+
+### 1.5.3 优化 B：按线程所有权精简计数，控制 callback 成本
+
+当前每个数据请求有 1 次 callback new/delete，提交计数 1 次原子 RMW、完成计数 1 次、活动 callback 进入/退出 2 次；600 块合计 600 次分配/释放与 2400 次 demo 原子 RMW，不含 hcom timer/context、CQ 和控制消息。相邻的提交/完成计数还可能在同一 cache line 上被 app 与 CQ worker 反复写入。
+
+先做无需改 hcom 所有权的最小优化：
+
+1. 审核计数的全部读写者。`expected/attempted` 若仅由应用线程提交及同线程错误 drain 访问，改为普通 `uint64_t` 累计值，消除逐 Put 的 atomic fetch_add。不要对 callback 与主线程共享的 completed/fatal 变量照搬此改法。
+2. 在调用异步 API **之前**更新本线程 attempted 数，保留当前错误路径的语义。callback 可能在 API 返回前执行，不能假设它只能稍后发生。只有 API 返回成功才推进正常路径的成功提交统计；失败立即进入错误退出，不强行声称 600 个请求已全部成功。
+3. 按写入线程组织状态，隔离 app-owned 计数和 callback-owned 完成/活动计数，采用目标平台合适的 cache-line 对齐，不盲目宣称固定 64 字节适用于所有鲲鹏配置。仍保留必要的 release/acquire 发布。
+4. 首轮保留每请求 completed 原子更新和 `ActiveCallbackGuard`。`done == expected` 只表示完成计数满足，并不自动证明所有 callback 栈帧已退出；不能为少两条原子指令直接删掉 teardown 的活动保护。
+5. 不默认批量发布 completed 到第 600 个才更新，也不改成“只等待最后一个 callback”，避免部分提交失败时 drain 无法看到已完成前缀。如果后续要聚合计数，须单独解决错误/超时 callback 并发和尾部刷新，超出本阶段必做范围。
+
+累计值的最小语义示例：
+
+```cpp
+// app 线程独占 attempted；callback 只访问 shared completed/fatal/active
+for (block = 0; block < 600; ++block) {
+    cb = NewDataCallback();
+    if (!cb) FailBeforePost();
+    ++attempted_data;                 // 普通整数，不做逐包 atomic RMW
+    rc = ch->Put(req[block], cb);
+    if (rc != OK) EnterBoundedFailurePath();
+}
+// 正常全成功时，等待对应累计完成阈值及远端 ACK
+// 错误时不可假定失败 API 一定会回调；保留有界 drain，无法确认安全则进程退出
+```
+
+callback 动态分配的处理有明确边界：A/B 必做版本继续使用公共 `UBSHcomNewCallback`，保留其删除语义。用独立 profile 观察 allocator、callback、timer/CQ 在 CPU 样本中的占比；若分配没有成为主要成本，记录“保留，未证实值得复杂化”。这不是宣称已消除 600 次分配。
+
+只有 profile 明确指向分配瓶颈才追加 B 的可选复用实验：按单轮最大在途数建立固定容量 callback 存储，显式处理成功 Run 后归还和 hcom 错误路径 delete 后归还，两者只能发生一次；源/状态对象在所有回调退出前存活。未经真实库错误路径所有权核验，不得把栈对象、同一个永久 callback 或普通数组元素直接传入可能 delete 的 API。若需要泛化内存池或改库才能安全完成，作为后续独立优化，不阻塞本阶段最小方案，也不混入阶段 2 双链接收益。
+
+顺手将两个统计数组的 reserve 移到正式 wall 计时前，避免一次性分配混入有效带宽；这项边界修正在报告注明，不当成主要性能发现。
+
+### 1.5.4 验收与交付
+
+| 验证项 | 要求 |
+|---|---|
+| 协议回归 | original/A/AB 都是 600 WRITE＋1 ROUND_READY＋1 ACK，source/dst 无 scatter |
+| 内容与复用 | 20 轮完整 verify、模式切换与最终检查；等待 ACK 和本地完成后才复用 |
+| 完成竞态 | 覆盖 callback 早于 API 返回、快速完成和慢 worker；计数不得提前放行 |
+| 有界失败 | 拒绝提交/中途断开/无回调时仍有界结束，不释放仍被引用的对象 |
+| 原子所有权 | 去掉 atomic 的字段没有跨线程读写；活动保护和完成可见性仍成立 |
+| 性能对照 | original/A/AB 各 5 次、统一绑核与库，独立 profile，保留原始结果 |
+| 归因 | A 的等待收益与 B 的记账收益分别报告；callback 分配是否优化明确记录 |
+
+交付独立改动、README 中当前生效行为、PROGRESS、三组结果和一份阶段 1.5 报告；代码及本地检查完成但无硬件时记为 IMPLEMENTED / LOCAL_PASS_HW_PENDING，不能预填提速数据。保留原版供比较；若某项优化无收益或回退，说明证据，阶段 2 选用经验证的共同实现，不强行叠加退化改动。
+
+## 5. 阶段 2：在阶段 1 direct 基础上增加双链接并测量收益
 
 ### 5.1 双链接实现
 
+本阶段的唯一数据路径变化是 links=1 → links=2。沿用阶段 1 的 direct 地址布局、每轮通知/ACK、单轮在途和校验逻辑；阶段 1.5 中采用的优化同时用于 B1 与 B2。不能把未优化的阶段 1 历史 B1 与已优化的 B2 直接比较并称为“双链接收益”。独立 trace 是诊断功能，正式性能关闭。
+
 1. 将单 rail 状态放入长度不超过 2 的数组；每个 rail 独立 service、设备、MR、channel、就绪和 ACK 状态。
 2. 每条分配 300 块，global_block_id 为 `rail*300 + local_id`。块总量、stride 和有效数据量保持不变。
-3. 一个提交线程在 rail0/rail1 之间交替提交直接写最终 dst 的 300 个 Put；每条 rail 的 300 个 Put 后只发送一个 ROUND_READY。receiver 不增加 scatter 线程。
+3. 一个提交线程按块交替提交：Put(rail0,i)、Put(rail1,i)，i=0…299；完成提交后每条 rail 各发一个 ROUND_READY。receiver 不增加 scatter 线程，独立检查两条 rail 的 ready 并异步发各自 ACK，不能因等 rail0 ready 或 ACK 本地完成而阻塞 rail1 的通知处理。
 4. 等待两条 rail 的 ACK 和本地完成后才能开始下一轮；不能将 rail0 ACK 当整轮完成。
 5. 保留 `--links 1` 路径，使用同一个二进制重测 B1 与 B2。不能只用阶段 1 的历史 B1 数字与修改后的 B2 比较。
 
@@ -198,7 +284,7 @@ boundscheck 等额外依赖按实测构建需求补充显式路径。链接动�
 | 主机/线程 | 时间点 | 精确定义 |
 |---|---|---|
 | sender 应用 | S0 | 本轮首个数据 API 前 |
-| sender 应用 | S_post[r] | 对应 rail 的 300 个数据和 ROUND_READY API 均返回成功后 |
+| sender 应用 | S_post[r] | 对应 rail 的 Nrail=600/L 个数据和 ROUND_READY API 均返回成功后（B1 为 600，B2 为 300） |
 | sender 应用 | S1 | 本轮最后一个 ROUND_READY 提交成功后 |
 | sender CQ | S_data[r] | 该 rail 本轮最后一个数据 API callback 成功的时刻 |
 | sender 接收 callback | S_ack[r] | 收到并校验该 rail 本轮 ACK 后 |
@@ -232,7 +318,7 @@ direct B2 没有 receiver scatter 或 CPU 重叠指标。未同步跨机时钟�
 
 ### 5.3 验证和比较
 
-1. 重跑阶段 1 正确性与 B1；再做 B2 的完整校验和延迟单 rail 的验证，确认 ACK 栅栏和各 rail generation 正确。
+1. 重跑采用相同阶段 1.5 设置的 B1 正确性与性能；再做 B2 的完整校验和延迟单 rail 的验证，确认 ACK 栅栏和各 rail generation 正确。若阶段 1.5 尚未验收，B1/B2 都保留相同未优化实现并标明，不能只优化其中一组。
 2. 记录实际设备、端口、QP 对应关系，以及两张网卡测试前后端口计数。只有建立两个 channel 的日志不足以证明双 NIC 正常承载数据。
 3. 关闭 trace，在同一配置/同一二进制下交替运行 B1/B2，各 5 次；下一次 repeat 反转顺序，减少温度/频率与运行顺序偏差。
 4. 单独开启 trace，再运行 B1/B2，产出上述指标的分位数或分布摘要；记录 trace 对 e2e 的影响，不将它混入正式对照表。
@@ -251,14 +337,14 @@ bandwidth_ratio = median(B2 每次有效 GB/s) / median(B1 每次有效 GB/s)
 
 ### 6.1 实现步骤
 
-阶段 3 的 PutV 需要连续远端地址，因此这是一个新的 staged/scatter 实验，不是 direct B1 的等价替换。必须先实现同一 staging、同一 chunk 通知/ACK 的 `plain-staged` 对照；direct B1/B2 只作为独立回归和参考，不得混入同工作量的 SGL 加速结论。
+阶段 3 为把多个 iov 合并为一个 WRITE，需要连续远端地址；这不代表所有 PutV 输入都必须连续。SGL＋staging/scatter 与 direct 最终都更新相同的 600 个分散目标块，主实验比较两种策略的整体 e2e，验证减少 WR 是否足以抵消额外拷贝/通知成本。不要把整体差值全部归因于纯 SGL。需要分离归因时再增加同 staging、同 K、同通知/ACK 的 plain-staged 对照；它是可选诊断，不是阶段 3 的实现前置条件。
 
-1. 增加 `mode=plain-staged|sgl`、`sgl_items=8|16|30`；每 chunk 指向预生成描述符中的连续 iov 段。
+1. 保留 direct `mode=plain`，增加 `mode=sgl`、`sgl_items=8|16|30`；每 chunk 指向预生成描述符中的连续 iov 段。按需实现 `mode=plain-staged`，不将该模式混入 direct B1/B2。
 2. 每个 iov 的源地址仍按 4096 stride 分散，目标地址按 1024 连续，key 相同；一次异步 PutV 替代 chunk 内的 K 次 Put，通知 Send 和 scatter 协议不变。
 3. 核实每个参与 QP 的实际 `max_send_sge`。不足则明确 SKIP；实际能力暂时无法核实应标 pending，不能只读公共常量 30。
 4. 处理尾块，按实际地址数和实际字节发通知、scatter 与校验。
 5. 增加 `scatter=after-all`：接收同样的 chunk 通知，等全部到齐后才 scatter，不改变通知数量。
-6. 保留阶段 2 的打点，适配 chunk 数量即可；不要新增另一套时钟和指标。
+6. 复用阶段 2 的时钟与 trace 存储，在 staged 分支新增每 chunk 的 ready/scatter_begin/scatter_end；direct B1/B2 不产生 scatter 指标。以同机区间观察就绪到消费的延迟与 memcpy 时间，不用跨机相减冒充网络时延。
 
 | case | 数据 WR/轮 | Send 通知/轮 | 每 rail 尾块有效地址数 |
 |---|---:|---:|---|
@@ -275,13 +361,13 @@ bandwidth_ratio = median(B2 每次有效 GB/s) / median(B1 每次有效 GB/s)
 
 - 所有硬件支持的配置先运行完整内容校验，重点验证尾块长度、global block 编号、staging 边界和 dst 间隙。
 - 在独立短诊断中观察 `PostOneSideSglGrouped`：`groupCount=1`、WR opcode=WRITE、`num_sge` 为正确的 K/尾块数、目标地址和 QP 正确。保留证据，正式测量移除诊断开销。
-- 用同一二进制重跑 direct B1/B2 作回归；另对 plain-staged 和 6 个 SGL case 加 `S2-30-off` 作同布局比较。不支持的项附证据 SKIP。
+- 用同一二进制运行 direct B1/B2、6 个 SGL case 和 `S2-30-off`，共 9 个主 case，比较整体方案并回归 direct。不支持的项附证据 SKIP；plain-staged 按需追加并单列。
 - 对 `S2-30` 与 `S2-30-off` 做 trace 对照，证实消费时机改变且通知数量相同。若能力不支持 30，选择最高支持的 K 做 on/off 附加对照并明确命名，原 30 项仍 SKIP。
-- SGL=8/16 同时改变 WR 和通知粒度，报告中说明这是综合配置对比。需要严格分离变量时再加 plain chunk=8/16，不默认展开无关矩阵。
+- SGL=8/16/30 同时改变 WR 和通知粒度，报告中说明这是综合配置对比。需要严格分离变量时加对应 `plain-staged(L,K)`，其每轮仍为 600 数据 WR、`L*ceil((600/L)/K)` 个通知，不默认展开无关矩阵。
 
-重点分析：相对同链接数 plain-staged 对照的 e2e/submit 收益、receiver scatter 时间是否接近、CQ 排队变化、SGL=30 是否受提交内部开销或 CPU scatter 限制。callback 次数减少也是当前 hcom 路径的真实收益，但不能全部归为网卡 gather。
+重点分析：相对同链接数 direct 的 e2e/submit 收益能否覆盖新增 scatter/通知成本，SGL=30 是否受提交或 CPU scatter 限制；若增加 plain-staged，再分离合并路径收益。callback 次数减少也是当前 hcom 路径的真实收益，但不能全部归为网卡 gather。保持各组已验证的阶段 1.5 等待/记账实现一致。
 
-阶段 3 通过条件：支持的 SGL 配置正确、尾块正确、单 chunk/单 WR 核验、direct B1/B2 无回归、plain-staged 对照完整且 on/off 有明确数据与解释。仅成功调用 PutV 不算验证了 RDMA SGL 合并。
+阶段 3 通过条件：支持的 SGL 配置正确、尾块正确、单 chunk/单 WR 核验、direct B1/B2 无回归，整体对比及 on/off 有明确数据与解释。只有声称纯合并收益时才要求对应 plain-staged 证据。仅成功调用 PutV 不算验证了 RDMA SGL 合并。
 
 ## 7. 阶段 4：WRITE_WITH_IMM 优化
 
@@ -362,13 +448,17 @@ token 使用设计约定：`(generation << 8) | chunk_id`，24 位 generation、
 
 > 请读取 perf_test/DESIGN_CN.md 和 perf_test/IMPLEMENTATION_PLAN_CN.md，实施阶段 1：单 RDMA 链接 direct baseline。只使用当前 ubs-comm，循环异步 Put 600 个 1 KiB 块，第 i 块直接写最终 `dst + i*4096`；600 个 Put 后在同一真实 QP 上仅 Send 一次 ROUND_READY，receiver 校验最终 dst 后发 ACK 再复用。不得分配 staging 或做 CPU scatter；在 `Start()` 前显式关闭 TLS。交付最小 C++ 程序、CMake、可运行的 Python 跑测脚本、配置示例、README 和 PROGRESS。先验证完整内容与缓冲生命周期，再运行 baseline，保存真实日志和性能结果。不要实现双链接、SGL 或修改 IMM。没有目标 RDMA 硬件时完成可执行的本地工作并标明硬件验证 pending，禁止虚构结果。
 
+### 阶段 1.5 提示词
+
+> 请读取两份设计/实施文档、PROGRESS及当前代码，实施阶段1.5，保持direct B1的600个Put、1个ROUND_READY/ACK、单轮在途和线程/队列配置不变。优化A只改数据面等待：绑核下忙轮询、默认每256次检查deadline，去掉逐次OS yield，保留错误和超时。优化B按线程所有权把应用私有提交计数改普通累计值、隔离跨线程写入缓存行，保留共享完成计数和ActiveCallbackGuard，不能提前放行或破坏部分失败的drain。callback分配先保留，以独立profile决定是否值得安全复用，不直接传可被delete的栈/共享callback，不引入通用池或改hcom。分别交付原版/A/AB的diff、正确性和性能证据；将统计数组reserve移出wall计时并注明。无硬件则标pending。本阶段不实现双链接/SGL/scatter/IMM。
+
 ### 阶段 2 提示词
 
-> 请先读取两份设计/实施文档、PROGRESS 和阶段 1 结果，在已有 direct baseline 上实施阶段 2：两个 service 分别绑定两张 RDMA 网卡，每个 channel 一条 QP，每条传 300 块、直接写最终 dst，总数仍是 600。保持一个应用提交线程和相同的 ROUND_READY/ACK 完成口径，新增详细诊断打点，记录提交、本地完成、每 rail round-ready 和 ACK。交付同一二进制下 B1/B2 的真实对照结果、独立 trace、双 NIC 流量证据与报告。详细打点关闭时才进入正式性能主表，不跨机器相减时间戳。保持前一阶段可运行，本阶段不实现 SGL/IMM。
+> 请先读取两份设计/实施文档、PROGRESS 和阶段 1/1.5 结果，在阶段 1 direct baseline 上只扩展双链接：两个 service 分别绑定两张 NIC，每个 channel 一条 QP，每条传 300 块、直接写最终 dst，总数600。B1/B2 使用完全相同的阶段1.5优化与配置，保持一个应用提交线程、单轮在途和 ROUND_READY/ACK 完成口径，按块交替提交两条 rail。新增独立诊断打点，记录提交、本地完成、每rail round-ready和ACK。交付同一二进制下B1/B2真实对照、独立trace、双NIC流量证据与报告，不把阶段1.5收益算成双链接收益。正式性能关闭详细trace，不跨机器相减时间戳。本阶段不实现SGL/staging/scatter/IMM。
 
 ### 阶段 3 提示词
 
-> 请基于已完成的前两阶段实施 SGL：使用当前 worker-poll PutV 合并路径，测试 8/16/30 个分散源地址写入连续 staging，正确处理尾块，保留按 chunk Send 通知和流水 scatter。先实现相同布局的 plain-staged 对照；不能将 direct B1/B2 当作相同工作量的 SGL 对照。核实实际 QP SGE 能力，并在短诊断中证明每 chunk 一个 WR；不支持项明确 SKIP。保存 direct baseline 回归、plain-staged/SGL 正确性、WR 核验、性能与打点证据。不要将不同通知粒度的综合收益全部归为 SGL。本阶段不实现 WRITE_WITH_IMM。
+> 请基于已完成的阶段1/1.5/2实施SGL：使用当前worker-poll PutV合并路径，测试8/16/30个分散源地址写连续staging，正确处理尾块，新增按chunk Send通知和流水scatter。与同链接数direct B1/B2比较完成相同最终任务的整体e2e，验证WR减少能否抵消scatter/通知成本；需要纯合并收益归因时再加plain-staged，不作为前置条件。核实实际QP能力，短诊断证明每chunk一个WR，不支持项明确SKIP。保存9个主case的正确性、direct回归、WR核验、性能及on/off打点证据，不将综合收益全部归为网卡gather。本阶段不实现WRITE_WITH_IMM。
 
 ### 阶段 4 提示词
 
