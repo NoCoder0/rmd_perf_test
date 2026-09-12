@@ -627,6 +627,18 @@ uint64_t PercentileNs(const std::vector<uint64_t> &samples, double percentile)
     return sorted[index];
 }
 
+double AverageNs(const std::vector<uint64_t> &samples)
+{
+    if (samples.empty()) {
+        return 0.0;
+    }
+    long double total = 0.0;
+    for (const uint64_t sample : samples) {
+        total += static_cast<long double>(sample);
+    }
+    return static_cast<double>(total / static_cast<long double>(samples.size()));
+}
+
 double NsToUs(uint64_t nanoseconds)
 {
     return static_cast<double>(nanoseconds) / 1000.0;
@@ -1429,7 +1441,7 @@ private:
                << ",\"rounds_in_flight\":1,\"data_wr_per_round\":600,\"round_ready_wr_per_round\":1"
                << ",\"ack_wr_per_round\":1,\"verify_passed\":true";
         if (mOptions.kind == RunKind::Verify) {
-            output << ",\"measure_rounds\":0,\"submit_p50_us\":null,\"e2e_p50_us\":null"
+            output << ",\"measure_rounds\":0,\"submit_p50_us\":null,\"e2e_avg_us\":null,\"e2e_p50_us\":null"
                    << ",\"e2e_p95_us\":null,\"e2e_p99_us\":null,\"effective_GBps\":null,\"block_Mops\":null";
         } else {
             const uint64_t wallNs = mMeasureWallEndNs - mMeasureWallStartNs;
@@ -1438,6 +1450,7 @@ private:
             const double blockMops = static_cast<double>(mParams.measureRounds) * kBlocks / wallSeconds / 1e6;
             output << ",\"measure_rounds\":" << mParams.measureRounds
                    << ",\"submit_p50_us\":" << NsToUs(PercentileNs(mSubmitNs, 0.50))
+                   << ",\"e2e_avg_us\":" << AverageNs(mE2eNs) / 1000.0
                    << ",\"e2e_p50_us\":" << NsToUs(PercentileNs(mE2eNs, 0.50))
                    << ",\"e2e_p95_us\":" << NsToUs(PercentileNs(mE2eNs, 0.95))
                    << ",\"e2e_p99_us\":" << NsToUs(PercentileNs(mE2eNs, 0.99))

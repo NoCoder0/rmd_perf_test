@@ -389,7 +389,7 @@ def validate_result(result: Dict[str, Any], case: Case, kind: str, stage: Dict[s
     for key, value in expected.items():
         if result.get(key) != value:
             raise RunFailure(f"result field {key!r} is {result.get(key)!r}, expected {value!r}")
-    metrics = ["submit_p50_us", "e2e_p50_us", "e2e_p95_us", "e2e_p99_us", "effective_GBps", "block_Mops"]
+    metrics = ["submit_p50_us", "e2e_avg_us", "e2e_p50_us", "e2e_p95_us", "e2e_p99_us", "effective_GBps", "block_Mops"]
     if kind == "verify":
         if result.get("measure_rounds") != 0 or any(result.get(metric) is not None for metric in metrics):
             raise RunFailure("verify run emitted formal performance metrics")
@@ -409,9 +409,9 @@ def write_sender_report(output: pathlib.Path, kind: str, outcome: Dict[str, Any]
         lines += [
             "## Measurement",
             "",
-            "| Case | e2e p50 (us) | submit p50 (us) | effective GB/s |",
-            "|---|---:|---:|---:|",
-            f"| B1 | {float(result['e2e_p50_us']):.3f} | {float(result['submit_p50_us']):.3f} | {float(result['effective_GBps']):.3f} |",
+            "| Case | e2e avg (us) | e2e p50 (us) | submit p50 (us) | effective GB/s |",
+            "|---|---:|---:|---:|---:|",
+            f"| B1 | {float(result['e2e_avg_us']):.3f} | {float(result['e2e_p50_us']):.3f} | {float(result['submit_p50_us']):.3f} | {float(result['effective_GBps']):.3f} |",
             "",
             "This is one validated sender result. It is application effective throughput with one round in flight, including the ROUND_READY/ACK control path; it is not a NIC peak claim.",
             "",

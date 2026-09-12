@@ -126,7 +126,7 @@ export LD_LIBRARY_PATH="$UBS_ROOT/dist/hcom_3rdparty/libboundscheck/lib:${LD_LIB
   --listen <receiver_oob_ip>:19000 \
   --kind verify --verify-rounds 20 --warmup 0 --rounds 0 \
   --timeout-sec 10 --app-cpu <receiver_app_cpu> --worker-cpu <cq_cpu> \
-  --links 1 --mode plain
+  --links 1
 ```
 
 确认 receiver 已输出 `LISTENING` 后，在 sender 主机启动匹配参数的 sender：
@@ -139,7 +139,7 @@ export LD_LIBRARY_PATH="$UBS_ROOT/dist/hcom_3rdparty/libboundscheck/lib:${LD_LIB
   --peer <receiver_oob_ip>:19000 \
   --kind verify --verify-rounds 20 --warmup 0 --rounds 0 \
   --timeout-sec 10 --app-cpu <submit_cpu> --worker-cpu <cq_cpu> \
-  --links 1 --mode plain
+  --links 1
 ```
 
 用 `--kind measure`、`--warmup 1000 --rounds 10000` 进入正式计时；该模式仍会先跑完整 verify。sender 只在正常结束时输出一行 JSON。`--kind verify` 中所有正式带宽/延迟字段为 `null`，避免将正确性运行误读为性能结果。

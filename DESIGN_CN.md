@@ -396,6 +396,7 @@ WR 数核验使用独立短运行：在 `PostOneSideSglGrouped` 提交前通过�
 direct B1 不记录 `scatter_cpu_us`，因为没有 memcpy/scatter。后续 staged 诊断可记录该指标及首个 chunk 就绪到最后一个 scatter 完成的本机区间。正式计时默认不在每个 1 KiB memcpy 周围读时钟。不用未同步的两台机器时间戳直接相减。
 
 ```text
+e2e_avg：measure 轮次 e2e_us 的算术平均值
 e2e_p50/p95/p99：measure 轮次的 e2e_us 分位数
 effective_GBps = measure_rounds * 614400 / measured_wall_seconds / 1e9
 block_Mops    = measure_rounds * 600 / measured_wall_seconds / 1e6
@@ -543,7 +544,7 @@ S2-30 的数据方向从 20 个 WRITE + 20 个 Send 变为 20 个 WRITE_WITH_IMM
   "mode": "plain", "remote_layout": "direct-stride-4096", "tls_enabled": false,
   "rounds_in_flight": 1, "data_wr_per_round": 600,
   "round_ready_wr_per_round": 1, "ack_wr_per_round": 1, "measure_rounds": 10000,
-  "e2e_p50_us": null, "e2e_p95_us": null, "e2e_p99_us": null,
+  "e2e_avg_us": null, "e2e_p50_us": null, "e2e_p95_us": null, "e2e_p99_us": null,
   "submit_p50_us": null, "effective_GBps": null,
   "verify_passed": true
 }
