@@ -399,17 +399,11 @@ def validate_result(result: Dict[str, Any], case: Case, kind: str, stage: Dict[s
     metrics = [
         "submit_avg_us", "submit_p50_us", "submit_p95_us", "submit_p99_us",
         "e2e_avg_us", "e2e_p50_us", "e2e_p95_us", "e2e_p99_us",
-        "post_submit_wait_avg_us", "post_submit_wait_p50_us", "post_submit_wait_p95_us",
-        "post_submit_wait_p99_us", "ack_observed_p50_us", "ack_observed_p95_us",
-        "ack_observed_p99_us", "all_data_done_p50_us", "all_data_done_p95_us",
-        "all_data_done_p99_us", "round_ready_send_done_p50_us", "round_ready_send_done_p95_us",
-        "round_ready_send_done_p99_us", "effective_GBps", "block_Mops",
+        "effective_GBps", "block_Mops",
     ]
     if kind == "verify":
         if result.get("measure_rounds") != 0 or any(result.get(metric) is not None for metric in metrics):
             raise RunFailure("verify run emitted formal performance metrics")
-        if result.get("completion_gate_dominant") is not None or result.get("completion_gate_counts") is not None:
-            raise RunFailure("verify run emitted completion-gate metrics")
         return
     if result.get("measure_rounds") != stage["measure_rounds"]:
         raise RunFailure("measure result has an unexpected round count")
@@ -417,16 +411,6 @@ def validate_result(result: Dict[str, Any], case: Case, kind: str, stage: Dict[s
         value = result.get(metric)
         if not isinstance(value, (int, float)) or isinstance(value, bool) or value < 0:
             raise RunFailure(f"measure result {metric} must be a non-negative number")
-    gate_counts = result.get("completion_gate_counts")
-    gate_keys = {"ack", "data_done", "round_ready_send_done", "tie"}
-    if not isinstance(gate_counts, dict) or set(gate_counts) != gate_keys:
-        raise RunFailure("measure result completion_gate_counts has an invalid shape")
-    if any(not isinstance(value, int) or isinstance(value, bool) or value < 0 for value in gate_counts.values()):
-        raise RunFailure("measure result completion_gate_counts must contain non-negative integers")
-    if sum(gate_counts.values()) != stage["measure_rounds"]:
-        raise RunFailure("measure result completion_gate_counts does not match the round count")
-    if result.get("completion_gate_dominant") not in {"ack", "data_done", "round_ready_send_done", "tie", "mixed"}:
-        raise RunFailure("measure result completion_gate_dominant is invalid")
 
 
 def write_sender_report(output: pathlib.Path, kind: str, outcome: Dict[str, Any]) -> None:
@@ -443,15 +427,13 @@ def write_sender_report(output: pathlib.Path, kind: str, outcome: Dict[str, Any]
         lines += [
             "## Measurement",
             "",
-            "| Case | e2e avg (us) | e2e p50/p95/p99 (us) | submit p50/p95/p99 (us) | post-submit wait p50/p95/p99 (us) | gate | effective GB/s |",
-            "|---|---:|---:|---:|---:|---|---:|",
+            "| Case | e2e avg (us) | e2e p50/p95/p99 (us) | submit avg (us) | submit p50/p95/p99 (us) | effective GB/s |",
+            "|---|---:|---:|---:|---:|---:|",
             f"| B1 | {float(result['e2e_avg_us']):.3f} | "
             f"{float(result['e2e_p50_us']):.3f}/{float(result['e2e_p95_us']):.3f}/{float(result['e2e_p99_us']):.3f} | "
+            f"{float(result['submit_avg_us']):.3f} | "
             f"{float(result['submit_p50_us']):.3f}/{float(result['submit_p95_us']):.3f}/{float(result['submit_p99_us']):.3f} | "
-            f"{float(result['post_submit_wait_p50_us']):.3f}/{float(result['post_submit_wait_p95_us']):.3f}/{float(result['post_submit_wait_p99_us']):.3f} | "
-            f"{result['completion_gate_dominant']} | {float(result['effective_GBps']):.3f} |",
-            "",
-            f"Completion gate counts: `{result['completion_gate_counts']}`. Event latency fields are measured from the first Put of the same round; post-submit wait is paired per round.",
+            f"{float(result['effective_GBps']):.3f} |",
             "",
             "This is one validated sender result. It is application effective throughput with one round in flight, including the ROUND_READY/ACK control path; it is not a NIC peak claim.",
             "",

@@ -410,7 +410,8 @@ WR 数核验使用独立短运行：在 `PostOneSideSglGrouped` 提交前通过�
 - `submit_us`：首个数据 API 调用前，到唯一的 ROUND_READY 提交后。包含 hcom API、callback 创建和遇到的内部背压。
 - `e2e_us`：首个数据 API 调用前，到收齐 B1 的 ROUND_ACK，且本地数据/通知 callback 完成。它是 direct baseline 的主完成口径。
 - 可选诊断 `local_write_done_us`：所有数据 API callback 完成的时刻；不代表接收端已处理 ROUND_READY，不能用来替代 `e2e_us`。正式最小路径可不采集此项，避免增加 callback 时间戳开销。
-- 阶段 1.5 长尾诊断：逐轮配对计算 `post_submit_wait_us=e2e_us-submit_us`，并从同一轮首个 Put 前记录 `ack_observed_us`、`all_data_done_us`、`round_ready_send_done_us`。三者中最晚者计入 `completion_gate_counts`；该诊断每个正式轮次增加三个 callback 时钟采样，跨版本比较时必须统一启用。
+
+遗留问题（阶段 1.5 submit 长尾）：目标机 10000 轮结果中，`submit_avg/p50/p95/p99` 为 689.469/460.990/590.800/4617.720 us，`e2e_avg/p50/p95/p99` 为 699.652/469.210/599.190/4627.710 us。一次临时诊断显示逐轮 `post_submit_wait` 平均仅 10.183 us，且各完成事件的 p99 都紧随 submit p99；ACK 虽在 10000 轮中均为最终完成 gate，但现有证据表明毫秒级长尾已在 600 次 Put 加一次 ROUND_READY 的提交阶段形成，不能归因于最后的 `WaitData("round completion")` 或 ACK 双边往返。该问题暂缓，后续若恢复调查，应使用独立诊断模式定位 600 次提交内部的背压、callback/上下文分配回收、SQ/CQ 资源周期及线程抢占/频率/NUMA 影响，避免在正式 measure 的 callback 中保留额外时钟采样。
 
 direct B1 不记录 `scatter_cpu_us`，因为没有 memcpy/scatter。后续 staged 诊断可记录该指标及首个 chunk 就绪到最后一个 scatter 完成的本机区间。正式计时默认不在每个 1 KiB memcpy 周围读时钟。不用未同步的两台机器时间戳直接相减。
 

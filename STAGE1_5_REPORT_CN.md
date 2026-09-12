@@ -8,8 +8,6 @@
 
 当前只能记为 `IMPLEMENTED / LOCAL_PASS_HW_PENDING`。Windows 本机已完成受限语法检查；目标 Linux/AArch64 构建、self-test、错误注入、profile、双机 verify 和 5 次 original/A/AB 性能对照均未执行，因此本文没有性能数字，也不推断加速比例。
 
-后续诊断版增加同一轮配对的 `post_submit_wait_us`，以及从首个 Put 前起算的 `ack_observed_us`、`all_data_done_us`、`round_ready_send_done_us` p50/p95/p99。每轮将三个事件中最后到达者计入 `completion_gate_counts`，用于区分 ACK 双边路径、600 个本地 data callback 和 ROUND_READY 本地 Send completion。正式 measure 每轮因此新增三个时钟采样，跨版本比较必须统一使用该诊断版。
-
 ## 2. 阶段 1.5 改动
 
 ### A：数据面等待

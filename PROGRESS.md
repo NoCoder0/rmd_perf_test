@@ -35,8 +35,6 @@
 
 2026-09-12 阶段 1.5 本机复查：`git diff --check`、`run.py` AST/`--help` 和阶段 1.5 结果契约检查通过；使用依赖仓库 `9e4c035a5d68ccca02d05fade3b6f5907db24ef4` 的真实 service 公共头完成受限 `g++ -std=c++17 -fsyntax-only`，仅为 Windows 缺失的 Linux 声明使用临时兼容头且未保留进仓库。未执行链接、`rdma_600 --self-test`、profile 或 RDMA 测试。阶段 1.5 结果与双边消息精简分析见 `STAGE1_5_REPORT_CN.md`。
 
-同日追加长尾归因指标：逐轮配对记录 post-submit wait、ACK observed、all-data-done 与 ROUND_READY Send done，输出 avg/p50/p95/p99 及 completion-gate 计数。C++ 受限语法检查、Python verify/measure 结果契约和 `git diff --check` 通过；新增 callback 时钟采样的真实开销及长尾归因仍待目标机重测。
-
 ## 下一步：真实硬件验证
 
 2026-09-12 更新：阶段 1.5 代码已实现但硬件未验证。执行时须保留当前 B1 原版与 A-only 证据，再完成 original/A/AB 对照；阶段 2 只增加 direct 双链接并测量收益。以下命令仍使用共用 `--suite stage1`，实际版本由源码/diff、二进制 hash 和结果 JSON 的优化元数据识别。

@@ -210,12 +210,7 @@ sender 使用本机 `CLOCK_MONOTONIC_RAW` 记录：
 
 - `submit_us`：第一个 `Put` 前至唯一的 `ROUND_READY` `Send` 提交成功后，输出 avg/p50/p95/p99；
 - `e2e_us`：第一个 `Put` 前至收齐 ROUND_ACK，且本地 data/Send callback 均完成；
-- `post_submit_wait_us`：同一轮配对计算 `e2e_us - submit_us`，输出 avg/p50/p95/p99，不能用两个独立分位数相减代替；
-- `ack_observed_us`、`all_data_done_us`、`round_ready_send_done_us`：均从同一轮第一个 `Put` 前开始计时，分别输出 p50/p95/p99；
-- `completion_gate_counts`：按每轮三个完成时间点中的最晚者，统计 `ack`、`data_done`、`round_ready_send_done` 或纳秒级并列 `tie`，同时输出 dominant gate；
 - 有效带宽：正式循环的总 614400 字节/轮除以整段正式 wall time。
-
-这些诊断在正式 measure 的每轮 callback 中增加三个 `CLOCK_MONOTONIC_RAW` 采样，可能带来轻微观测开销；original/A/AB 或不同通知方案比较时必须统一启用相同版本。时间戳先写入，再通过 generation/counter 的 release/acquire 发布，避免完成条件已可见但时间戳尚未初始化。
 
 不同机器的时间戳不会相减。这个 direct baseline 没有 receiver 的 1 KiB memcpy 或 scatter 计时。正式 measure 每轮只检查 `ROUND_READY` generation 和完成状态，结束后完整检查最终 destination 与 stride gap；verify 轮则检查所有 64-bit word 的 generation/block/word 数据模式。
 
