@@ -373,6 +373,10 @@ def validate_result(result: Dict[str, Any], case: Case, kind: str, stage: Dict[s
         "status": "ok",
         "role": "sender",
         "kind": kind,
+        "optimization": "stage1.5-AB",
+        "data_wait": "busy-poll-relax",
+        "deadline_check_interval": 256,
+        "callback_allocation": "per-request",
         "links": case.links,
         "blocks": 600,
         "block_bytes": 1024,
@@ -389,6 +393,9 @@ def validate_result(result: Dict[str, Any], case: Case, kind: str, stage: Dict[s
     for key, value in expected.items():
         if result.get(key) != value:
             raise RunFailure(f"result field {key!r} is {result.get(key)!r}, expected {value!r}")
+    counter_alignment = result.get("counter_alignment_bytes")
+    if not isinstance(counter_alignment, int) or isinstance(counter_alignment, bool) or counter_alignment <= 0:
+        raise RunFailure("result field 'counter_alignment_bytes' must be a positive integer")
     metrics = ["submit_p50_us", "e2e_avg_us", "e2e_p50_us", "e2e_p95_us", "e2e_p99_us", "effective_GBps", "block_Mops"]
     if kind == "verify":
         if result.get("measure_rounds") != 0 or any(result.get(metric) is not None for metric in metrics):
@@ -403,8 +410,15 @@ def validate_result(result: Dict[str, Any], case: Case, kind: str, stage: Dict[s
 
 
 def write_sender_report(output: pathlib.Path, kind: str, outcome: Dict[str, Any]) -> None:
-    lines = ["# Stage 1 sender report", "", f"- Generated: {utc_now()}", f"- Requested kind: `{kind}`", ""]
+    lines = ["# Stage 1.5 sender report", "", f"- Generated: {utc_now()}", f"- Requested kind: `{kind}`", ""]
     result = outcome.get("result")
+    if outcome.get("status") == "ok" and isinstance(result, dict):
+        lines += [
+            f"- Optimization: `{result['optimization']}`",
+            f"- Data wait: `{result['data_wait']}`; deadline checked every {result['deadline_check_interval']} spins",
+            f"- Callback allocation: `{result['callback_allocation']}`",
+            "",
+        ]
     if outcome.get("status") == "ok" and isinstance(result, dict) and kind == "measure":
         lines += [
             "## Measurement",

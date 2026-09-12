@@ -1,6 +1,6 @@
 # ubs-comm：600 × 1 KiB RDMA 性能穿刺设计
 
-状态：阶段 1 direct B1 已实现；阶段 1.5、2、3、4 为计划，目标 Linux/RDMA 构建与硬件跑测尚未执行。更新日期：2026-09-12。当前实现参考 perf_test `0f5e382`，本文新增的优化不表示代码已修改。
+状态：阶段 1 direct B1 与阶段 1.5 A+B 已实现；阶段 2、3、4 为计划，目标 Linux/RDMA 构建与硬件跑测尚未执行。更新日期：2026-09-12。阶段 1 原始实现参考 perf_test `0f5e382`，阶段 1.5 当前代码与证据见 `STAGE1_5_REPORT_CN.md`。
 
 分阶段实施、跑测脚本契约、阶段验收与模型交接提示词见 [IMPLEMENTATION_PLAN_CN.md](C:/code/RDMA_DEMO/perf_test/IMPLEMENTATION_PLAN_CN.md)。
 
@@ -343,13 +343,13 @@ CPU :                  [scatter c0]       [scatter c1]       ...
 
 若 profile 证实 callback 分配占主导，再单独设计 callback 池或库内轻量异步接口，并让各组使用相同版本重新测量。首版不为了减少表面行数而依赖内部 `gEmptyCallback` 或切换全局 callback 模式绕过正常完成管理。
 
-### 阶段 1.5：direct 热路径优化边界（计划）
+### 阶段 1.5：direct 热路径优化边界（已实现，硬件验证 pending）
 
-当前 direct 代码在等待中每次调用时钟和 `std::this_thread::yield()`；每个数据请求还动态分配 callback，并执行提交计数、完成计数、活动 callback 进入/退出的原子更新。阶段 1.5 先优化这些应用侧成本，不改变 600 个 Put、一个 ROUND_READY/ACK、单轮在途及全 signaled 的库路径。
+阶段 1 原始 direct 代码在等待中每次调用时钟和 `std::this_thread::yield()`；每个数据请求还动态分配 callback，并执行提交计数、完成计数、活动 callback 进入/退出的原子更新。阶段 1.5 已优化这些应用侧成本，但不改变 600 个 Put、一个 ROUND_READY/ACK、单轮在途及全 signaled 的库路径。
 
 优化 A：仅数据面改为绑核条件下的忙轮询，默认每 256 次循环检查时钟/deadline，去掉每次 OS yield；保留 acquire 可见性、错误退出和非性能路径的有界等待。优化 B：把仅应用线程访问的提交计数改为线程私有累计值，隔离不同写入线程的共享缓存行，保留必要完成发布和退出保护。callback 分配先保留，只有独立 profile 证实其主导时才评估固定容量复用；不得直接复用会被 hcom 删除的 callback。
 
-A、B 分别形成可对比版本，记录 B1 原版、A、A+B 的正确性及性能；阶段 2 的 B1/B2 一起采用已验证的相同版本。具体伪代码、失败路径和验收见实施计划“阶段 1.5”，本段不代表优化已实现。
+A、B 分别形成可对比版本，记录 B1 原版、A、A+B 的正确性及性能；阶段 2 的 B1/B2 一起采用已验证的相同版本。具体实现、失败路径、当前本地证据和待执行硬件验收见实施计划“阶段 1.5”及 `STAGE1_5_REPORT_CN.md`。
 
 ## 10. 参数与队列预算
 
@@ -378,9 +378,9 @@ A、B 分别形成可对比版本，记录 B1 原版、A、A+B 的正确性及�
 | warmup rounds | 1000 | 清除建链/触页等一次性影响 |
 | measure rounds | 10000 | 各 case 相同；运行过短时包装脚本增加轮数 |
 | independent repeats | 5 | 每次新进程，报告中位数与波动 |
-| application progress timeout | 当前默认 10 秒 | 当前每次轮询读时钟；阶段 1.5 计划改为低频检查 |
+| application progress timeout | 当前默认 10 秒 | 数据面每 256 次 spin 读时钟；控制/失败路径仍有界 |
 | hcom operation timeout | 当前与 timeout_sec 相同，默认 10 秒 | 对齐实际 SetChannelTimeOut；阶段 1.5 不改变此值 |
-| data wait | 当前逐次 clock + OS yield | 阶段 1.5 计划忙轮询、每 256 次查 deadline；未实现 |
+| data wait | 忙轮询 + CPU relax | 阶段 1.5 已实现每 256 次查 deadline；目标机验证 pending |
 | generation | uint64，初始 1 | 不随 warmup/measure 重置 |
 
 SQ/RQ/CQ 表内是请求配置，实际创建值可能由 hcom 调整、受设备限制。不得仅凭设置值声称拥有对应硬件资源。记录设备 `max_sge`、实际 QP `max_send_sge`、队列大小和 active MTU；如果库暂未暴露实际 QP capability，可利用查询/诊断路径核实，不能把创建前日志当创建后结果。
@@ -421,7 +421,7 @@ block_Mops    = measure_rounds * 600 / measured_wall_seconds / 1e6
 speedup       = reference_e2e_median / candidate_e2e_median
 ```
 
-`measured_wall_seconds` 覆盖整个正式循环，包括轮次之间的调度、统计数组写入和 ACK 等待。分位数排序、JSON 输出都在计时结束后，不逐轮打印日志。当前实现先开始 wall 计时再 reserve 两个统计数组；阶段 1.5 将这项一次性准备移到计时前，并在对比报告记录该边界修正。每轮 submit/e2e 的起止定义保持不变。
+`measured_wall_seconds` 覆盖整个正式循环，包括轮次之间的调度、统计数组写入和 ACK 等待。分位数排序、JSON 输出都在计时结束后，不逐轮打印日志。阶段 1.5 已将两个统计数组的 reserve 移到 wall 计时前，并在对比报告记录该边界修正；每轮 submit/e2e 的起止定义保持不变。
 
 主带宽是 **单轮在途、包含 ROUND_READY/ACK 的 direct 应用有效带宽**，不能标成 NIC 峰值。它不包含 CPU scatter。若 ACK 栅栏使端口明显空闲，再增加跨轮窗口实验；该扩展需要多套 source/dst、slot 与 credit，本次先不实现。
 

@@ -1,6 +1,6 @@
-# RDMA 600 × 1 KiB — 阶段 1（B1）
+# RDMA 600 × 1 KiB — 阶段 1.5（direct B1）
 
-这是 ubs-comm RDMA 穿刺测试的最小独立实现。当前代码只实现阶段 1 的单链接 baseline：`B1`。设计、协议边界和后续阶段请见 [DESIGN_CN.md](DESIGN_CN.md) 与 [IMPLEMENTATION_PLAN_CN.md](IMPLEMENTATION_PLAN_CN.md)。
+这是 ubs-comm RDMA 穿刺测试的最小独立实现。当前代码在阶段 1 单链接 `B1` 上实现了阶段 1.5 的 A+B 热路径优化；数据协议和 WR 数没有改变。设计、协议边界和后续阶段请见 [DESIGN_CN.md](DESIGN_CN.md)、[IMPLEMENTATION_PLAN_CN.md](IMPLEMENTATION_PLAN_CN.md) 与 [STAGE1_5_REPORT_CN.md](STAGE1_5_REPORT_CN.md)。
 
 本仓库没有附带或伪造任何硬件性能数字。实际 RDMA 正确性和性能验证需要两台目标 Linux 主机、可工作的 RDMA 路径及匹配版本的 ubs-comm 构建产物。`run.py` 只在启动它的当前主机上运行由 `--role` 指定的一个角色，不会通过 SSH 连接、部署或启动另一台机器。
 
@@ -18,7 +18,9 @@
 
 阶段 1 明确拒绝双链接、SGL、旧的 `--chunk-items` / `--scatter` / `--notify` 参数和 `WRITE_WITH_IMM`；它们不属于这个 direct baseline。
 
-后续顺序为 **1.5 热路径优化 → 2 direct 双链接 → 3 SGL＋scatter → 4 WRITE_WITH_IMM**。阶段 1.5 保留当前协议，只优化数据面等待和记账；阶段 2 在同一实现下对比 B1/B2，不增加 scatter。上述均尚未编码，现有命令不因此新增参数，详见 [实施计划](C:/code/RDMA_DEMO/perf_test/IMPLEMENTATION_PLAN_CN.md) 与 [设计文档](C:/code/RDMA_DEMO/perf_test/DESIGN_CN.md)。
+阶段 1.5 的当前实现保持现有协议，只优化数据面等待和记账：热路径不再逐次调用 OS yield，默认每 256 次 spin 检查 deadline；应用线程独占的 attempted 计数不再逐请求做原子 RMW；callback 完成发布和 `ActiveCallbackGuard` 保留。每请求 callback 仍由 `UBSHcomNewCallback` 分配，尚无 profile 证据支持安全复用。阶段 2 之后才扩展 direct 双链接；当前没有实现 SGL、scatter 或 IMM。
+
+正式 `measure` 必须显式提供不同的 `--app-cpu` 和 `--worker-cpu`，并由运行者确认它们属于不同物理核心。结果 JSON 会标记 `optimization=stage1.5-AB`、等待策略、deadline 检查间隔、计数对齐值及 callback 分配策略，避免把优化版误当成原始基线。
 
 ## 构建
 

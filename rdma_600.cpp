@@ -34,6 +34,7 @@
 #include <limits>
 #include <map>
 #include <mutex>
+#include <new>
 #include <numeric>
 #include <sstream>
 #include <stdexcept>
@@ -85,8 +86,18 @@ constexpr uint64_t kPayloadBytes = static_cast<uint64_t>(kBlocks) * kBlockBytes;
 constexpr uint64_t kDestinationBytes = static_cast<uint64_t>(kBlocks) * kStrideBytes;
 constexpr uint8_t kDstGapSentinel = 0xa5;
 constexpr uint8_t kSourceGapSentinel = 0x5a;
+constexpr uint32_t kDataDeadlineCheckInterval = 256;
+#if defined(__cpp_lib_hardware_interference_size)
+constexpr size_t kCounterAlignment = std::hardware_destructive_interference_size;
+#else
+// Older standard libraries do not expose the platform value.  This fallback
+// is only an alignment choice; hardware runs must still record CPU topology.
+constexpr size_t kCounterAlignment = 64;
+#endif
 
 static_assert(kPayloadBytes == 614400, "the benchmark payload is fixed by design");
+static_assert((kDataDeadlineCheckInterval & (kDataDeadlineCheckInterval - 1)) == 0,
+    "the data deadline interval must be a power of two");
 
 constexpr uint16_t kOpHello = 700;
 constexpr uint16_t kOpReady = 701;
@@ -596,6 +607,10 @@ Options ParseOptions(int argc, char **argv)
     } else if (options.measureRounds == 0) {
         throw std::runtime_error("--rounds must be greater than zero for --kind measure");
     }
+    if (options.kind == RunKind::Measure && (options.appCpu < 0 || options.workerCpu < 0)) {
+        throw std::runtime_error(
+            "stage-1.5 measure requires explicit --app-cpu and --worker-cpu for pinned busy polling");
+    }
     return options;
 }
 
@@ -614,6 +629,18 @@ void PinCurrentThread(int cpu)
         throw std::runtime_error("sched_setaffinity failed for CPU " + std::to_string(cpu) + ": " +
             std::strerror(errno));
     }
+}
+
+inline void CpuRelax() noexcept
+{
+#if defined(__aarch64__) || defined(__arm__)
+    // This is the architectural spin-loop hint, not an operating-system yield.
+    __asm__ __volatile__("yield");
+#elif defined(__x86_64__) || defined(__i386__)
+    __asm__ __volatile__("pause");
+#else
+    std::atomic_signal_fence(std::memory_order_seq_cst);
+#endif
 }
 
 uint64_t PercentileNs(const std::vector<uint64_t> &samples, double percentile)
@@ -731,6 +758,23 @@ private:
     std::atomic<uint64_t> &mCounter;
 };
 
+// Only the application thread writes these counters.  Completion handlers
+// never read or modify them, so ordinary integers preserve the ownership rule
+// without a per-request atomic read-modify-write.
+struct alignas(kCounterAlignment) AppOwnedCounters {
+    uint64_t attemptedDataCallbacks = 0;
+    uint64_t attemptedSendCallbacks = 0;
+};
+
+// The HCOM worker/callback side owns all writes in this cache-line-aligned
+// group.  The application thread only observes them with acquire loads.
+struct alignas(kCounterAlignment) CallbackOwnedCounters {
+    std::atomic<uint64_t> workerAttemptedSendCallbacks{0};
+    std::atomic<uint64_t> dataDoneCallbacks{0};
+    std::atomic<uint64_t> sendDoneCallbacks{0};
+    std::atomic<uint64_t> activeCallbacks{0};
+};
+
 class Stage1Benchmark {
 public:
     explicit Stage1Benchmark(Options options) : mOptions(std::move(options))
@@ -816,16 +860,16 @@ private:
         mService->SetEnableMrCache(false);
         mService->RegisterRecvHandler([this](UBSHcomServiceContext &context) { return OnIncoming(context); });
         mService->RegisterSendHandler([this](const UBSHcomServiceContext &) {
-            ActiveCallbackGuard guard(mActiveCallbacks);
+            ActiveCallbackGuard guard(mCallbackCounters.activeCallbacks);
             return 0;
         });
         mService->RegisterOneSideHandler([this](const UBSHcomServiceContext &) {
-            ActiveCallbackGuard guard(mActiveCallbacks);
+            ActiveCallbackGuard guard(mCallbackCounters.activeCallbacks);
             return 0;
         });
         mService->RegisterChannelBrokenHandler(
             [this](const UBSHcomChannelPtr &) {
-                ActiveCallbackGuard guard(mActiveCallbacks);
+                ActiveCallbackGuard guard(mCallbackCounters.activeCallbacks);
                 if (!mTearingDown.load(std::memory_order_acquire)) {
                     RecordFailure("hcom channel broken");
                 }
@@ -875,7 +919,7 @@ private:
 
     int OnNewChannel(const UBSHcomChannelPtr &channel) noexcept
     {
-        ActiveCallbackGuard guard(mActiveCallbacks);
+        ActiveCallbackGuard guard(mCallbackCounters.activeCallbacks);
         if (mOptions.role != Role::Receiver || channel == nullptr) {
             RecordFailure("unexpected new channel");
             return -1;
@@ -973,7 +1017,7 @@ private:
 
     int OnIncoming(UBSHcomServiceContext &context) noexcept
     {
-        ActiveCallbackGuard guard(mActiveCallbacks);
+        ActiveCallbackGuard guard(mCallbackCounters.activeCallbacks);
         if (context.Result() != 0) {
             RecordFailure("incoming hcom context failed: " + std::to_string(context.Result()));
             return context.Result();
@@ -1017,7 +1061,7 @@ private:
             RecordFailure("unable to allocate READY callback");
             return -1;
         }
-        mExpectedSendCallbacks.fetch_add(1, std::memory_order_relaxed);
+        mCallbackCounters.workerAttemptedSendCallbacks.fetch_add(1, std::memory_order_relaxed);
         const UBSHcomRequest reply(mReadyPayload.data(), static_cast<uint32_t>(mReadyPayload.size()), kOpReady);
         const UBSHcomReplyContext replyContext(context.RspCtx(), 0);
         const int rc = context.Channel()->Reply(replyContext, reply, callback);
@@ -1109,12 +1153,12 @@ private:
     {
         return UBSHcomNewCallback(
             [this](UBSHcomServiceContext &context) {
-                ActiveCallbackGuard guard(mActiveCallbacks);
+                ActiveCallbackGuard guard(mCallbackCounters.activeCallbacks);
                 if (context.Result() != 0) {
                     RecordFailure("Put callback failed: " + std::to_string(context.Result()));
                     return;
                 }
-                mDataDoneCallbacks.fetch_add(1, std::memory_order_release);
+                mCallbackCounters.dataDoneCallbacks.fetch_add(1, std::memory_order_release);
             },
             std::placeholders::_1);
     }
@@ -1123,12 +1167,12 @@ private:
     {
         return UBSHcomNewCallback(
             [this](UBSHcomServiceContext &context) {
-                ActiveCallbackGuard guard(mActiveCallbacks);
+                ActiveCallbackGuard guard(mCallbackCounters.activeCallbacks);
                 if (context.Result() != 0) {
                     RecordFailure("Send/Reply callback failed: " + std::to_string(context.Result()));
                     return;
                 }
-                mSendDoneCallbacks.fetch_add(1, std::memory_order_release);
+                mCallbackCounters.sendDoneCallbacks.fetch_add(1, std::memory_order_release);
             },
             std::placeholders::_1);
     }
@@ -1147,9 +1191,9 @@ private:
             RunSenderRound(generation, false);
         }
         if (mParams.measureRounds != 0) {
-            mMeasureWallStartNs = NowNs();
             mSubmitNs.reserve(mParams.measureRounds);
             mE2eNs.reserve(mParams.measureRounds);
+            mMeasureWallStartNs = NowNs();
             for (uint32_t round = 0; round < mParams.measureRounds; ++round, ++generation) {
                 RunSenderRound(generation, true);
             }
@@ -1164,8 +1208,8 @@ private:
         if (channel == nullptr) {
             throw std::runtime_error("sender lost its channel before a round");
         }
-        const uint64_t expectedData = mExpectedDataCallbacks.load(std::memory_order_relaxed) + kBlocks;
-        const uint64_t expectedSend = mExpectedSendCallbacks.load(std::memory_order_relaxed) + 1;
+        const uint64_t expectedData = mAppCounters.attemptedDataCallbacks + kBlocks;
+        const uint64_t expectedSend = ExpectedSendCallbacks() + 1;
         const uint64_t startNs = NowNs();
 
         for (uint32_t block = 0; block < kBlocks; ++block) {
@@ -1173,7 +1217,7 @@ private:
             if (callback == nullptr) {
                 throw std::runtime_error("unable to allocate Put callback");
             }
-            mExpectedDataCallbacks.fetch_add(1, std::memory_order_relaxed);
+            ++mAppCounters.attemptedDataCallbacks;
             const int rc = channel->Put(mPutRequests[block], callback);
             if (rc != 0) {
                 throw std::runtime_error("Put failed: " + std::to_string(rc));
@@ -1182,10 +1226,10 @@ private:
         mRoundReadyPayload = EncodeAck(kRoundReadyMagic, generation);
         PostAsyncSend(channel, mRoundReadyPayload.data(), mRoundReadyPayload.size(), kOpRoundReady);
         const uint64_t submitNs = NowNs();
-        WaitUntil("round completion", [this, generation, expectedData, expectedSend] {
+        WaitData("round completion", [this, generation, expectedData, expectedSend] {
             return mAckGeneration.load(std::memory_order_acquire) >= generation &&
-                mDataDoneCallbacks.load(std::memory_order_acquire) >= expectedData &&
-                mSendDoneCallbacks.load(std::memory_order_acquire) >= expectedSend;
+                mCallbackCounters.dataDoneCallbacks.load(std::memory_order_acquire) >= expectedData &&
+                mCallbackCounters.sendDoneCallbacks.load(std::memory_order_acquire) >= expectedSend;
         });
         const uint64_t endNs = NowNs();
         if (measure) {
@@ -1197,7 +1241,7 @@ private:
     void RunReceiver()
     {
         for (uint64_t generation = 1; generation <= mParams.TotalRounds(); ++generation) {
-            WaitUntil("ROUND_READY", [this, generation] {
+            WaitData("ROUND_READY", [this, generation] {
                 return mRoundReadyGeneration.load(std::memory_order_acquire) >= generation;
             });
             if (generation <= mParams.verifyRounds) {
@@ -1208,7 +1252,7 @@ private:
         if (mParams.measureRounds != 0) {
             VerifyFinalMeasureDestination();
         }
-        WaitUntil("FINISH", [this] {
+        WaitControl("FINISH", [this] {
             return mFinishGeneration.load(std::memory_order_acquire) == mParams.TotalRounds();
         });
         SendFinishAck();
@@ -1233,9 +1277,9 @@ private:
         }
         mAckPayload = EncodeAck(kAckMagic, generation);
         PostAsyncSend(channel, mAckPayload.data(), mAckPayload.size(), kOpRoundAck);
-        const uint64_t target = mExpectedSendCallbacks.load(std::memory_order_acquire);
-        WaitUntil("ROUND_ACK local completion", [this, target] {
-            return mSendDoneCallbacks.load(std::memory_order_acquire) >= target;
+        const uint64_t target = ExpectedSendCallbacks();
+        WaitData("ROUND_ACK local completion", [this, target] {
+            return mCallbackCounters.sendDoneCallbacks.load(std::memory_order_acquire) >= target;
         });
     }
 
@@ -1247,11 +1291,11 @@ private:
         }
         mFinishPayload = EncodeFinish(kFinishMagic, mParams.TotalRounds());
         PostAsyncSend(channel, mFinishPayload.data(), mFinishPayload.size(), kOpFinish);
-        const uint64_t target = mExpectedSendCallbacks.load(std::memory_order_acquire);
-        WaitUntil("FINISH local completion", [this, target] {
-            return mSendDoneCallbacks.load(std::memory_order_acquire) >= target;
+        const uint64_t target = ExpectedSendCallbacks();
+        WaitControl("FINISH local completion", [this, target] {
+            return mCallbackCounters.sendDoneCallbacks.load(std::memory_order_acquire) >= target;
         });
-        WaitUntil("FINISH_ACK", [this] {
+        WaitControl("FINISH_ACK", [this] {
             return mFinishAckGeneration.load(std::memory_order_acquire) == mParams.TotalRounds();
         });
     }
@@ -1264,9 +1308,9 @@ private:
         }
         mFinishAckPayload = EncodeFinish(kFinishAckMagic, mParams.TotalRounds());
         PostAsyncSend(channel, mFinishAckPayload.data(), mFinishAckPayload.size(), kOpFinishAck);
-        const uint64_t target = mExpectedSendCallbacks.load(std::memory_order_acquire);
-        WaitUntil("FINISH_ACK local completion", [this, target] {
-            return mSendDoneCallbacks.load(std::memory_order_acquire) >= target;
+        const uint64_t target = ExpectedSendCallbacks();
+        WaitControl("FINISH_ACK local completion", [this, target] {
+            return mCallbackCounters.sendDoneCallbacks.load(std::memory_order_acquire) >= target;
         });
     }
 
@@ -1276,12 +1320,18 @@ private:
         if (callback == nullptr) {
             throw std::runtime_error("unable to allocate Send callback");
         }
-        mExpectedSendCallbacks.fetch_add(1, std::memory_order_relaxed);
+        ++mAppCounters.attemptedSendCallbacks;
         const UBSHcomRequest request(data, static_cast<uint32_t>(size), opcode);
         const int rc = channel->Send(request, callback);
         if (rc != 0) {
             throw std::runtime_error("Send opcode " + std::to_string(opcode) + " failed: " + std::to_string(rc));
         }
+    }
+
+    uint64_t ExpectedSendCallbacks() const noexcept
+    {
+        return mAppCounters.attemptedSendCallbacks +
+            mCallbackCounters.workerAttemptedSendCallbacks.load(std::memory_order_acquire);
     }
 
     void FillSenderVerifyPattern(uint64_t generation)
@@ -1310,7 +1360,25 @@ private:
     }
 
     template <typename Predicate>
-    void WaitUntil(const char *what, Predicate predicate)
+    void WaitData(const char *what, Predicate predicate)
+    {
+        CheckFatal(what);
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(mOptions.timeoutSec);
+        uint32_t spins = 0;
+        while (!predicate()) {
+            CheckFatal(what);
+            CpuRelax();
+            ++spins;
+            if ((spins & (kDataDeadlineCheckInterval - 1)) == 0 &&
+                std::chrono::steady_clock::now() >= deadline) {
+                throw std::runtime_error(std::string("timed out waiting for ") + what);
+            }
+        }
+        CheckFatal(what);
+    }
+
+    template <typename Predicate>
+    void WaitControl(const char *what, Predicate predicate)
     {
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(mOptions.timeoutSec);
         while (!predicate()) {
@@ -1386,20 +1454,19 @@ private:
     {
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(mOptions.timeoutSec);
         while (std::chrono::steady_clock::now() < deadline) {
-            const uint64_t expectedData = mExpectedDataCallbacks.load(std::memory_order_acquire);
-            const uint64_t expectedSend = mExpectedSendCallbacks.load(std::memory_order_acquire);
-            if (mDataDoneCallbacks.load(std::memory_order_acquire) >= expectedData &&
-                mSendDoneCallbacks.load(std::memory_order_acquire) >= expectedSend &&
-                mActiveCallbacks.load(std::memory_order_acquire) == 0) {
+            const uint64_t expectedData = mAppCounters.attemptedDataCallbacks;
+            const uint64_t expectedSend = ExpectedSendCallbacks();
+            if (mCallbackCounters.dataDoneCallbacks.load(std::memory_order_acquire) >= expectedData &&
+                mCallbackCounters.sendDoneCallbacks.load(std::memory_order_acquire) >= expectedSend &&
+                mCallbackCounters.activeCallbacks.load(std::memory_order_acquire) == 0) {
                 return true;
             }
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
-        return mDataDoneCallbacks.load(std::memory_order_acquire) >=
-                   mExpectedDataCallbacks.load(std::memory_order_acquire) &&
-            mSendDoneCallbacks.load(std::memory_order_acquire) >=
-                   mExpectedSendCallbacks.load(std::memory_order_acquire) &&
-            mActiveCallbacks.load(std::memory_order_acquire) == 0;
+        return mCallbackCounters.dataDoneCallbacks.load(std::memory_order_acquire) >=
+                   mAppCounters.attemptedDataCallbacks &&
+            mCallbackCounters.sendDoneCallbacks.load(std::memory_order_acquire) >= ExpectedSendCallbacks() &&
+            mCallbackCounters.activeCallbacks.load(std::memory_order_acquire) == 0;
     }
 
     void Teardown() noexcept
@@ -1436,7 +1503,11 @@ private:
         output << std::fixed << std::setprecision(3);
         output << "{\"case\":\"B1\",\"status\":\"ok\",\"commit\":\"" << RDMA_600_GIT_COMMIT
                << "\",\"role\":\"sender\",\"kind\":\"" << KindName(mOptions.kind)
-               << "\",\"links\":1,\"blocks\":600,\"block_bytes\":1024,\"payload_bytes\":614400"
+               << "\",\"optimization\":\"stage1.5-AB\",\"data_wait\":\"busy-poll-relax\""
+               << ",\"deadline_check_interval\":" << kDataDeadlineCheckInterval
+               << ",\"counter_alignment_bytes\":" << kCounterAlignment
+               << ",\"callback_allocation\":\"per-request\""
+               << ",\"links\":1,\"blocks\":600,\"block_bytes\":1024,\"payload_bytes\":614400"
                << ",\"mode\":\"plain\",\"remote_layout\":\"direct-stride-4096\",\"tls_enabled\":false"
                << ",\"rounds_in_flight\":1,\"data_wr_per_round\":600,\"round_ready_wr_per_round\":1"
                << ",\"ack_wr_per_round\":1,\"verify_passed\":true";
@@ -1498,11 +1569,8 @@ private:
     std::atomic<uint64_t> mAckGeneration{0};
     std::atomic<uint64_t> mFinishGeneration{0};
     std::atomic<uint64_t> mFinishAckGeneration{0};
-    std::atomic<uint64_t> mExpectedDataCallbacks{0};
-    std::atomic<uint64_t> mDataDoneCallbacks{0};
-    std::atomic<uint64_t> mExpectedSendCallbacks{0};
-    std::atomic<uint64_t> mSendDoneCallbacks{0};
-    std::atomic<uint64_t> mActiveCallbacks{0};
+    AppOwnedCounters mAppCounters;
+    CallbackOwnedCounters mCallbackCounters;
 
     std::vector<uint64_t> mSubmitNs;
     std::vector<uint64_t> mE2eNs;
