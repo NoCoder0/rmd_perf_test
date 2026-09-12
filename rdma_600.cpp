@@ -1,17 +1,9 @@
 // SPDX-License-Identifier: MulanPSL-2.0
 //
-// Stage 1 baseline for the 600 x 1 KiB ubs-comm RDMA experiment.
-//
-// This executable deliberately implements only B1:
-//   * one service / one RDMA device / one worker-poll QP;
-//   * 600 asynchronous 1 KiB Put operations per round, each directly targeting
-//     receiver dst + i * 4096;
-//   * one ROUND_READY Send after those writes on the same channel;
-//   * receiver-side validation and a per-round ACK (no staging or CPU scatter).
-//
-// It is intended to be built and run on the target Linux RDMA hosts.  The
-// --self-test mode has no RDMA dependency at runtime and validates the local
-// layout, pattern, and explicit wire encoders before a hardware run.
+// Stage 2 direct B1/B2 benchmark for the 600 x 1 KiB ubs-comm RDMA
+// experiment. Each rail owns one service, one explicitly selected RDMA NIC,
+// one linkCount=1 worker-poll channel/QP, one MR, and independent protocol
+// state. Internal hcom multirail is disabled.
 
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
@@ -29,7 +21,6 @@
 #include <exception>
 #include <functional>
 #include <iomanip>
-#include <iterator>
 #include <iostream>
 #include <limits>
 #include <map>
@@ -64,6 +55,7 @@ using ock::hcom::UBSHcomClientPollingMode;
 using ock::hcom::UBSHcomConnectOptions;
 using ock::hcom::UBSHcomMemoryKey;
 using ock::hcom::UBSHcomMultiRailOptions;
+using ock::hcom::UBSHcomNewCallback;
 using ock::hcom::UBSHcomOneSideRequest;
 using ock::hcom::UBSHcomRegMemoryRegion;
 using ock::hcom::UBSHcomReplyContext;
@@ -75,23 +67,21 @@ using ock::hcom::UBSHcomServiceOptions;
 using ock::hcom::UBSHcomServiceProtocol;
 using ock::hcom::UBSHcomTlsOptions;
 using ock::hcom::UBSHcomTwoSideThreshold;
-using ock::hcom::UBSHcomNewCallback;
 
-constexpr uint16_t kProtocolVersion = 2;
-constexpr uint16_t kLinks = 1;
+constexpr uint16_t kProtocolVersion = 3;
+constexpr uint16_t kMaxLinks = 2;
 constexpr uint32_t kBlocks = 600;
+constexpr uint32_t kMaxBlocksPerRail = kBlocks;
 constexpr uint32_t kBlockBytes = 1024;
 constexpr uint32_t kStrideBytes = 4096;
+constexpr uint32_t kMaxTraceRounds = 64;
+constexpr uint32_t kDataDeadlineCheckInterval = 256;
 constexpr uint64_t kPayloadBytes = static_cast<uint64_t>(kBlocks) * kBlockBytes;
-constexpr uint64_t kDestinationBytes = static_cast<uint64_t>(kBlocks) * kStrideBytes;
 constexpr uint8_t kDstGapSentinel = 0xa5;
 constexpr uint8_t kSourceGapSentinel = 0x5a;
-constexpr uint32_t kDataDeadlineCheckInterval = 256;
 #if defined(__cpp_lib_hardware_interference_size)
 constexpr size_t kCounterAlignment = std::hardware_destructive_interference_size;
 #else
-// Older standard libraries do not expose the platform value.  This fallback
-// is only an alignment choice; hardware runs must still record CPU topology.
 constexpr size_t kCounterAlignment = 64;
 #endif
 
@@ -113,48 +103,53 @@ constexpr uint32_t kAckMagic = 0x5244414bU;        // "RDAK"
 constexpr uint32_t kFinishMagic = 0x5244464eU;     // "RDFN"
 constexpr uint32_t kFinishAckMagic = 0x52444641U;  // "RDFA"
 
-constexpr size_t kHelloWireBytes = 32;
+// Params are 32 bytes in protocol v3. HELLO/READY also carry the rail id so
+// that a swapped OOB endpoint cannot silently become a valid dual-rail run.
+constexpr size_t kParametersWireBytes = 32;
+constexpr size_t kHelloWireBytes = 4 + kParametersWireBytes + 4;
 constexpr size_t kMemoryKeyWireBytes = 80;
-constexpr size_t kReadyWireBytes = kHelloWireBytes + 16 + kMemoryKeyWireBytes;
-constexpr size_t kAckWireBytes = 16;
-constexpr size_t kFinishWireBytes = 16;
+constexpr size_t kReadyWireBytes = 4 + kParametersWireBytes + 4 + 16 + kMemoryKeyWireBytes;
+constexpr size_t kTokenWireBytes = 16;
 
 enum class Role { Sender, Receiver };
-enum class RunKind { Verify, Measure };
+enum class RunKind { Verify, Measure, Trace };
 
 struct Options {
     Role role = Role::Sender;
     RunKind kind = RunKind::Measure;
-    std::string rdmaIp;
-    std::string listen;
-    std::string peer;
+    uint16_t links = 1;
+    std::vector<std::string> rdmaIps;
+    std::vector<std::string> endpoints;
     uint32_t verifyRounds = 20;
     uint32_t warmupRounds = 1000;
     uint32_t measureRounds = 10000;
+    uint32_t traceRounds = 0;
     uint32_t timeoutSec = 10;
     int appCpu = -1;
-    int workerCpu = -1;
+    std::vector<int> workerCpus;
     bool selfTest = false;
 };
 
 struct CaseParameters {
     uint16_t version = kProtocolVersion;
-    uint16_t links = kLinks;
+    uint16_t links = 1;
     uint32_t blocks = kBlocks;
     uint32_t blockBytes = kBlockBytes;
     uint32_t strideBytes = kStrideBytes;
     uint32_t verifyRounds = 0;
     uint32_t warmupRounds = 0;
     uint32_t measureRounds = 0;
+    uint32_t traceRounds = 0;
 
     uint64_t TotalRounds() const
     {
-        return static_cast<uint64_t>(verifyRounds) + warmupRounds + measureRounds;
+        return static_cast<uint64_t>(verifyRounds) + warmupRounds + measureRounds + traceRounds;
     }
 };
 
 struct ReadyInfo {
     CaseParameters params;
+    uint16_t rail = 0;
     uint64_t destinationAddress = 0;
     uint64_t destinationBytes = 0;
     UBSHcomMemoryKey destinationKey{};
@@ -208,6 +203,16 @@ uint64_t NowNs()
         throw std::runtime_error("clock_gettime(CLOCK_MONOTONIC_RAW) failed");
     }
     return static_cast<uint64_t>(ts.tv_sec) * 1000000000ULL + static_cast<uint64_t>(ts.tv_nsec);
+}
+
+bool TryNowNs(uint64_t &value) noexcept
+{
+    timespec ts{};
+    if (clock_gettime(CLOCK_MONOTONIC_RAW, &ts) != 0) {
+        return false;
+    }
+    value = static_cast<uint64_t>(ts.tv_sec) * 1000000000ULL + static_cast<uint64_t>(ts.tv_nsec);
+    return true;
 }
 
 void PutU16(uint8_t *&cursor, uint16_t value)
@@ -267,6 +272,7 @@ void EncodeParams(uint8_t *&cursor, const CaseParameters &params)
     PutU32(cursor, params.verifyRounds);
     PutU32(cursor, params.warmupRounds);
     PutU32(cursor, params.measureRounds);
+    PutU32(cursor, params.traceRounds);
 }
 
 CaseParameters DecodeParams(const uint8_t *&cursor)
@@ -280,6 +286,7 @@ CaseParameters DecodeParams(const uint8_t *&cursor)
     params.verifyRounds = GetU32(cursor);
     params.warmupRounds = GetU32(cursor);
     params.measureRounds = GetU32(cursor);
+    params.traceRounds = GetU32(cursor);
     return params;
 }
 
@@ -288,7 +295,7 @@ bool SameParams(const CaseParameters &left, const CaseParameters &right)
     return left.version == right.version && left.links == right.links && left.blocks == right.blocks &&
         left.blockBytes == right.blockBytes && left.strideBytes == right.strideBytes &&
         left.verifyRounds == right.verifyRounds && left.warmupRounds == right.warmupRounds &&
-        left.measureRounds == right.measureRounds;
+        left.measureRounds == right.measureRounds && left.traceRounds == right.traceRounds;
 }
 
 void EncodeMemoryKey(uint8_t *&cursor, const UBSHcomMemoryKey &key)
@@ -317,16 +324,18 @@ UBSHcomMemoryKey DecodeMemoryKey(const uint8_t *&cursor)
     return key;
 }
 
-std::array<uint8_t, kHelloWireBytes> EncodeHello(const CaseParameters &params)
+std::array<uint8_t, kHelloWireBytes> EncodeHello(const CaseParameters &params, uint16_t rail)
 {
     std::array<uint8_t, kHelloWireBytes> payload{};
     uint8_t *cursor = payload.data();
     PutU32(cursor, kHelloMagic);
     EncodeParams(cursor, params);
+    PutU16(cursor, rail);
+    PutU16(cursor, 0);
     return payload;
 }
 
-bool DecodeHello(const void *data, uint32_t size, CaseParameters &params)
+bool DecodeHello(const void *data, uint32_t size, CaseParameters &params, uint16_t &rail)
 {
     if (data == nullptr || size != kHelloWireBytes) {
         return false;
@@ -336,7 +345,8 @@ bool DecodeHello(const void *data, uint32_t size, CaseParameters &params)
         return false;
     }
     params = DecodeParams(cursor);
-    return true;
+    rail = GetU16(cursor);
+    return GetU16(cursor) == 0;
 }
 
 std::array<uint8_t, kReadyWireBytes> EncodeReady(const ReadyInfo &info)
@@ -345,6 +355,8 @@ std::array<uint8_t, kReadyWireBytes> EncodeReady(const ReadyInfo &info)
     uint8_t *cursor = payload.data();
     PutU32(cursor, kReadyMagic);
     EncodeParams(cursor, info.params);
+    PutU16(cursor, info.rail);
+    PutU16(cursor, 0);
     PutU64(cursor, info.destinationAddress);
     PutU64(cursor, info.destinationBytes);
     EncodeMemoryKey(cursor, info.destinationKey);
@@ -361,26 +373,30 @@ bool DecodeReady(const void *data, uint32_t size, ReadyInfo &info)
         return false;
     }
     info.params = DecodeParams(cursor);
+    info.rail = GetU16(cursor);
+    if (GetU16(cursor) != 0) {
+        return false;
+    }
     info.destinationAddress = GetU64(cursor);
     info.destinationBytes = GetU64(cursor);
     info.destinationKey = DecodeMemoryKey(cursor);
     return true;
 }
 
-std::array<uint8_t, kAckWireBytes> EncodeAck(uint32_t magic, uint64_t generation)
+std::array<uint8_t, kTokenWireBytes> EncodeToken(uint32_t magic, uint64_t generation, uint16_t rail)
 {
-    std::array<uint8_t, kAckWireBytes> payload{};
+    std::array<uint8_t, kTokenWireBytes> payload{};
     uint8_t *cursor = payload.data();
     PutU32(cursor, magic);
     PutU64(cursor, generation);
-    PutU16(cursor, 0);  // rail 0 in stage 1
+    PutU16(cursor, rail);
     PutU16(cursor, 0);
     return payload;
 }
 
-bool DecodeAck(const void *data, uint32_t size, uint32_t magic, uint64_t &generation)
+bool DecodeToken(const void *data, uint32_t size, uint32_t magic, uint64_t &generation, uint16_t &rail)
 {
-    if (data == nullptr || size != kAckWireBytes) {
+    if (data == nullptr || size != kTokenWireBytes) {
         return false;
     }
     const uint8_t *cursor = static_cast<const uint8_t *>(data);
@@ -388,30 +404,8 @@ bool DecodeAck(const void *data, uint32_t size, uint32_t magic, uint64_t &genera
         return false;
     }
     generation = GetU64(cursor);
-    return GetU16(cursor) == 0 && GetU16(cursor) == 0;
-}
-
-std::array<uint8_t, kFinishWireBytes> EncodeFinish(uint32_t magic, uint64_t generation)
-{
-    std::array<uint8_t, kFinishWireBytes> payload{};
-    uint8_t *cursor = payload.data();
-    PutU32(cursor, magic);
-    PutU64(cursor, generation);
-    PutU32(cursor, 0);
-    return payload;
-}
-
-bool DecodeFinish(const void *data, uint32_t size, uint32_t magic, uint64_t &generation)
-{
-    if (data == nullptr || size != kFinishWireBytes) {
-        return false;
-    }
-    const uint8_t *cursor = static_cast<const uint8_t *>(data);
-    if (GetU32(cursor) != magic) {
-        return false;
-    }
-    generation = GetU64(cursor);
-    return GetU32(cursor) == 0;
+    rail = GetU16(cursor);
+    return GetU16(cursor) == 0;
 }
 
 uint64_t PatternWord(uint64_t generation, uint32_t globalBlock, uint32_t wordIndex)
@@ -420,22 +414,22 @@ uint64_t PatternWord(uint64_t generation, uint32_t globalBlock, uint32_t wordInd
         (static_cast<uint64_t>(globalBlock) << 32U) ^ wordIndex;
 }
 
-void FillBlock(uint8_t *address, uint64_t generation, uint32_t block)
+void FillBlock(uint8_t *address, uint64_t generation, uint32_t globalBlock)
 {
     auto *words = reinterpret_cast<uint64_t *>(address);
     for (uint32_t word = 0; word < kBlockBytes / sizeof(uint64_t); ++word) {
-        words[word] = PatternWord(generation, block, word);
+        words[word] = PatternWord(generation, globalBlock, word);
     }
 }
 
-bool VerifyBlock(const uint8_t *address, uint64_t generation, uint32_t block, std::string &error)
+bool VerifyBlock(const uint8_t *address, uint64_t generation, uint32_t globalBlock, std::string &error)
 {
     const auto *words = reinterpret_cast<const uint64_t *>(address);
     for (uint32_t word = 0; word < kBlockBytes / sizeof(uint64_t); ++word) {
-        const uint64_t expected = PatternWord(generation, block, word);
+        const uint64_t expected = PatternWord(generation, globalBlock, word);
         if (words[word] != expected) {
             std::ostringstream stream;
-            stream << "data mismatch: generation=" << generation << " block=" << block << " word=" << word
+            stream << "data mismatch: generation=" << generation << " block=" << globalBlock << " word=" << word
                    << " expected=0x" << std::hex << expected << " actual=0x" << words[word];
             error = stream.str();
             return false;
@@ -462,7 +456,20 @@ std::string RoleName(Role role)
 
 std::string KindName(RunKind kind)
 {
-    return kind == RunKind::Measure ? "measure" : "verify";
+    switch (kind) {
+        case RunKind::Verify:
+            return "verify";
+        case RunKind::Measure:
+            return "measure";
+        case RunKind::Trace:
+            return "trace";
+    }
+    return "unknown";
+}
+
+std::string CaseName(uint16_t links)
+{
+    return links == 1 ? "B1" : "B2";
 }
 
 uint64_t ParseUnsigned(const std::string &name, const std::string &value, uint64_t maximum)
@@ -484,20 +491,48 @@ int ParseSignedCpu(const std::string &name, const std::string &value)
     if (value == "-1") {
         return -1;
     }
-    const uint64_t parsed = ParseUnsigned(name, value, static_cast<uint64_t>(std::numeric_limits<int>::max()));
-    return static_cast<int>(parsed);
+    return static_cast<int>(ParseUnsigned(name, value, static_cast<uint64_t>(std::numeric_limits<int>::max())));
+}
+
+std::vector<std::string> SplitCsv(const std::string &name, const std::string &value)
+{
+    std::vector<std::string> result;
+    size_t start = 0;
+    while (start <= value.size()) {
+        const size_t comma = value.find(',', start);
+        const std::string item = value.substr(start, comma == std::string::npos ? std::string::npos : comma - start);
+        if (item.empty()) {
+            throw std::runtime_error(name + " contains an empty item");
+        }
+        result.push_back(item);
+        if (comma == std::string::npos) {
+            break;
+        }
+        start = comma + 1;
+    }
+    return result;
+}
+
+std::vector<int> ParseCpuCsv(const std::string &name, const std::string &value)
+{
+    std::vector<int> cpus;
+    for (const std::string &item : SplitCsv(name, value)) {
+        cpus.push_back(ParseSignedCpu(name, item));
+    }
+    return cpus;
 }
 
 void PrintUsage(std::ostream &stream)
 {
     stream << "Usage:\n"
-           << "  rdma_600 --role receiver --rdma-ip <ip> --listen <oob-ip:port> [options]\n"
-           << "  rdma_600 --role sender --rdma-ip <ip> --peer <receiver-oob-ip:port> [options]\n"
+           << "  rdma_600 --role receiver --rdma-ips <ip0[,ip1]> --listen <ep0[,ep1]> [options]\n"
+           << "  rdma_600 --role sender --rdma-ips <ip0[,ip1]> --peer <ep0[,ep1]> [options]\n"
            << "  rdma_600 --self-test\n\n"
-           << "Stage 1 is fixed to: --links 1 --mode plain; 600 Put writes directly to "
-              "dst + i * 4096, with TLS disabled.\n"
-           << "Options: --kind verify|measure --verify-rounds N --warmup N --rounds N\n"
-           << "         --timeout-sec N --app-cpu N --worker-cpu N\n";
+           << "Stage 2 direct cases: --links 1 (B1) or --links 2 (B2), --mode plain.\n"
+           << "Singular --rdma-ip/--worker-cpu remain aliases for links=1.\n"
+           << "Options: --kind verify|measure|trace --verify-rounds N --warmup N --rounds N\n"
+           << "         --trace-rounds N (1..64 for trace) --timeout-sec N --app-cpu N\n"
+           << "         --worker-cpus <cpu0[,cpu1]>\n";
 }
 
 Options ParseOptions(int argc, char **argv)
@@ -532,9 +567,10 @@ Options ParseOptions(int argc, char **argv)
         return options;
     }
 
-    static const std::array<std::string, 13> kAllowedOptions = {
-        "--role", "--rdma-ip", "--listen", "--peer", "--kind", "--verify-rounds", "--warmup", "--rounds",
-        "--timeout-sec", "--app-cpu", "--worker-cpu", "--links", "--mode"};
+    static const std::array<std::string, 16> kAllowedOptions = {
+        "--role", "--rdma-ip", "--rdma-ips", "--listen", "--peer", "--kind", "--verify-rounds", "--warmup",
+        "--rounds", "--trace-rounds", "--timeout-sec", "--app-cpu", "--worker-cpu", "--worker-cpus", "--links",
+        "--mode"};
     for (const auto &entry : values) {
         if (std::find(kAllowedOptions.begin(), kAllowedOptions.end(), entry.first) == kAllowedOptions.end()) {
             throw std::runtime_error("unknown option: " + entry.first);
@@ -553,31 +589,64 @@ Options ParseOptions(int argc, char **argv)
         return it == values.end() ? fallback : it->second;
     };
 
+    options.links = static_cast<uint16_t>(ParseUnsigned("--links", optional("--links", "1"), kMaxLinks));
+    if (options.links == 0 || kBlocks % options.links != 0) {
+        throw std::runtime_error("--links must be 1 or 2 and evenly divide 600");
+    }
+    if (optional("--mode", "plain") != "plain") {
+        throw std::runtime_error("stage 2 supports only plain direct Put; no SGL/staging/scatter mode is available");
+    }
+
     const std::string role = required("--role");
     if (role == "sender") {
         options.role = Role::Sender;
-        options.peer = required("--peer");
+        options.endpoints = SplitCsv("--peer", required("--peer"));
         if (values.count("--listen") != 0) {
             throw std::runtime_error("--listen is only valid for receiver");
         }
     } else if (role == "receiver") {
         options.role = Role::Receiver;
-        options.listen = required("--listen");
+        options.endpoints = SplitCsv("--listen", required("--listen"));
         if (values.count("--peer") != 0) {
             throw std::runtime_error("--peer is only valid for sender");
         }
     } else {
         throw std::runtime_error("--role must be sender or receiver");
     }
-    options.rdmaIp = required("--rdma-ip");
+
+    if (values.count("--rdma-ip") != 0 && values.count("--rdma-ips") != 0) {
+        throw std::runtime_error("use only one of --rdma-ip and --rdma-ips");
+    }
+    options.rdmaIps = SplitCsv("--rdma-ips",
+        values.count("--rdma-ips") != 0 ? values.at("--rdma-ips") : required("--rdma-ip"));
+
+    if (values.count("--worker-cpu") != 0 && values.count("--worker-cpus") != 0) {
+        throw std::runtime_error("use only one of --worker-cpu and --worker-cpus");
+    }
+    if (values.count("--worker-cpus") != 0) {
+        options.workerCpus = ParseCpuCsv("--worker-cpus", values.at("--worker-cpus"));
+    } else {
+        options.workerCpus = {ParseSignedCpu("--worker-cpu", optional("--worker-cpu", "-1"))};
+    }
+
+    if (options.rdmaIps.size() != options.links || options.endpoints.size() != options.links ||
+        options.workerCpus.size() != options.links) {
+        throw std::runtime_error("RDMA IP, OOB endpoint, and worker CPU counts must all equal --links");
+    }
+    if (options.links == 2 && (options.rdmaIps[0] == options.rdmaIps[1] ||
+            options.endpoints[0] == options.endpoints[1] || options.workerCpus[0] == options.workerCpus[1])) {
+        throw std::runtime_error("B2 requires two distinct RDMA IPs, OOB endpoints, and worker CPUs");
+    }
 
     const std::string kind = optional("--kind", "measure");
     if (kind == "verify") {
         options.kind = RunKind::Verify;
     } else if (kind == "measure") {
         options.kind = RunKind::Measure;
+    } else if (kind == "trace") {
+        options.kind = RunKind::Trace;
     } else {
-        throw std::runtime_error("--kind must be verify or measure");
+        throw std::runtime_error("--kind must be verify, measure, or trace");
     }
     options.verifyRounds = static_cast<uint32_t>(ParseUnsigned("--verify-rounds", optional("--verify-rounds", "20"),
         std::numeric_limits<uint32_t>::max()));
@@ -585,31 +654,49 @@ Options ParseOptions(int argc, char **argv)
         std::numeric_limits<uint32_t>::max()));
     options.measureRounds = static_cast<uint32_t>(ParseUnsigned("--rounds", optional("--rounds", "10000"),
         std::numeric_limits<uint32_t>::max()));
+    options.traceRounds = static_cast<uint32_t>(ParseUnsigned("--trace-rounds", optional("--trace-rounds", "0"),
+        kMaxTraceRounds));
     options.timeoutSec = static_cast<uint32_t>(ParseUnsigned("--timeout-sec", optional("--timeout-sec", "10"), 32767));
     options.appCpu = ParseSignedCpu("--app-cpu", optional("--app-cpu", "-1"));
-    options.workerCpu = ParseSignedCpu("--worker-cpu", optional("--worker-cpu", "-1"));
 
-    if (optional("--links", "1") != "1" || optional("--mode", "plain") != "plain") {
-        throw std::runtime_error("this stage-1 binary only supports B1: links=1 plain direct dst Put");
-    }
     if (options.verifyRounds == 0) {
         throw std::runtime_error("--verify-rounds must be greater than zero");
     }
     if (options.timeoutSec == 0) {
         throw std::runtime_error("--timeout-sec must be greater than zero");
     }
-    if (options.appCpu >= 0 && options.appCpu == options.workerCpu) {
-        throw std::runtime_error("--app-cpu and --worker-cpu must use different cores");
+    for (int workerCpu : options.workerCpus) {
+        if (options.appCpu >= 0 && options.appCpu == workerCpu) {
+            throw std::runtime_error("--app-cpu must differ from every worker CPU");
+        }
     }
     if (options.kind == RunKind::Verify) {
+        if (options.traceRounds != 0) {
+            throw std::runtime_error("--trace-rounds is only valid for --kind trace");
+        }
         options.warmupRounds = 0;
         options.measureRounds = 0;
-    } else if (options.measureRounds == 0) {
-        throw std::runtime_error("--rounds must be greater than zero for --kind measure");
+        options.traceRounds = 0;
+    } else if (options.kind == RunKind::Measure) {
+        if (options.traceRounds != 0) {
+            throw std::runtime_error("--trace-rounds is only valid for --kind trace");
+        }
+        options.traceRounds = 0;
+        if (options.measureRounds == 0) {
+            throw std::runtime_error("--rounds must be greater than zero for --kind measure");
+        }
+    } else {
+        options.warmupRounds = 0;
+        options.measureRounds = 0;
+        if (options.traceRounds == 0) {
+            throw std::runtime_error("--trace-rounds must be in [1,64] for --kind trace");
+        }
     }
-    if (options.kind == RunKind::Measure && (options.appCpu < 0 || options.workerCpu < 0)) {
+    if (options.kind == RunKind::Measure &&
+        (options.appCpu < 0 || std::any_of(options.workerCpus.begin(), options.workerCpus.end(),
+            [](int cpu) { return cpu < 0; }))) {
         throw std::runtime_error(
-            "stage-1.5 measure requires explicit --app-cpu and --worker-cpu for pinned busy polling");
+            "stage-1.5 measure requires explicit app and per-rail worker CPUs for pinned busy polling");
     }
     return options;
 }
@@ -634,7 +721,6 @@ void PinCurrentThread(int cpu)
 inline void CpuRelax() noexcept
 {
 #if defined(__aarch64__) || defined(__arm__)
-    // This is the architectural spin-loop hint, not an operating-system yield.
     __asm__ __volatile__("yield");
 #elif defined(__x86_64__) || defined(__i386__)
     __asm__ __volatile__("pause");
@@ -671,67 +757,111 @@ double NsToUs(uint64_t nanoseconds)
     return static_cast<double>(nanoseconds) / 1000.0;
 }
 
+struct TracePoint {
+    std::atomic<uint64_t> timestampNs{0};
+    std::atomic<bool> published{false};
+
+    void Publish(uint64_t timestamp) noexcept
+    {
+        timestampNs.store(timestamp, std::memory_order_relaxed);
+        published.store(true, std::memory_order_release);
+    }
+
+    uint64_t Read(const char *event) const
+    {
+        if (!published.load(std::memory_order_acquire)) {
+            throw std::runtime_error(std::string("trace event was not published: ") + event);
+        }
+        return timestampNs.load(std::memory_order_relaxed);
+    }
+};
+
+struct TraceRound {
+    uint64_t generation = 0;
+    TracePoint s0;
+    std::array<TracePoint, kMaxLinks> sPost;
+    TracePoint s1;
+    std::array<TracePoint, kMaxLinks> sData;
+    std::array<TracePoint, kMaxLinks> sAck;
+    TracePoint s2;
+    std::array<TracePoint, kMaxLinks> rReady;
+    std::array<TracePoint, kMaxLinks> rAck;
+};
+
 bool RunSelfTest()
 {
     try {
-        CaseParameters parameters;
-        parameters.verifyRounds = 20;
-        parameters.warmupRounds = 0;
-        parameters.measureRounds = 0;
-        const auto hello = EncodeHello(parameters);
-        CaseParameters decoded{};
-        if (!DecodeHello(hello.data(), static_cast<uint32_t>(hello.size()), decoded) || !SameParams(parameters, decoded)) {
-            throw std::runtime_error("HELLO wire round trip failed");
-        }
+        for (uint16_t links : {uint16_t{1}, uint16_t{2}}) {
+            CaseParameters parameters;
+            parameters.links = links;
+            parameters.verifyRounds = 20;
+            parameters.traceRounds = 3;
+            for (uint16_t rail = 0; rail < links; ++rail) {
+                const auto hello = EncodeHello(parameters, rail);
+                CaseParameters decoded{};
+                uint16_t decodedRail = kMaxLinks;
+                if (!DecodeHello(hello.data(), static_cast<uint32_t>(hello.size()), decoded, decodedRail) ||
+                    !SameParams(parameters, decoded) || decodedRail != rail) {
+                    throw std::runtime_error("HELLO wire round trip failed");
+                }
 
-        UBSHcomMemoryKey key{};
-        for (size_t index = 0; index < std::size(key.keys); ++index) {
-            key.keys[index] = 0x1000U + index;
-            key.tokens[index] = 0x2000U + index;
-        }
-        for (size_t index = 0; index < std::size(key.eid); ++index) {
-            key.eid[index] = static_cast<uint8_t>(index);
-        }
-        ReadyInfo ready{parameters, 0x12345000U, kDestinationBytes, key};
-        const auto readyWire = EncodeReady(ready);
-        ReadyInfo decodedReady{};
-        if (!DecodeReady(readyWire.data(), static_cast<uint32_t>(readyWire.size()), decodedReady) ||
-            !SameParams(ready.params, decodedReady.params) ||
-            ready.destinationAddress != decodedReady.destinationAddress ||
-            ready.destinationBytes != decodedReady.destinationBytes ||
-            std::memcmp(&ready.destinationKey, &decodedReady.destinationKey, sizeof(key)) != 0) {
-            throw std::runtime_error("READY wire round trip failed");
-        }
+                UBSHcomMemoryKey key{};
+                for (size_t index = 0; index < std::size(key.keys); ++index) {
+                    key.keys[index] = 0x1000U + index + rail;
+                    key.tokens[index] = 0x2000U + index + rail;
+                }
+                for (size_t index = 0; index < std::size(key.eid); ++index) {
+                    key.eid[index] = static_cast<uint8_t>(index + rail);
+                }
+                ReadyInfo ready{parameters, rail, 0x12345000U, (kBlocks / links) * kStrideBytes, key};
+                const auto readyWire = EncodeReady(ready);
+                ReadyInfo decodedReady{};
+                if (!DecodeReady(readyWire.data(), static_cast<uint32_t>(readyWire.size()), decodedReady) ||
+                    !SameParams(ready.params, decodedReady.params) || decodedReady.rail != rail ||
+                    ready.destinationAddress != decodedReady.destinationAddress ||
+                    ready.destinationBytes != decodedReady.destinationBytes ||
+                    std::memcmp(&ready.destinationKey, &decodedReady.destinationKey, sizeof(key)) != 0) {
+                    throw std::runtime_error("READY wire round trip failed");
+                }
 
-        const auto roundReadyWire = EncodeAck(kRoundReadyMagic, 7);
-        uint64_t decodedGeneration = 0;
-        if (!DecodeAck(roundReadyWire.data(), static_cast<uint32_t>(roundReadyWire.size()), kRoundReadyMagic,
-                decodedGeneration) ||
-            decodedGeneration != 7) {
-            throw std::runtime_error("ROUND_READY wire round trip failed");
-        }
+                const auto token = EncodeToken(kRoundReadyMagic, 7, rail);
+                uint64_t decodedGeneration = 0;
+                decodedRail = kMaxLinks;
+                if (!DecodeToken(token.data(), static_cast<uint32_t>(token.size()), kRoundReadyMagic,
+                        decodedGeneration, decodedRail) || decodedGeneration != 7 || decodedRail != rail) {
+                    throw std::runtime_error("ROUND_READY wire round trip failed");
+                }
+            }
 
-        AlignedBuffer source;
-        AlignedBuffer destination;
-        source.Allocate(static_cast<size_t>(kBlocks) * kStrideBytes);
-        destination.Allocate(static_cast<size_t>(kBlocks) * kStrideBytes);
-        std::memset(source.Data(), kSourceGapSentinel, source.Size());
-        std::memset(destination.Data(), kDstGapSentinel, destination.Size());
-
-        constexpr uint64_t generation = 7;
-        for (uint32_t block = 0; block < kBlocks; ++block) {
-            FillBlock(source.Data() + static_cast<size_t>(block) * kStrideBytes, generation, block);
-            std::memcpy(destination.Data() + static_cast<size_t>(block) * kStrideBytes,
-                source.Data() + static_cast<size_t>(block) * kStrideBytes, kBlockBytes);
-        }
-        for (uint32_t block = 0; block < kBlocks; ++block) {
-            std::string error;
-            if (!VerifyBlock(destination.Data() + static_cast<size_t>(block) * kStrideBytes, generation, block, error) ||
-                !VerifyGap(destination.Data() + static_cast<size_t>(block) * kStrideBytes, error)) {
-                throw std::runtime_error(error);
+            const uint32_t blocksPerRail = kBlocks / links;
+            std::array<AlignedBuffer, kMaxLinks> source;
+            std::array<AlignedBuffer, kMaxLinks> destination;
+            constexpr uint64_t generation = 7;
+            for (uint16_t rail = 0; rail < links; ++rail) {
+                const size_t bytes = static_cast<size_t>(blocksPerRail) * kStrideBytes;
+                source[rail].Allocate(bytes);
+                destination[rail].Allocate(bytes);
+                std::memset(source[rail].Data(), kSourceGapSentinel, bytes);
+                std::memset(destination[rail].Data(), kDstGapSentinel, bytes);
+                for (uint32_t localBlock = 0; localBlock < blocksPerRail; ++localBlock) {
+                    const uint32_t globalBlock = rail * blocksPerRail + localBlock;
+                    FillBlock(source[rail].Data() + static_cast<size_t>(localBlock) * kStrideBytes,
+                        generation, globalBlock);
+                    std::memcpy(destination[rail].Data() + static_cast<size_t>(localBlock) * kStrideBytes,
+                        source[rail].Data() + static_cast<size_t>(localBlock) * kStrideBytes, kBlockBytes);
+                }
+                for (uint32_t localBlock = 0; localBlock < blocksPerRail; ++localBlock) {
+                    const uint32_t globalBlock = rail * blocksPerRail + localBlock;
+                    const uint8_t *address = destination[rail].Data() + static_cast<size_t>(localBlock) * kStrideBytes;
+                    std::string error;
+                    if (!VerifyBlock(address, generation, globalBlock, error) || !VerifyGap(address, error)) {
+                        throw std::runtime_error(error);
+                    }
+                }
             }
         }
-        std::cout << "SELF_TEST: PASS (600 direct blocks, 614400 bytes, dst stride 4096)" << std::endl;
+        std::cout << "SELF_TEST: PASS (B1/B2 direct partition, 600 blocks, 614400 bytes, stride 4096, wire v3)"
+                  << std::endl;
         return true;
     } catch (const std::exception &error) {
         std::cerr << "SELF_TEST: FAIL: " << error.what() << std::endl;
@@ -751,71 +881,101 @@ public:
         mCounter.fetch_sub(1, std::memory_order_release);
     }
 
-    ActiveCallbackGuard(const ActiveCallbackGuard &) = delete;
-    ActiveCallbackGuard &operator=(const ActiveCallbackGuard &) = delete;
-
 private:
     std::atomic<uint64_t> &mCounter;
 };
 
-// Only the application thread writes these counters.  Completion handlers
-// never read or modify them, so ordinary integers preserve the ownership rule
-// without a per-request atomic read-modify-write.
+// Application-thread attempted counters stay ordinary; callback threads never
+// read or write them. Callback-owned counters remain atomic and separated onto
+// another cache line. The same layout is used by B1 and every B2 rail.
 struct alignas(kCounterAlignment) AppOwnedCounters {
     uint64_t attemptedDataCallbacks = 0;
     uint64_t attemptedSendCallbacks = 0;
 };
 
-// The HCOM worker/callback side owns all writes in this cache-line-aligned
-// group.  The application thread only observes them with acquire loads.
 struct alignas(kCounterAlignment) CallbackOwnedCounters {
     std::atomic<uint64_t> workerAttemptedSendCallbacks{0};
     std::atomic<uint64_t> dataDoneCallbacks{0};
     std::atomic<uint64_t> sendDoneCallbacks{0};
-    std::atomic<uint64_t> activeCallbacks{0};
 };
 
-class Stage1Benchmark {
+struct RailState {
+    std::string serviceName;
+    UBSHcomService *service = nullptr;
+    UBSHcomChannelPtr channel;
+    AlignedBuffer buffer;
+    UBSHcomRegMemoryRegion memoryRegion;
+    bool memoryRegistered = false;
+    UBSHcomMemoryKey memoryKey{};
+    UBSHcomMemoryKey peerDestinationKey{};
+    uintptr_t peerDestinationAddress = 0;
+    std::array<UBSHcomOneSideRequest, kMaxBlocksPerRail> putRequests{};
+    std::array<uint8_t, kHelloWireBytes> helloPayload{};
+    std::array<uint8_t, kReadyWireBytes> readyPayload{};
+    std::array<uint8_t, kReadyWireBytes> readyResponse{};
+    std::array<uint8_t, kTokenWireBytes> roundReadyPayload{};
+    std::array<uint8_t, kTokenWireBytes> ackPayload{};
+    std::array<uint8_t, kTokenWireBytes> finishPayload{};
+    std::array<uint8_t, kTokenWireBytes> finishAckPayload{};
+    std::atomic<bool> helloSeen{false};
+    std::atomic<uint64_t> roundReadyGeneration{0};
+    std::atomic<uint64_t> ackGeneration{0};
+    std::atomic<uint64_t> finishGeneration{0};
+    std::atomic<uint64_t> finishAckGeneration{0};
+    AppOwnedCounters appCounters;
+    CallbackOwnedCounters callbackCounters;
+};
+
+class DirectBenchmark {
 public:
-    explicit Stage1Benchmark(Options options) : mOptions(std::move(options))
+    explicit DirectBenchmark(Options options) : mOptions(std::move(options))
     {
+        mParams.links = mOptions.links;
         mParams.verifyRounds = mOptions.verifyRounds;
         mParams.warmupRounds = mOptions.warmupRounds;
         mParams.measureRounds = mOptions.measureRounds;
+        mParams.traceRounds = mOptions.traceRounds;
+        mBlocksPerRail = kBlocks / mOptions.links;
+        if (TraceEnabled()) {
+            const uint64_t firstGeneration = static_cast<uint64_t>(mParams.verifyRounds) + 1;
+            for (uint32_t index = 0; index < mParams.traceRounds; ++index) {
+                mTrace[index].generation = firstGeneration + index;
+            }
+        }
     }
 
     int Run()
     {
         try {
             PinCurrentThread(mOptions.appCpu);
-            SetupService();
+            SetupServices();
             SetupMemory();
             if (mOptions.role == Role::Receiver) {
                 mReceiverReady.store(true, std::memory_order_release);
-                std::cout << "LISTENING role=receiver endpoint=" << mOptions.listen << " rdma_ip=" << mOptions.rdmaIp
-                          << std::endl;
-                std::cout.flush();
-                WaitForChannel();
+                PrintListening();
+                WaitForChannels();
                 RunReceiver();
             } else {
                 ConnectSender();
                 Handshake();
                 BuildPutRequests();
                 RunSender();
-                PrintSenderResult();
             }
             CheckFatal("normal completion");
             if (!DrainUntilComplete()) {
                 throw std::runtime_error("completion counters did not drain before teardown");
+            }
+            if (TraceEnabled()) {
+                EmitTrace();
+            }
+            if (mOptions.role == Role::Sender) {
+                PrintSenderResult();
             }
             Teardown();
             return 0;
         } catch (const std::exception &error) {
             RecordFailure(error.what());
             std::cerr << "ERROR: " << error.what() << std::endl;
-            // Do not free callback-owned state while a worker can still run it.  A
-            // bounded failed drain intentionally exits the process without C++
-            // destructors; the OS then reclaims the process and its worker threads.
             if (!DrainUntilComplete()) {
                 std::cerr << "FATAL: callbacks did not drain before the deadline; exiting without unsafe teardown"
                           << std::endl;
@@ -827,119 +987,162 @@ public:
     }
 
 private:
-    void SetupService()
+    bool TraceEnabled() const
     {
-        mServiceName = "rdma600_" + RoleName(mOptions.role) + "_0";
+        return mOptions.kind == RunKind::Trace;
+    }
+
+    bool TraceIndex(uint64_t generation, size_t &index) const noexcept
+    {
+        if (!TraceEnabled()) {
+            return false;
+        }
+        const uint64_t first = static_cast<uint64_t>(mParams.verifyRounds) + 1;
+        if (generation < first || generation >= first + mParams.traceRounds) {
+            return false;
+        }
+        index = static_cast<size_t>(generation - first);
+        return true;
+    }
+
+    void PublishCallbackTrace(uint64_t generation, TracePoint &point, const char *event) noexcept
+    {
+        size_t index = 0;
+        if (!TraceIndex(generation, index)) {
+            return;
+        }
+        uint64_t timestamp = 0;
+        if (!TryNowNs(timestamp)) {
+            RecordFailure(std::string("clock_gettime failed while recording ") + event);
+            return;
+        }
+        point.Publish(timestamp);
+    }
+
+    void SetupServices()
+    {
+        for (uint16_t rail = 0; rail < mOptions.links; ++rail) {
+            SetupService(rail);
+        }
+    }
+
+    void SetupService(uint16_t rail)
+    {
+        RailState &state = mRails[rail];
+        state.serviceName = "rdma600_" + RoleName(mOptions.role) + "_" + std::to_string(rail);
         UBSHcomServiceOptions options{};
         options.maxSendRecvDataSize = 1024;
         options.workerGroupThreadCount = 1;
         options.workerGroupMode = ock::hcom::NET_BUSY_POLLING;
-        if (mOptions.workerCpu >= 0) {
-            const auto cpu = static_cast<uint32_t>(mOptions.workerCpu);
+        if (mOptions.workerCpus[rail] >= 0) {
+            const auto cpu = static_cast<uint32_t>(mOptions.workerCpus[rail]);
             options.workerGroupCpuIdsRange = {cpu, cpu};
         }
-        mService = UBSHcomService::Create(UBSHcomServiceProtocol::RDMA, mServiceName, options);
-        if (mService == nullptr) {
-            throw std::runtime_error("UBSHcomService::Create(RDMA) returned null");
+        state.service = UBSHcomService::Create(UBSHcomServiceProtocol::RDMA, state.serviceName, options);
+        if (state.service == nullptr) {
+            throw std::runtime_error("UBSHcomService::Create(RDMA) returned null for rail " + std::to_string(rail));
         }
-        // HCOM defaults TLS to enabled.  This benchmark uses an isolated,
-        // trusted test path and does not provide certificates or PSK callbacks,
-        // so disable it before Start() creates the RDMA/OOB TLS context.
         UBSHcomTlsOptions tlsOptions{};
         tlsOptions.enableTls = false;
-        mService->SetTlsOptions(tlsOptions);
-        mService->SetDeviceIpMask({mOptions.rdmaIp + "/32"});
+        state.service->SetTlsOptions(tlsOptions);
+        state.service->SetDeviceIpMask({mOptions.rdmaIps[rail] + "/32"});
         UBSHcomMultiRailOptions multiRail{};
         multiRail.enable = false;
-        mService->SetMultiRailOptions(multiRail);
-        mService->SetSendQueueSize(1024);
-        mService->SetRecvQueueSize(256);
-        mService->SetCompletionQueueDepth(2048);
-        mService->SetQueuePrePostSize(128);
-        mService->SetPollingBatchSize(16);
-        mService->SetEnableMrCache(false);
-        mService->RegisterRecvHandler([this](UBSHcomServiceContext &context) { return OnIncoming(context); });
-        mService->RegisterSendHandler([this](const UBSHcomServiceContext &) {
-            ActiveCallbackGuard guard(mCallbackCounters.activeCallbacks);
+        state.service->SetMultiRailOptions(multiRail);
+        state.service->SetSendQueueSize(1024);
+        state.service->SetRecvQueueSize(256);
+        state.service->SetCompletionQueueDepth(2048);
+        state.service->SetQueuePrePostSize(128);
+        state.service->SetPollingBatchSize(16);
+        state.service->SetEnableMrCache(false);
+        state.service->RegisterRecvHandler(
+            [this, rail](UBSHcomServiceContext &context) { return OnIncoming(rail, context); });
+        state.service->RegisterSendHandler([this](const UBSHcomServiceContext &) {
+            ActiveCallbackGuard guard(mActiveCallbacks);
             return 0;
         });
-        mService->RegisterOneSideHandler([this](const UBSHcomServiceContext &) {
-            ActiveCallbackGuard guard(mCallbackCounters.activeCallbacks);
+        state.service->RegisterOneSideHandler([this](const UBSHcomServiceContext &) {
+            ActiveCallbackGuard guard(mActiveCallbacks);
             return 0;
         });
-        mService->RegisterChannelBrokenHandler(
-            [this](const UBSHcomChannelPtr &) {
-                ActiveCallbackGuard guard(mCallbackCounters.activeCallbacks);
+        state.service->RegisterChannelBrokenHandler(
+            [this, rail](const UBSHcomChannelPtr &) {
+                ActiveCallbackGuard guard(mActiveCallbacks);
                 if (!mTearingDown.load(std::memory_order_acquire)) {
-                    RecordFailure("hcom channel broken");
+                    RecordFailure("hcom channel broken on rail " + std::to_string(rail));
                 }
             },
             UBSHcomChannelBrokenPolicy::BROKEN_ALL);
 
         if (mOptions.role == Role::Receiver) {
-            const int rc = mService->Bind("tcp://" + mOptions.listen,
-                [this](const std::string &, const UBSHcomChannelPtr &channel, const std::string &) {
-                    return OnNewChannel(channel);
+            const int rc = state.service->Bind("tcp://" + mOptions.endpoints[rail],
+                [this, rail](const std::string &, const UBSHcomChannelPtr &channel, const std::string &) {
+                    return OnNewChannel(rail, channel);
                 });
-            RequireOk(rc, "Bind");
+            RequireOk(rc, ("Bind rail " + std::to_string(rail)).c_str());
         }
-        RequireOk(mService->Start(), "Start");
+        RequireOk(state.service->Start(), ("Start rail " + std::to_string(rail)).c_str());
     }
 
     void SetupMemory()
     {
-        if (mOptions.role == Role::Sender) {
-            mSource.Allocate(static_cast<size_t>(kBlocks) * kStrideBytes);
-            std::memset(mSource.Data(), kSourceGapSentinel, mSource.Size());
-            RequireOk(mService->RegisterMemoryRegion(reinterpret_cast<uintptr_t>(mSource.Data()), mSource.Size(), mSourceMr),
-                "RegisterMemoryRegion(source)");
-            mSourceMrRegistered = true;
-            mSourceKey = {};
-            mSourceMr.GetMemoryKey(mSourceKey);
-            if (mSourceMr.GetAddress() != reinterpret_cast<uintptr_t>(mSource.Data()) || mSourceMr.GetSize() < mSource.Size()) {
-                throw std::runtime_error("source MR does not cover the supplied source allocation");
+        const size_t railBytes = static_cast<size_t>(mBlocksPerRail) * kStrideBytes;
+        for (uint16_t rail = 0; rail < mOptions.links; ++rail) {
+            RailState &state = mRails[rail];
+            state.buffer.Allocate(railBytes);
+            std::memset(state.buffer.Data(),
+                mOptions.role == Role::Sender ? kSourceGapSentinel : kDstGapSentinel, state.buffer.Size());
+            RequireOk(state.service->RegisterMemoryRegion(
+                          reinterpret_cast<uintptr_t>(state.buffer.Data()), state.buffer.Size(), state.memoryRegion),
+                ("RegisterMemoryRegion rail " + std::to_string(rail)).c_str());
+            state.memoryRegistered = true;
+            state.memoryKey = {};
+            state.memoryRegion.GetMemoryKey(state.memoryKey);
+            if (state.memoryRegion.GetAddress() != reinterpret_cast<uintptr_t>(state.buffer.Data()) ||
+                state.memoryRegion.GetSize() < state.buffer.Size()) {
+                throw std::runtime_error("MR does not cover rail " + std::to_string(rail) + " allocation");
             }
-            FillSenderMeasurePattern();
-            return;
         }
-
-        mDestination.Allocate(static_cast<size_t>(kBlocks) * kStrideBytes);
-        std::memset(mDestination.Data(), kDstGapSentinel, mDestination.Size());
-        RequireOk(mService->RegisterMemoryRegion(
-                      reinterpret_cast<uintptr_t>(mDestination.Data()), mDestination.Size(), mDestinationMr),
-            "RegisterMemoryRegion(destination)");
-        mDestinationMrRegistered = true;
-        mDestinationKey = {};
-        mDestinationMr.GetMemoryKey(mDestinationKey);
-        if (mDestinationMr.GetAddress() != reinterpret_cast<uintptr_t>(mDestination.Data()) ||
-            mDestinationMr.GetSize() < mDestination.Size()) {
-            throw std::runtime_error("destination MR does not cover the supplied destination allocation");
+        if (mOptions.role == Role::Sender) {
+            FillSenderPattern(0);
         }
     }
 
-    int OnNewChannel(const UBSHcomChannelPtr &channel) noexcept
+    void PrintListening() const
     {
-        ActiveCallbackGuard guard(mCallbackCounters.activeCallbacks);
-        if (mOptions.role != Role::Receiver || channel == nullptr) {
+        std::ostringstream output;
+        output << "LISTENING role=receiver links=" << mOptions.links;
+        for (uint16_t rail = 0; rail < mOptions.links; ++rail) {
+            output << " rail" << rail << "=" << mOptions.endpoints[rail] << "/" << mOptions.rdmaIps[rail];
+        }
+        std::cout << output.str() << std::endl;
+        std::cout.flush();
+    }
+
+    int OnNewChannel(uint16_t rail, const UBSHcomChannelPtr &channel) noexcept
+    {
+        ActiveCallbackGuard guard(mActiveCallbacks);
+        if (mOptions.role != Role::Receiver || rail >= mOptions.links || channel == nullptr) {
             RecordFailure("unexpected new channel");
             return -1;
         }
-        if (!ConfigureChannel(channel)) {
+        if (!ConfigureChannel(rail, channel)) {
             return -1;
         }
+        RailState &state = mRails[rail];
         {
-            std::lock_guard<std::mutex> lock(mChannelMutex);
-            if (mChannel != nullptr) {
-                RecordFailure("receiver accepted more than one channel in stage 1");
+            std::lock_guard<std::mutex> lock(mChannelsMutex);
+            if (state.channel != nullptr) {
+                RecordFailure("receiver accepted more than one channel on rail " + std::to_string(rail));
                 return -1;
             }
-            mChannel = channel;
+            state.channel = channel;
         }
         mChannelCv.notify_all();
         return 0;
     }
 
-    bool ConfigureChannel(const UBSHcomChannelPtr &channel) noexcept
+    bool ConfigureChannel(uint16_t rail, const UBSHcomChannelPtr &channel) noexcept
     {
         try {
             channel->SetChannelTimeOut(static_cast<int16_t>(mOptions.timeoutSec),
@@ -949,230 +1152,294 @@ private:
             thresholds.rndvThreshold = UINT32_MAX;
             const int rc = channel->SetTwoSideThreshold(thresholds);
             if (rc != 0) {
-                RecordFailure("SetTwoSideThreshold failed: " + std::to_string(rc));
+                RecordFailure("SetTwoSideThreshold failed on rail " + std::to_string(rail) + ": " +
+                    std::to_string(rc));
                 return false;
             }
             return true;
         } catch (const std::exception &error) {
-            RecordFailure(std::string("ConfigureChannel failed: ") + error.what());
+            RecordFailure("ConfigureChannel failed on rail " + std::to_string(rail) + ": " + error.what());
             return false;
         }
     }
 
     void ConnectSender()
     {
-        UBSHcomConnectOptions options{};
-        options.linkCount = 1;
-        options.mode = UBSHcomClientPollingMode::WORKER_POLL;
-        options.cbType = UBSHcomChannelCallBackType::CHANNEL_FUNC_CB;
-        UBSHcomChannelPtr channel;
-        RequireOk(mService->Connect("tcp://" + mOptions.peer, channel, options), "Connect");
-        if (channel == nullptr) {
-            throw std::runtime_error("Connect succeeded without a channel");
-        }
-        if (!ConfigureChannel(channel)) {
-            CheckFatal("ConfigureChannel after Connect");
-            throw std::runtime_error("ConfigureChannel failed after Connect");
-        }
-        {
-            std::lock_guard<std::mutex> lock(mChannelMutex);
-            mChannel = channel;
+        for (uint16_t rail = 0; rail < mOptions.links; ++rail) {
+            UBSHcomConnectOptions options{};
+            options.linkCount = 1;
+            options.mode = UBSHcomClientPollingMode::WORKER_POLL;
+            options.cbType = UBSHcomChannelCallBackType::CHANNEL_FUNC_CB;
+            UBSHcomChannelPtr channel;
+            RequireOk(mRails[rail].service->Connect("tcp://" + mOptions.endpoints[rail], channel, options),
+                ("Connect rail " + std::to_string(rail)).c_str());
+            if (channel == nullptr) {
+                throw std::runtime_error("Connect succeeded without a channel on rail " + std::to_string(rail));
+            }
+            if (!ConfigureChannel(rail, channel)) {
+                CheckFatal("ConfigureChannel after Connect");
+                throw std::runtime_error("ConfigureChannel failed after Connect");
+            }
+            {
+                std::lock_guard<std::mutex> lock(mChannelsMutex);
+                mRails[rail].channel = channel;
+            }
         }
         mChannelCv.notify_all();
     }
 
     void Handshake()
     {
-        const UBSHcomChannelPtr channel = ChannelCopy();
-        if (channel == nullptr) {
-            throw std::runtime_error("HELLO without a connected channel");
+        const uint64_t expectedBytes = static_cast<uint64_t>(mBlocksPerRail) * kStrideBytes;
+        for (uint16_t rail = 0; rail < mOptions.links; ++rail) {
+            RailState &state = mRails[rail];
+            const UBSHcomChannelPtr channel = ChannelCopy(rail);
+            if (channel == nullptr) {
+                throw std::runtime_error("HELLO without a connected channel on rail " + std::to_string(rail));
+            }
+            state.helloPayload = EncodeHello(mParams, rail);
+            UBSHcomRequest request(state.helloPayload.data(), static_cast<uint32_t>(state.helloPayload.size()), kOpHello);
+            UBSHcomResponse response(state.readyResponse.data(), static_cast<uint32_t>(state.readyResponse.size()));
+            RequireOk(channel->Call(request, response, nullptr), ("HELLO Call rail " + std::to_string(rail)).c_str());
+            ReadyInfo ready{};
+            if (!DecodeReady(response.address, response.size, ready) || !SameParams(mParams, ready.params) ||
+                ready.rail != rail || ready.destinationAddress == 0 || ready.destinationBytes != expectedBytes) {
+                throw std::runtime_error("invalid READY response on rail " + std::to_string(rail));
+            }
+            state.peerDestinationAddress = static_cast<uintptr_t>(ready.destinationAddress);
+            state.peerDestinationKey = ready.destinationKey;
         }
-        mHelloPayload = EncodeHello(mParams);
-        UBSHcomRequest request(mHelloPayload.data(), static_cast<uint32_t>(mHelloPayload.size()), kOpHello);
-        UBSHcomResponse response(mReadyResponse.data(), static_cast<uint32_t>(mReadyResponse.size()));
-        RequireOk(channel->Call(request, response, nullptr), "HELLO Call");
-        ReadyInfo ready{};
-        if (!DecodeReady(response.address, response.size, ready) || !SameParams(mParams, ready.params) ||
-            ready.destinationAddress == 0 || ready.destinationBytes != kDestinationBytes) {
-            throw std::runtime_error("invalid READY response");
-        }
-        mPeerDestinationAddress = static_cast<uintptr_t>(ready.destinationAddress);
-        mPeerDestinationKey = ready.destinationKey;
     }
 
     void BuildPutRequests()
     {
-        if (mPeerDestinationAddress == 0) {
-            throw std::runtime_error("cannot prepare Put descriptors without READY");
-        }
-        for (uint32_t block = 0; block < kBlocks; ++block) {
-            UBSHcomOneSideRequest &request = mPutRequests[block];
-            request.lAddress = reinterpret_cast<uintptr_t>(mSource.Data()) + static_cast<uintptr_t>(block) * kStrideBytes;
-            request.rAddress = mPeerDestinationAddress + static_cast<uintptr_t>(block) * kStrideBytes;
-            request.lKey = mSourceKey;
-            request.rKey = mPeerDestinationKey;
-            request.size = kBlockBytes;
+        for (uint16_t rail = 0; rail < mOptions.links; ++rail) {
+            RailState &state = mRails[rail];
+            if (state.peerDestinationAddress == 0) {
+                throw std::runtime_error("cannot prepare Put descriptors without READY on rail " +
+                    std::to_string(rail));
+            }
+            for (uint32_t localBlock = 0; localBlock < mBlocksPerRail; ++localBlock) {
+                UBSHcomOneSideRequest &request = state.putRequests[localBlock];
+                request.lAddress = reinterpret_cast<uintptr_t>(state.buffer.Data()) +
+                    static_cast<uintptr_t>(localBlock) * kStrideBytes;
+                request.rAddress = state.peerDestinationAddress + static_cast<uintptr_t>(localBlock) * kStrideBytes;
+                request.lKey = state.memoryKey;
+                request.rKey = state.peerDestinationKey;
+                request.size = kBlockBytes;
+            }
         }
     }
 
-    int OnIncoming(UBSHcomServiceContext &context) noexcept
+    int OnIncoming(uint16_t rail, UBSHcomServiceContext &context) noexcept
     {
-        ActiveCallbackGuard guard(mCallbackCounters.activeCallbacks);
+        ActiveCallbackGuard guard(mActiveCallbacks);
+        const UBSHcomChannelPtr expectedChannel = ChannelCopy(rail);
+        if (expectedChannel == nullptr || context.Channel() != expectedChannel) {
+            RecordFailure("incoming message arrived on an unexpected channel for rail " + std::to_string(rail));
+            return -1;
+        }
         if (context.Result() != 0) {
-            RecordFailure("incoming hcom context failed: " + std::to_string(context.Result()));
+            RecordFailure("incoming hcom context failed on rail " + std::to_string(rail) + ": " +
+                std::to_string(context.Result()));
             return context.Result();
         }
         switch (context.OpCode()) {
             case kOpHello:
-                return OnHello(context);
+                return OnHello(rail, context);
             case kOpRoundReady:
-                return OnRoundReady(context);
+                return OnRoundReady(rail, context);
             case kOpRoundAck:
-                return OnRoundAck(context);
+                return OnRoundAck(rail, context);
             case kOpFinish:
-                return OnFinish(context);
+                return OnFinish(rail, context);
             case kOpFinishAck:
-                return OnFinishAck(context);
+                return OnFinishAck(rail, context);
             default:
-                RecordFailure("unexpected hcom opcode " + std::to_string(context.OpCode()));
+                RecordFailure("unexpected hcom opcode " + std::to_string(context.OpCode()) + " on rail " +
+                    std::to_string(rail));
                 return -1;
         }
     }
 
-    int OnHello(UBSHcomServiceContext &context) noexcept
+    int OnHello(uint16_t rail, UBSHcomServiceContext &context) noexcept
     {
         if (mOptions.role != Role::Receiver || !mReceiverReady.load(std::memory_order_acquire)) {
             RecordFailure("HELLO received before receiver initialization");
             return -1;
         }
         CaseParameters peer{};
-        if (!DecodeHello(context.MessageData(), context.MessageDataLen(), peer) || !SameParams(peer, mParams)) {
-            RecordFailure("HELLO parameters do not match the local B1 configuration");
+        uint16_t wireRail = kMaxLinks;
+        if (!DecodeHello(context.MessageData(), context.MessageDataLen(), peer, wireRail) ||
+            !SameParams(peer, mParams) || wireRail != rail) {
+            RecordFailure("HELLO parameters/rail do not match local configuration on rail " + std::to_string(rail));
             return -1;
         }
+        bool expected = false;
+        if (!mRails[rail].helloSeen.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
+            RecordFailure("duplicate HELLO on rail " + std::to_string(rail));
+            return -1;
+        }
+        RailState &state = mRails[rail];
         ReadyInfo ready{};
         ready.params = mParams;
-        ready.destinationAddress = reinterpret_cast<uintptr_t>(mDestination.Data());
-        ready.destinationBytes = mDestination.Size();
-        ready.destinationKey = mDestinationKey;
-        mReadyPayload = EncodeReady(ready);
-        Callback *callback = NewSendCallback();
+        ready.rail = rail;
+        ready.destinationAddress = reinterpret_cast<uintptr_t>(state.buffer.Data());
+        ready.destinationBytes = state.buffer.Size();
+        ready.destinationKey = state.memoryKey;
+        state.readyPayload = EncodeReady(ready);
+        Callback *callback = NewSendCallback(rail);
         if (callback == nullptr) {
             RecordFailure("unable to allocate READY callback");
             return -1;
         }
-        mCallbackCounters.workerAttemptedSendCallbacks.fetch_add(1, std::memory_order_relaxed);
-        const UBSHcomRequest reply(mReadyPayload.data(), static_cast<uint32_t>(mReadyPayload.size()), kOpReady);
+        state.callbackCounters.workerAttemptedSendCallbacks.fetch_add(1, std::memory_order_relaxed);
+        const UBSHcomRequest reply(state.readyPayload.data(), static_cast<uint32_t>(state.readyPayload.size()), kOpReady);
         const UBSHcomReplyContext replyContext(context.RspCtx(), 0);
         const int rc = context.Channel()->Reply(replyContext, reply, callback);
         if (rc != 0) {
-            // hcom owns or destroys the asynchronous callback on its own error
-            // paths.  Do not delete it here and risk a double free.
-            RecordFailure("READY Reply failed: " + std::to_string(rc));
+            RecordFailure("READY Reply failed on rail " + std::to_string(rail) + ": " + std::to_string(rc));
             return rc;
         }
         return 0;
     }
 
-    int OnRoundReady(UBSHcomServiceContext &context) noexcept
+    bool DecodeAndValidateToken(uint16_t rail, UBSHcomServiceContext &context, uint32_t magic,
+        const char *name, uint64_t &generation) noexcept
+    {
+        uint16_t wireRail = kMaxLinks;
+        if (!DecodeToken(context.MessageData(), context.MessageDataLen(), magic, generation, wireRail) ||
+            generation == 0 || wireRail != rail) {
+            RecordFailure(std::string("invalid ") + name + " payload/rail on rail " + std::to_string(rail));
+            return false;
+        }
+        return true;
+    }
+
+    int OnRoundReady(uint16_t rail, UBSHcomServiceContext &context) noexcept
     {
         if (mOptions.role != Role::Receiver) {
             RecordFailure("sender received ROUND_READY");
             return -1;
         }
         uint64_t generation = 0;
-        if (!DecodeAck(context.MessageData(), context.MessageDataLen(), kRoundReadyMagic, generation) || generation == 0) {
-            RecordFailure("invalid ROUND_READY payload");
+        if (!DecodeAndValidateToken(rail, context, kRoundReadyMagic, "ROUND_READY", generation)) {
             return -1;
         }
-        const uint64_t previous = mRoundReadyGeneration.load(std::memory_order_relaxed);
+        RailState &state = mRails[rail];
+        const uint64_t previous = state.roundReadyGeneration.load(std::memory_order_relaxed);
         if (generation != previous + 1) {
-            RecordFailure("ROUND_READY generation is not strictly increasing");
+            RecordFailure("ROUND_READY generation is not strictly increasing on rail " + std::to_string(rail));
             return -1;
         }
-        // A successful SEND on this QP follows all 600 direct WRITE requests.
-        // The release store only publishes that complete-round state to the app
-        // thread; it is not a substitute for RDMA DMA ordering.
-        mRoundReadyGeneration.store(generation, std::memory_order_release);
+        size_t traceIndex = 0;
+        if (TraceIndex(generation, traceIndex)) {
+            PublishCallbackTrace(generation, mTrace[traceIndex].rReady[rail], "R_ready");
+        }
+        // This release publishes both DMA-complete data and R_ready to the app
+        // thread. It relies on ordered WRITE then SEND on this rail's real QP.
+        state.roundReadyGeneration.store(generation, std::memory_order_release);
         return 0;
     }
 
-    int OnRoundAck(UBSHcomServiceContext &context) noexcept
+    int OnRoundAck(uint16_t rail, UBSHcomServiceContext &context) noexcept
     {
         if (mOptions.role != Role::Sender) {
             RecordFailure("receiver received ROUND_ACK");
             return -1;
         }
         uint64_t generation = 0;
-        if (!DecodeAck(context.MessageData(), context.MessageDataLen(), kAckMagic, generation) || generation == 0) {
-            RecordFailure("invalid ROUND_ACK payload");
+        if (!DecodeAndValidateToken(rail, context, kAckMagic, "ROUND_ACK", generation)) {
             return -1;
         }
-        const uint64_t previous = mAckGeneration.load(std::memory_order_relaxed);
+        RailState &state = mRails[rail];
+        const uint64_t previous = state.ackGeneration.load(std::memory_order_relaxed);
         if (generation != previous + 1) {
-            RecordFailure("ROUND_ACK generation is not strictly increasing");
+            RecordFailure("ROUND_ACK generation is not strictly increasing on rail " + std::to_string(rail));
             return -1;
         }
-        mAckGeneration.store(generation, std::memory_order_release);
+        size_t traceIndex = 0;
+        if (TraceIndex(generation, traceIndex)) {
+            PublishCallbackTrace(generation, mTrace[traceIndex].sAck[rail], "S_ack");
+        }
+        state.ackGeneration.store(generation, std::memory_order_release);
         return 0;
     }
 
-    int OnFinish(UBSHcomServiceContext &context) noexcept
+    int OnFinish(uint16_t rail, UBSHcomServiceContext &context) noexcept
     {
         if (mOptions.role != Role::Receiver) {
             RecordFailure("sender received FINISH");
             return -1;
         }
         uint64_t generation = 0;
-        if (!DecodeFinish(context.MessageData(), context.MessageDataLen(), kFinishMagic, generation) ||
+        if (!DecodeAndValidateToken(rail, context, kFinishMagic, "FINISH", generation) ||
             generation != mParams.TotalRounds()) {
-            RecordFailure("invalid FINISH payload");
+            RecordFailure("invalid FINISH generation on rail " + std::to_string(rail));
             return -1;
         }
-        mFinishGeneration.store(generation, std::memory_order_release);
+        uint64_t expected = 0;
+        if (!mRails[rail].finishGeneration.compare_exchange_strong(
+                expected, generation, std::memory_order_release, std::memory_order_relaxed)) {
+            RecordFailure("duplicate FINISH on rail " + std::to_string(rail));
+            return -1;
+        }
         return 0;
     }
 
-    int OnFinishAck(UBSHcomServiceContext &context) noexcept
+    int OnFinishAck(uint16_t rail, UBSHcomServiceContext &context) noexcept
     {
         if (mOptions.role != Role::Sender) {
             RecordFailure("receiver received FINISH_ACK");
             return -1;
         }
         uint64_t generation = 0;
-        if (!DecodeFinish(context.MessageData(), context.MessageDataLen(), kFinishAckMagic, generation) ||
+        if (!DecodeAndValidateToken(rail, context, kFinishAckMagic, "FINISH_ACK", generation) ||
             generation != mParams.TotalRounds()) {
-            RecordFailure("invalid FINISH_ACK payload");
+            RecordFailure("invalid FINISH_ACK generation on rail " + std::to_string(rail));
             return -1;
         }
-        mFinishAckGeneration.store(generation, std::memory_order_release);
+        uint64_t expected = 0;
+        if (!mRails[rail].finishAckGeneration.compare_exchange_strong(
+                expected, generation, std::memory_order_release, std::memory_order_relaxed)) {
+            RecordFailure("duplicate FINISH_ACK on rail " + std::to_string(rail));
+            return -1;
+        }
         return 0;
     }
 
-    Callback *NewDataCallback()
+    Callback *NewDataCallback(uint16_t rail, uint64_t generation, bool lastDataApi)
     {
         return UBSHcomNewCallback(
-            [this](UBSHcomServiceContext &context) {
-                ActiveCallbackGuard guard(mCallbackCounters.activeCallbacks);
+            [this, rail, generation, lastDataApi](UBSHcomServiceContext &context) {
+                ActiveCallbackGuard guard(mActiveCallbacks);
                 if (context.Result() != 0) {
-                    RecordFailure("Put callback failed: " + std::to_string(context.Result()));
+                    RecordFailure("Put callback failed on rail " + std::to_string(rail) + ": " +
+                        std::to_string(context.Result()));
                     return;
                 }
-                mCallbackCounters.dataDoneCallbacks.fetch_add(1, std::memory_order_release);
+                if (lastDataApi) {
+                    size_t traceIndex = 0;
+                    if (TraceIndex(generation, traceIndex)) {
+                        PublishCallbackTrace(generation, mTrace[traceIndex].sData[rail], "S_data");
+                    }
+                }
+                mRails[rail].callbackCounters.dataDoneCallbacks.fetch_add(1, std::memory_order_release);
             },
             std::placeholders::_1);
     }
 
-    Callback *NewSendCallback()
+    Callback *NewSendCallback(uint16_t rail)
     {
         return UBSHcomNewCallback(
-            [this](UBSHcomServiceContext &context) {
-                ActiveCallbackGuard guard(mCallbackCounters.activeCallbacks);
+            [this, rail](UBSHcomServiceContext &context) {
+                ActiveCallbackGuard guard(mActiveCallbacks);
                 if (context.Result() != 0) {
-                    RecordFailure("Send/Reply callback failed: " + std::to_string(context.Result()));
+                    RecordFailure("Send/Reply callback failed on rail " + std::to_string(rail) + ": " +
+                        std::to_string(context.Result()));
                     return;
                 }
-                mCallbackCounters.sendDoneCallbacks.fetch_add(1, std::memory_order_release);
+                mRails[rail].callbackCounters.sendDoneCallbacks.fetch_add(1, std::memory_order_release);
             },
             std::placeholders::_1);
     }
@@ -1181,12 +1448,10 @@ private:
     {
         uint64_t generation = 1;
         for (uint32_t round = 0; round < mParams.verifyRounds; ++round, ++generation) {
-            FillSenderVerifyPattern(generation);
+            FillSenderPattern(generation);
             RunSenderRound(generation, false);
         }
-        // The formal path uses stable pre-generated content.  It does not spend
-        // 600 KiB of per-round generation or validation work inside the timing.
-        FillSenderMeasurePattern();
+        FillSenderPattern(0);
         for (uint32_t round = 0; round < mParams.warmupRounds; ++round, ++generation) {
             RunSenderRound(generation, false);
         }
@@ -1199,39 +1464,77 @@ private:
             }
             mMeasureWallEndNs = NowNs();
         }
+        for (uint32_t round = 0; round < mParams.traceRounds; ++round, ++generation) {
+            RunSenderRound(generation, false);
+        }
         SendFinish();
     }
 
     void RunSenderRound(uint64_t generation, bool measure)
     {
-        const UBSHcomChannelPtr channel = ChannelCopy();
-        if (channel == nullptr) {
-            throw std::runtime_error("sender lost its channel before a round");
+        std::array<UBSHcomChannelPtr, kMaxLinks> channels;
+        std::array<uint64_t, kMaxLinks> expectedData{};
+        std::array<uint64_t, kMaxLinks> expectedSend{};
+        for (uint16_t rail = 0; rail < mOptions.links; ++rail) {
+            channels[rail] = ChannelCopy(rail);
+            if (channels[rail] == nullptr) {
+                throw std::runtime_error("sender lost channel before round on rail " + std::to_string(rail));
+            }
+            expectedData[rail] = mRails[rail].appCounters.attemptedDataCallbacks + mBlocksPerRail;
+            expectedSend[rail] = ExpectedSendCallbacks(rail) + 1;
         }
-        const uint64_t expectedData = mAppCounters.attemptedDataCallbacks + kBlocks;
-        const uint64_t expectedSend = ExpectedSendCallbacks() + 1;
-        const uint64_t startNs = NowNs();
 
-        for (uint32_t block = 0; block < kBlocks; ++block) {
-            Callback *callback = NewDataCallback();
-            if (callback == nullptr) {
-                throw std::runtime_error("unable to allocate Put callback");
-            }
-            ++mAppCounters.attemptedDataCallbacks;
-            const int rc = channel->Put(mPutRequests[block], callback);
-            if (rc != 0) {
-                throw std::runtime_error("Put failed: " + std::to_string(rc));
+        const uint64_t startNs = NowNs();
+        size_t traceIndex = 0;
+        if (TraceIndex(generation, traceIndex)) {
+            mTrace[traceIndex].s0.Publish(startNs);
+        }
+
+        // One application submission thread alternates rails block-by-block.
+        for (uint32_t localBlock = 0; localBlock < mBlocksPerRail; ++localBlock) {
+            for (uint16_t rail = 0; rail < mOptions.links; ++rail) {
+                Callback *callback = NewDataCallback(rail, generation, localBlock + 1 == mBlocksPerRail);
+                if (callback == nullptr) {
+                    throw std::runtime_error("unable to allocate Put callback");
+                }
+                ++mRails[rail].appCounters.attemptedDataCallbacks;
+                const int rc = channels[rail]->Put(mRails[rail].putRequests[localBlock], callback);
+                if (rc != 0) {
+                    throw std::runtime_error("Put failed on rail " + std::to_string(rail) + ": " +
+                        std::to_string(rc));
+                }
             }
         }
-        mRoundReadyPayload = EncodeAck(kRoundReadyMagic, generation);
-        PostAsyncSend(channel, mRoundReadyPayload.data(), mRoundReadyPayload.size(), kOpRoundReady);
+
+        for (uint16_t rail = 0; rail < mOptions.links; ++rail) {
+            mRails[rail].roundReadyPayload = EncodeToken(kRoundReadyMagic, generation, rail);
+            PostAsyncSend(rail, channels[rail], mRails[rail].roundReadyPayload.data(),
+                mRails[rail].roundReadyPayload.size(), kOpRoundReady);
+            if (TraceIndex(generation, traceIndex)) {
+                mTrace[traceIndex].sPost[rail].Publish(NowNs());
+            }
+        }
         const uint64_t submitNs = NowNs();
-        WaitData("round completion", [this, generation, expectedData, expectedSend] {
-            return mAckGeneration.load(std::memory_order_acquire) >= generation &&
-                mCallbackCounters.dataDoneCallbacks.load(std::memory_order_acquire) >= expectedData &&
-                mCallbackCounters.sendDoneCallbacks.load(std::memory_order_acquire) >= expectedSend;
+        if (TraceIndex(generation, traceIndex)) {
+            mTrace[traceIndex].s1.Publish(submitNs);
+        }
+
+        WaitData("round completion", [this, generation, &expectedData, &expectedSend] {
+            for (uint16_t rail = 0; rail < mOptions.links; ++rail) {
+                if (mRails[rail].ackGeneration.load(std::memory_order_acquire) < generation ||
+                    mRails[rail].callbackCounters.dataDoneCallbacks.load(std::memory_order_acquire) <
+                        expectedData[rail] ||
+                    mRails[rail].callbackCounters.sendDoneCallbacks.load(std::memory_order_acquire) <
+                        expectedSend[rail]) {
+                    return false;
+                }
+            }
+            return true;
         });
         const uint64_t endNs = NowNs();
+        if (TraceIndex(generation, traceIndex)) {
+            mTrace[traceIndex].s2.Publish(endNs);
+        }
         if (measure) {
             mSubmitNs.push_back(submitNs - startNs);
             mE2eNs.push_back(endNs - startNs);
@@ -1241,120 +1544,162 @@ private:
     void RunReceiver()
     {
         for (uint64_t generation = 1; generation <= mParams.TotalRounds(); ++generation) {
-            WaitData("ROUND_READY", [this, generation] {
-                return mRoundReadyGeneration.load(std::memory_order_acquire) >= generation;
+            std::array<bool, kMaxLinks> ackPosted{};
+            std::array<uint64_t, kMaxLinks> sendTargets{};
+            uint16_t remaining = mOptions.links;
+            while (remaining != 0) {
+                bool progressed = false;
+                for (uint16_t rail = 0; rail < mOptions.links; ++rail) {
+                    if (ackPosted[rail] ||
+                        mRails[rail].roundReadyGeneration.load(std::memory_order_acquire) < generation) {
+                        continue;
+                    }
+                    if (generation <= mParams.verifyRounds) {
+                        VerifyReceiverRail(rail, generation);
+                    }
+                    size_t traceIndex = 0;
+                    if (TraceIndex(generation, traceIndex)) {
+                        mTrace[traceIndex].rAck[rail].Publish(NowNs());
+                    }
+                    RailState &state = mRails[rail];
+                    state.ackPayload = EncodeToken(kAckMagic, generation, rail);
+                    PostAsyncSend(rail, ChannelCopyRequired(rail, "ROUND_ACK"), state.ackPayload.data(),
+                        state.ackPayload.size(), kOpRoundAck);
+                    sendTargets[rail] = ExpectedSendCallbacks(rail);
+                    ackPosted[rail] = true;
+                    --remaining;
+                    progressed = true;
+                }
+                if (!progressed) {
+                    WaitData("next per-rail ROUND_READY", [this, generation, &ackPosted] {
+                        for (uint16_t rail = 0; rail < mOptions.links; ++rail) {
+                            if (!ackPosted[rail] &&
+                                mRails[rail].roundReadyGeneration.load(std::memory_order_acquire) >= generation) {
+                                return true;
+                            }
+                        }
+                        return false;
+                    });
+                }
+            }
+            // Do not wait for rail0 ACK completion before posting rail1 ACK.
+            WaitData("all ROUND_ACK local completions", [this, &sendTargets] {
+                for (uint16_t rail = 0; rail < mOptions.links; ++rail) {
+                    if (mRails[rail].callbackCounters.sendDoneCallbacks.load(std::memory_order_acquire) <
+                        sendTargets[rail]) {
+                        return false;
+                    }
+                }
+                return true;
             });
-            if (generation <= mParams.verifyRounds) {
-                VerifyReceiverDestination(generation);
+        }
+        if (mParams.measureRounds != 0 || mParams.traceRounds != 0) {
+            VerifyFinalDestination();
+        }
+        WaitControl("FINISH on all rails", [this] {
+            for (uint16_t rail = 0; rail < mOptions.links; ++rail) {
+                if (mRails[rail].finishGeneration.load(std::memory_order_acquire) != mParams.TotalRounds()) {
+                    return false;
+                }
             }
-            SendRoundAck(generation);
-        }
-        if (mParams.measureRounds != 0) {
-            VerifyFinalMeasureDestination();
-        }
-        WaitControl("FINISH", [this] {
-            return mFinishGeneration.load(std::memory_order_acquire) == mParams.TotalRounds();
+            return true;
         });
-        SendFinishAck();
+        SendFinishAcks();
     }
 
-    void VerifyReceiverDestination(uint64_t generation)
+    void VerifyReceiverRail(uint16_t rail, uint64_t generation)
     {
-        for (uint32_t block = 0; block < kBlocks; ++block) {
-            const uint8_t *destination = mDestination.Data() + static_cast<size_t>(block) * kStrideBytes;
+        for (uint32_t localBlock = 0; localBlock < mBlocksPerRail; ++localBlock) {
+            const uint32_t globalBlock = rail * mBlocksPerRail + localBlock;
+            const uint8_t *destination = mRails[rail].buffer.Data() +
+                static_cast<size_t>(localBlock) * kStrideBytes;
             std::string error;
-            if (!VerifyBlock(destination, generation, block, error) || !VerifyGap(destination, error)) {
-                throw std::runtime_error(error);
+            if (!VerifyBlock(destination, generation, globalBlock, error) || !VerifyGap(destination, error)) {
+                throw std::runtime_error("rail " + std::to_string(rail) + ": " + error);
             }
         }
     }
 
-    void SendRoundAck(uint64_t generation)
+    void VerifyFinalDestination()
     {
-        const UBSHcomChannelPtr channel = ChannelCopy();
-        if (channel == nullptr) {
-            throw std::runtime_error("receiver lost its channel before ROUND_ACK");
+        for (uint16_t rail = 0; rail < mOptions.links; ++rail) {
+            VerifyReceiverRail(rail, 0);
         }
-        mAckPayload = EncodeAck(kAckMagic, generation);
-        PostAsyncSend(channel, mAckPayload.data(), mAckPayload.size(), kOpRoundAck);
-        const uint64_t target = ExpectedSendCallbacks();
-        WaitData("ROUND_ACK local completion", [this, target] {
-            return mCallbackCounters.sendDoneCallbacks.load(std::memory_order_acquire) >= target;
-        });
     }
 
     void SendFinish()
     {
-        const UBSHcomChannelPtr channel = ChannelCopy();
-        if (channel == nullptr) {
-            throw std::runtime_error("sender lost its channel before FINISH");
+        std::array<uint64_t, kMaxLinks> targets{};
+        for (uint16_t rail = 0; rail < mOptions.links; ++rail) {
+            RailState &state = mRails[rail];
+            state.finishPayload = EncodeToken(kFinishMagic, mParams.TotalRounds(), rail);
+            PostAsyncSend(rail, ChannelCopyRequired(rail, "FINISH"), state.finishPayload.data(),
+                state.finishPayload.size(), kOpFinish);
+            targets[rail] = ExpectedSendCallbacks(rail);
         }
-        mFinishPayload = EncodeFinish(kFinishMagic, mParams.TotalRounds());
-        PostAsyncSend(channel, mFinishPayload.data(), mFinishPayload.size(), kOpFinish);
-        const uint64_t target = ExpectedSendCallbacks();
-        WaitControl("FINISH local completion", [this, target] {
-            return mCallbackCounters.sendDoneCallbacks.load(std::memory_order_acquire) >= target;
-        });
-        WaitControl("FINISH_ACK", [this] {
-            return mFinishAckGeneration.load(std::memory_order_acquire) == mParams.TotalRounds();
+        WaitControl("FINISH local completion and FINISH_ACK on all rails", [this, &targets] {
+            for (uint16_t rail = 0; rail < mOptions.links; ++rail) {
+                if (mRails[rail].callbackCounters.sendDoneCallbacks.load(std::memory_order_acquire) < targets[rail] ||
+                    mRails[rail].finishAckGeneration.load(std::memory_order_acquire) != mParams.TotalRounds()) {
+                    return false;
+                }
+            }
+            return true;
         });
     }
 
-    void SendFinishAck()
+    void SendFinishAcks()
     {
-        const UBSHcomChannelPtr channel = ChannelCopy();
-        if (channel == nullptr) {
-            throw std::runtime_error("receiver lost its channel before FINISH_ACK");
+        std::array<uint64_t, kMaxLinks> targets{};
+        for (uint16_t rail = 0; rail < mOptions.links; ++rail) {
+            RailState &state = mRails[rail];
+            state.finishAckPayload = EncodeToken(kFinishAckMagic, mParams.TotalRounds(), rail);
+            PostAsyncSend(rail, ChannelCopyRequired(rail, "FINISH_ACK"), state.finishAckPayload.data(),
+                state.finishAckPayload.size(), kOpFinishAck);
+            targets[rail] = ExpectedSendCallbacks(rail);
         }
-        mFinishAckPayload = EncodeFinish(kFinishAckMagic, mParams.TotalRounds());
-        PostAsyncSend(channel, mFinishAckPayload.data(), mFinishAckPayload.size(), kOpFinishAck);
-        const uint64_t target = ExpectedSendCallbacks();
-        WaitControl("FINISH_ACK local completion", [this, target] {
-            return mCallbackCounters.sendDoneCallbacks.load(std::memory_order_acquire) >= target;
+        WaitControl("FINISH_ACK local completion on all rails", [this, &targets] {
+            for (uint16_t rail = 0; rail < mOptions.links; ++rail) {
+                if (mRails[rail].callbackCounters.sendDoneCallbacks.load(std::memory_order_acquire) < targets[rail]) {
+                    return false;
+                }
+            }
+            return true;
         });
     }
 
-    void PostAsyncSend(const UBSHcomChannelPtr &channel, uint8_t *data, size_t size, uint16_t opcode)
+    void PostAsyncSend(uint16_t rail, const UBSHcomChannelPtr &channel, uint8_t *data, size_t size, uint16_t opcode)
     {
-        Callback *callback = NewSendCallback();
+        if (channel == nullptr) {
+            throw std::runtime_error("null channel for Send on rail " + std::to_string(rail));
+        }
+        Callback *callback = NewSendCallback(rail);
         if (callback == nullptr) {
             throw std::runtime_error("unable to allocate Send callback");
         }
-        ++mAppCounters.attemptedSendCallbacks;
+        ++mRails[rail].appCounters.attemptedSendCallbacks;
         const UBSHcomRequest request(data, static_cast<uint32_t>(size), opcode);
         const int rc = channel->Send(request, callback);
         if (rc != 0) {
-            throw std::runtime_error("Send opcode " + std::to_string(opcode) + " failed: " + std::to_string(rc));
+            throw std::runtime_error("Send opcode " + std::to_string(opcode) + " failed on rail " +
+                std::to_string(rail) + ": " + std::to_string(rc));
         }
     }
 
-    uint64_t ExpectedSendCallbacks() const noexcept
+    uint64_t ExpectedSendCallbacks(uint16_t rail) const noexcept
     {
-        return mAppCounters.attemptedSendCallbacks +
-            mCallbackCounters.workerAttemptedSendCallbacks.load(std::memory_order_acquire);
+        const RailState &state = mRails[rail];
+        return state.appCounters.attemptedSendCallbacks +
+            state.callbackCounters.workerAttemptedSendCallbacks.load(std::memory_order_acquire);
     }
 
-    void FillSenderVerifyPattern(uint64_t generation)
+    void FillSenderPattern(uint64_t generation)
     {
-        for (uint32_t block = 0; block < kBlocks; ++block) {
-            FillBlock(mSource.Data() + static_cast<size_t>(block) * kStrideBytes, generation, block);
-        }
-    }
-
-    void FillSenderMeasurePattern()
-    {
-        for (uint32_t block = 0; block < kBlocks; ++block) {
-            FillBlock(mSource.Data() + static_cast<size_t>(block) * kStrideBytes, 0, block);
-        }
-    }
-
-    void VerifyFinalMeasureDestination()
-    {
-        for (uint32_t block = 0; block < kBlocks; ++block) {
-            std::string error;
-            const uint8_t *destination = mDestination.Data() + static_cast<size_t>(block) * kStrideBytes;
-            if (!VerifyBlock(destination, 0, block, error) || !VerifyGap(destination, error)) {
-                throw std::runtime_error("final measure validation failed: " + error);
+        for (uint16_t rail = 0; rail < mOptions.links; ++rail) {
+            for (uint32_t localBlock = 0; localBlock < mBlocksPerRail; ++localBlock) {
+                const uint32_t globalBlock = rail * mBlocksPerRail + localBlock;
+                FillBlock(mRails[rail].buffer.Data() + static_cast<size_t>(localBlock) * kStrideBytes,
+                    generation, globalBlock);
             }
         }
     }
@@ -1391,25 +1736,44 @@ private:
         CheckFatal(what);
     }
 
-    void WaitForChannel()
+    void WaitForChannels()
     {
-        std::unique_lock<std::mutex> lock(mChannelMutex);
+        std::unique_lock<std::mutex> lock(mChannelsMutex);
         const bool received = mChannelCv.wait_for(lock, std::chrono::seconds(mOptions.timeoutSec), [this] {
-            return mChannel != nullptr || mFatal.load(std::memory_order_acquire);
+            if (mFatal.load(std::memory_order_acquire)) {
+                return true;
+            }
+            for (uint16_t rail = 0; rail < mOptions.links; ++rail) {
+                if (mRails[rail].channel == nullptr) {
+                    return false;
+                }
+            }
+            return true;
         });
         if (!received) {
-            throw std::runtime_error("timed out waiting for the peer channel");
+            throw std::runtime_error("timed out waiting for all peer channels");
         }
-        if (mChannel == nullptr) {
-            CheckFatal("peer channel");
-            throw std::runtime_error("peer channel was not established");
+        CheckFatal("peer channels");
+        for (uint16_t rail = 0; rail < mOptions.links; ++rail) {
+            if (mRails[rail].channel == nullptr) {
+                throw std::runtime_error("peer channel was not established on rail " + std::to_string(rail));
+            }
         }
     }
 
-    UBSHcomChannelPtr ChannelCopy() const
+    UBSHcomChannelPtr ChannelCopy(uint16_t rail) const
     {
-        std::lock_guard<std::mutex> lock(mChannelMutex);
-        return mChannel;
+        std::lock_guard<std::mutex> lock(mChannelsMutex);
+        return mRails[rail].channel;
+    }
+
+    UBSHcomChannelPtr ChannelCopyRequired(uint16_t rail, const char *operation) const
+    {
+        UBSHcomChannelPtr channel = ChannelCopy(rail);
+        if (channel == nullptr) {
+            throw std::runtime_error(std::string(operation) + " without a channel on rail " + std::to_string(rail));
+        }
+        return channel;
     }
 
     void RequireOk(int rc, const char *operation)
@@ -1429,8 +1793,6 @@ private:
             std::lock_guard<std::mutex> lock(mErrorMutex);
             mError = message;
         } catch (...) {
-            // A callback must not throw through hcom.  The fatal flag is still
-            // sufficient for the app thread to stop safely.
         }
         mChannelCv.notify_all();
     }
@@ -1454,19 +1816,26 @@ private:
     {
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(mOptions.timeoutSec);
         while (std::chrono::steady_clock::now() < deadline) {
-            const uint64_t expectedData = mAppCounters.attemptedDataCallbacks;
-            const uint64_t expectedSend = ExpectedSendCallbacks();
-            if (mCallbackCounters.dataDoneCallbacks.load(std::memory_order_acquire) >= expectedData &&
-                mCallbackCounters.sendDoneCallbacks.load(std::memory_order_acquire) >= expectedSend &&
-                mCallbackCounters.activeCallbacks.load(std::memory_order_acquire) == 0) {
+            if (CallbacksDrained()) {
                 return true;
             }
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
-        return mCallbackCounters.dataDoneCallbacks.load(std::memory_order_acquire) >=
-                   mAppCounters.attemptedDataCallbacks &&
-            mCallbackCounters.sendDoneCallbacks.load(std::memory_order_acquire) >= ExpectedSendCallbacks() &&
-            mCallbackCounters.activeCallbacks.load(std::memory_order_acquire) == 0;
+        return CallbacksDrained();
+    }
+
+    bool CallbacksDrained() const noexcept
+    {
+        for (uint16_t rail = 0; rail < mOptions.links; ++rail) {
+            const RailState &state = mRails[rail];
+            if (state.callbackCounters.dataDoneCallbacks.load(std::memory_order_acquire) <
+                    state.appCounters.attemptedDataCallbacks ||
+                state.callbackCounters.sendDoneCallbacks.load(std::memory_order_acquire) <
+                    ExpectedSendCallbacks(rail)) {
+                return false;
+            }
+        }
+        return mActiveCallbacks.load(std::memory_order_acquire) == 0;
     }
 
     void Teardown() noexcept
@@ -1474,26 +1843,61 @@ private:
         if (mTearingDown.exchange(true, std::memory_order_acq_rel)) {
             return;
         }
-        UBSHcomChannelPtr channel;
-        {
-            std::lock_guard<std::mutex> lock(mChannelMutex);
-            channel = mChannel;
-            mChannel.Set(nullptr);
+        for (uint16_t rail = 0; rail < mOptions.links; ++rail) {
+            RailState &state = mRails[rail];
+            UBSHcomChannelPtr channel;
+            {
+                std::lock_guard<std::mutex> lock(mChannelsMutex);
+                channel = state.channel;
+                state.channel.Set(nullptr);
+            }
+            if (state.service != nullptr && channel != nullptr) {
+                state.service->Disconnect(channel);
+            }
+            if (state.service != nullptr && state.memoryRegistered) {
+                state.service->DestroyMemoryRegion(state.memoryRegion);
+                state.memoryRegistered = false;
+            }
+            if (state.service != nullptr) {
+                UBSHcomService::Destroy(state.serviceName);
+                state.service = nullptr;
+            }
         }
-        if (mService != nullptr && channel != nullptr) {
-            mService->Disconnect(channel);
+    }
+
+    void EmitTracePoint(const char *event, uint64_t generation, int rail, const TracePoint &point) const
+    {
+        std::cout << "{\"record_type\":\"trace\",\"trace_schema\":\"rdma600-stage2-v1\",\"host_role\":\""
+                  << RoleName(mOptions.role) << "\",\"case\":\"" << CaseName(mOptions.links)
+                  << "\",\"generation\":" << generation << ",\"rail\":";
+        if (rail < 0) {
+            std::cout << "null";
+        } else {
+            std::cout << rail;
         }
-        if (mService != nullptr && mDestinationMrRegistered) {
-            mService->DestroyMemoryRegion(mDestinationMr);
-            mDestinationMrRegistered = false;
-        }
-        if (mService != nullptr && mSourceMrRegistered) {
-            mService->DestroyMemoryRegion(mSourceMr);
-            mSourceMrRegistered = false;
-        }
-        if (mService != nullptr) {
-            UBSHcomService::Destroy(mServiceName);
-            mService = nullptr;
+        std::cout << ",\"event\":\"" << event << "\",\"timestamp_ns\":" << point.Read(event) << "}"
+                  << std::endl;
+    }
+
+    void EmitTrace() const
+    {
+        for (uint32_t index = 0; index < mParams.traceRounds; ++index) {
+            const TraceRound &trace = mTrace[index];
+            if (mOptions.role == Role::Sender) {
+                EmitTracePoint("S0", trace.generation, -1, trace.s0);
+                for (uint16_t rail = 0; rail < mOptions.links; ++rail) {
+                    EmitTracePoint("S_post", trace.generation, rail, trace.sPost[rail]);
+                    EmitTracePoint("S_data", trace.generation, rail, trace.sData[rail]);
+                    EmitTracePoint("S_ack", trace.generation, rail, trace.sAck[rail]);
+                }
+                EmitTracePoint("S1", trace.generation, -1, trace.s1);
+                EmitTracePoint("S2", trace.generation, -1, trace.s2);
+            } else {
+                for (uint16_t rail = 0; rail < mOptions.links; ++rail) {
+                    EmitTracePoint("R_ready", trace.generation, rail, trace.rReady[rail]);
+                    EmitTracePoint("R_ack", trace.generation, rail, trace.rAck[rail]);
+                }
+            }
         }
     }
 
@@ -1501,17 +1905,22 @@ private:
     {
         std::ostringstream output;
         output << std::fixed << std::setprecision(3);
-        output << "{\"case\":\"B1\",\"status\":\"ok\",\"commit\":\"" << RDMA_600_GIT_COMMIT
-               << "\",\"role\":\"sender\",\"kind\":\"" << KindName(mOptions.kind)
+        output << "{\"case\":\"" << CaseName(mOptions.links) << "\",\"status\":\"ok\",\"commit\":\""
+               << RDMA_600_GIT_COMMIT << "\",\"role\":\"sender\",\"kind\":\"" << KindName(mOptions.kind)
                << "\",\"optimization\":\"stage1.5-AB\",\"data_wait\":\"busy-poll-relax\""
                << ",\"deadline_check_interval\":" << kDataDeadlineCheckInterval
                << ",\"counter_alignment_bytes\":" << kCounterAlignment
                << ",\"callback_allocation\":\"per-request\""
-               << ",\"links\":1,\"blocks\":600,\"block_bytes\":1024,\"payload_bytes\":614400"
+               << ",\"links\":" << mOptions.links
+               << ",\"services\":" << mOptions.links << ",\"blocks\":600,\"blocks_per_rail\":" << mBlocksPerRail
+               << ",\"block_bytes\":1024,\"payload_bytes\":614400"
                << ",\"mode\":\"plain\",\"remote_layout\":\"direct-stride-4096\",\"tls_enabled\":false"
-               << ",\"rounds_in_flight\":1,\"data_wr_per_round\":600,\"round_ready_wr_per_round\":1"
-               << ",\"ack_wr_per_round\":1,\"verify_passed\":true";
-        if (mOptions.kind == RunKind::Verify) {
+               << ",\"internal_multirail\":false,\"channel_link_count\":1,\"rounds_in_flight\":1"
+               << ",\"application_submit_threads\":1,\"data_wr_per_round\":600,\"round_ready_wr_per_round\":"
+               << mOptions.links << ",\"ack_wr_per_round\":" << mOptions.links
+               << ",\"direct_optimization\":\"stage1.5-AB\",\"verify_passed\":true"
+               << ",\"trace_rounds\":" << mParams.traceRounds;
+        if (mOptions.kind != RunKind::Measure) {
             output << ",\"measure_rounds\":0,\"submit_avg_us\":null,\"submit_p50_us\":null"
                    << ",\"submit_p95_us\":null,\"submit_p99_us\":null,\"e2e_avg_us\":null"
                    << ",\"e2e_p50_us\":null,\"e2e_p95_us\":null,\"e2e_p99_us\":null"
@@ -1539,44 +1948,17 @@ private:
 
     Options mOptions;
     CaseParameters mParams;
-    std::string mServiceName;
-    UBSHcomService *mService = nullptr;
-    mutable std::mutex mChannelMutex;
-    std::condition_variable mChannelCv;
-    UBSHcomChannelPtr mChannel;
+    uint32_t mBlocksPerRail = kBlocks;
+    std::array<RailState, kMaxLinks> mRails{};
     std::atomic<bool> mReceiverReady{false};
     std::atomic<bool> mTearingDown{false};
     std::atomic<bool> mFatal{false};
     mutable std::mutex mErrorMutex;
     std::string mError;
-
-    AlignedBuffer mSource;
-    AlignedBuffer mDestination;
-    UBSHcomRegMemoryRegion mSourceMr;
-    UBSHcomRegMemoryRegion mDestinationMr;
-    bool mSourceMrRegistered = false;
-    bool mDestinationMrRegistered = false;
-    UBSHcomMemoryKey mSourceKey{};
-    UBSHcomMemoryKey mDestinationKey{};
-    UBSHcomMemoryKey mPeerDestinationKey{};
-    uintptr_t mPeerDestinationAddress = 0;
-
-    std::array<UBSHcomOneSideRequest, kBlocks> mPutRequests{};
-    std::array<uint8_t, kHelloWireBytes> mHelloPayload{};
-    std::array<uint8_t, kReadyWireBytes> mReadyPayload{};
-    std::array<uint8_t, kReadyWireBytes> mReadyResponse{};
-    std::array<uint8_t, kAckWireBytes> mRoundReadyPayload{};
-    std::array<uint8_t, kAckWireBytes> mAckPayload{};
-    std::array<uint8_t, kFinishWireBytes> mFinishPayload{};
-    std::array<uint8_t, kFinishWireBytes> mFinishAckPayload{};
-
-    std::atomic<uint64_t> mRoundReadyGeneration{0};
-    std::atomic<uint64_t> mAckGeneration{0};
-    std::atomic<uint64_t> mFinishGeneration{0};
-    std::atomic<uint64_t> mFinishAckGeneration{0};
-    AppOwnedCounters mAppCounters;
-    CallbackOwnedCounters mCallbackCounters;
-
+    mutable std::mutex mChannelsMutex;
+    std::condition_variable mChannelCv;
+    alignas(kCounterAlignment) std::atomic<uint64_t> mActiveCallbacks{0};
+    std::array<TraceRound, kMaxTraceRounds> mTrace{};
     std::vector<uint64_t> mSubmitNs;
     std::vector<uint64_t> mE2eNs;
     uint64_t mMeasureWallStartNs = 0;
@@ -1592,7 +1974,7 @@ int main(int argc, char **argv)
         if (options.selfTest) {
             return RunSelfTest() ? 0 : 1;
         }
-        Stage1Benchmark benchmark(options);
+        DirectBenchmark benchmark(options);
         return benchmark.Run();
     } catch (const std::exception &error) {
         std::cerr << "ERROR: " << error.what() << std::endl;

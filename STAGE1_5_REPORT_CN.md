@@ -2,6 +2,10 @@
 
 日期：2026-09-12
 
+说明：本文随 `main@38e6637` 同步，记录的是单链接阶段 1.5 A+B 的原始实施证据与内容标识。
+`duo_card` 在此基础上把同一 A+B 语义共同应用到阶段 2 的 B1/B2；当前双链接实现与待验证项以
+`README.md`、`PROGRESS.md` 和工作区 diff 为准，下文 A/AB diff SHA-1 不是当前阶段 2 diff 的标识。
+
 ## 1. 结论与状态
 
 阶段 1.5 的 A+B 最小优化已在 `perf_test` 中实现，保持 direct B1 的数据与控制协议不变：每轮仍为 600 个异步 `Put(1024)`、1 个 `ROUND_READY` Send、1 个反向 `ROUND_ACK`，单轮在途，source/destination stride 均为 4096。没有 staging、scatter、SGL、IMM、跨轮窗口或 `ubs-comm` 修改。

@@ -1,8 +1,8 @@
 # 分阶段实施与验证任务书：ubs-comm RDMA 600 × 1 KiB
 
-状态：阶段 1 direct B1 与阶段 1.5 A+B 已实现；阶段 2、3、4 尚未实现。目标 Linux/RDMA 构建与硬件跑测尚未执行。更新日期：2026-09-12。阶段 1 原始实现参考 perf_test `0f5e382`；阶段 1.5 记录见 `STAGE1_5_REPORT_CN.md`。
+状态：阶段 1 direct B1、阶段 1.5 A+B 与阶段 2 direct B1/B2＋trace 已实现；阶段 3、4 尚未实现。`duo_card` 已同步 `main@38e6637`，B1/B2 共同使用同一阶段 1.5 等待/记账实现。目标 Linux/RDMA 构建与硬件跑测尚未执行。更新日期：2026-09-12。
 
-配套设计：[DESIGN_CN.md](C:/code/RDMA_DEMO/perf_test/DESIGN_CN.md)。本文规定实施顺序、交付物和阶段验收，协议与内存布局以设计文档为准。执行模型若发现两份文档与源码存在冲突，应说明依据并记录最小修正，不应默默改变测试口径。
+配套设计：[DESIGN_CN.md](DESIGN_CN.md)。本文规定实施顺序、交付物和阶段验收，协议与内存布局以设计文档为准。执行模型若发现两份文档与源码存在冲突，应说明依据并记录最小修正，不应默默改变测试口径。
 
 原始代码基线：ubs-comm `oneside-msge-merge`，`9e4c035a5d68ccca02d05fade3b6f5907db24ef4`。
 
@@ -11,7 +11,7 @@
 ## 1. 交给实施模型的总约束
 
 1. 先读设计文档、本文及工作目录适用的 `AGENTS.md`，查看现有代码与 git 状态，保留已有修改。先复用已有阶段产物，再继续实现。
-2. 实现一个小型 C++ 可执行程序，不引入 memfabric，不搬入整个 hcom perf 框架。Python 只用标准库在各自主机启动一个角色并负责本机结果归档。
+2. 实现一个小型 C++ 可执行程序，不引入 memfabric，不搬入整个 hcom perf 框架。两台主机分别直接运行 C++ 二进制并各自保存日志，不引入 Python 或 SSH 编排。
 3. 顺序为：**阶段 1 单链接 direct baseline → 阶段 1.5 热路径优化 → 阶段 2 direct 双链接与打点 → 阶段 3 SGL＋scatter → 阶段 4 WRITE_WITH_IMM**。每阶段保持前一阶段用例可运行，逐阶段形成可独立审阅的 diff 和报告。
 4. 两端总有效数据固定为每轮 600 × 1024 字节。阶段 1 的源/最终目标均为 stride=4096；第 `i` 个 Put 直接写 `dst + i*4096`，最终完成口径包含一个轮次完成通知和 ACK，不包含 staging 或 scatter。
 5. 所有主 case 使用异步提交；一个 service 对应一个 RDMA 设备，每个 channel `linkCount=1`、worker poll、关闭内建 multirail；阶段 1 每端各一个应用线程。
@@ -19,25 +19,24 @@
 7. 阶段 1 单轮在途：同一 QP 上的 600 次 WRITE 后只发一个 `ROUND_READY` Send，再等待 ACK。实现局部函数、固定数组和必要的状态，不增加跨轮窗口、通用线程池、动态调度、自动重连或 selective signaling。
 8. 第一至第三阶段优先只改 `perf_test`；第四阶段改 ubs-comm。若前期发现库缺陷确实阻塞正确性，单独提交最小修复并重新跑 baseline，不将修复收益归入双链接/SGL/IMM。
 9. API 返回码、本地 callback 错误、接收消息合法性、超时、缓冲复用和退出 drain 都必须处理。不要为“代码最少”省略这些正确性条件。
-10. 硬件结果只来自真实运行。编译通过、mock 通过、脚本可启动都不等于 RDMA 验证通过；不得生成示意数字冒充测量结果。
+10. 硬件结果只来自真实运行。编译或本地逻辑检查通过都不等于 RDMA 验证通过；不得生成示意数字冒充测量结果。
 
 每次只交办一个阶段时，实施模型完成该阶段及可执行验证后交付，不擅自扩展到下一阶段。若收到整体实施指令，按 1 → 1.5 → 2 → 3 → 4 推进；阶段验收是技术条件，不是额外的人工审批流程。
 
-无目标硬件时，继续完成不依赖硬件的代码、构建检查、脚本和交付文档，将硬件验收明确保留为 pending。后续本地准备可以继续，但不能将后续性能结论建立在未验证的上一阶段之上。
+无目标硬件时，继续完成不依赖硬件的代码、构建检查和交付文档，将硬件验收明确保留为 pending。后续本地准备可以继续，但不能将后续性能结论建立在未验证的上一阶段之上。
 
 ## 2. 交付目录与状态记录
 
 建议产物保持精简：
 
 ```text
-perf_test/
+perf_test_duo_card/
   DESIGN_CN.md
   IMPLEMENTATION_PLAN_CN.md
   rdma_600.cpp
   CMakeLists.txt
-  run.py
-  hosts.example.json          sender/receiver 主机参数、绝对路径、绑核配置示例
-  README.md                   已验证的编译/手工运行/脚本运行命令
+  hosts.example.json          仅供人工记录双端路径、网卡、端口和绑核参数
+  README.md                   已验证的编译与双端直接运行命令
   PROGRESS.md                 阶段状态、验证命令、证据路径与遗留问题
   results/<run-id>-<role>/   当前两端分别保存，不是一个目录自动汇总两端
     manifest.json             参数、版本、库路径、构建、机器元信息
@@ -48,85 +47,44 @@ perf_test/
     REPORT.md                 当前 sender 报告；跨运行比较由实施者汇总
 ```
 
-不是每个 run 都必须生成 trace。不为脚本增加另一套插件或配置框架。原始日志和数据使用新的 run-id 保存，不覆盖上一阶段结果。
+不是每个 run 都必须生成 trace。原始日志和数据应使用新的 run-id 保存，不覆盖上一阶段结果。
 
 `PROGRESS.md` 为每阶段分别记录两个维度：
 
 | 维度 | 状态 | 含义 |
 |---|---|---|
-| 实现 | NOT_STARTED / IN_PROGRESS / IMPLEMENTED | 是否已经有对应代码与脚本 |
+| 实现 | NOT_STARTED / IN_PROGRESS / IMPLEMENTED | 是否已经有对应代码与文档 |
 | 验证 | NOT_RUN / LOCAL_PASS_HW_PENDING / HW_PASS / FAIL | 是否真实完成硬件正确性与该阶段跑测 |
 
 示例：“阶段 2：IMPLEMENTED / LOCAL_PASS_HW_PENDING；缺少第二条 RDMA 路径；尚无双链接性能结论。”
 
 硬件不支持某一 SGL 上限时，该 case 单独 SKIP 并附能力证据；不能把设备不支持伪装为实现通过，也不能把静默拆分后的结果标成 30 SGE 单 WR。
 
-## 3. 共用脚本契约：阶段 1 就交付
+## 3. 双端直接运行契约
 
-阶段 1 已实现下述每主机本地角色脚本接口，尚未在目标机跑测。阶段 1.5 复用 `--suite stage1`，通过二进制/提交/hash 区分优化版本，不增加一套启动器。后续阶段的参数扩展仍为计划，实际已支持命令以 README 为准。
+`run.py` 已删除。两台主机分别直接启动 `rdma_600`，receiver 先运行并输出 `LISTENING`，再由人工在 sender 主机启动同一 case。C++ 的 HELLO/READY 才是实际数据准备条件；`LISTENING` 只表示 receiver 的本地监听已就绪。
+
+以 B2 verify 为例，实际绝对路径、IP、端口与 CPU 由目标机替换：
 
 ```bash
 # receiver 主机
-python3 "$PERF_ROOT/run.py" --config "$PERF_ROOT/hosts.json" \
-  --role receiver --suite stage1 --kind verify \
-  --output "$PERF_ROOT/results/<run-id>-receiver"
+"$PERF_ROOT/build/rdma_600" --role receiver --links 2 --kind verify \
+  --rdma-ips <receiver_nic0_ip>,<receiver_nic1_ip> \
+  --listen <receiver_oob_ip>:19000,<receiver_oob_ip>:19001 \
+  --app-cpu 2 --worker-cpus 3,4 --verify-rounds 20 --timeout-sec 10
 
-# sender 主机，待 receiver 输出 LISTENING 后执行
-python3 "$PERF_ROOT/run.py" --config "$PERF_ROOT/hosts.json" \
-  --role sender --suite stage1 --kind verify \
-  --output "$PERF_ROOT/results/<run-id>-sender"
+# sender 主机（看到 receiver 的 LISTENING 后）
+"$PERF_ROOT/build/rdma_600" --role sender --links 2 --kind verify \
+  --rdma-ips <sender_nic0_ip>,<sender_nic1_ip> \
+  --peer <receiver_oob_ip>:19000,<receiver_oob_ip>:19001 \
+  --app-cpu 2 --worker-cpus 3,4 --verify-rounds 20 --timeout-sec 10
 ```
 
-measure 使用相同的双主机顺序和 `--kind measure`。每个物理 repeat 使用新的两端输出目录；脚本不跨主机协调 repeat。后续只增加 `--suite stage2|stage3|stage4` 和第二阶段的 `--kind trace`，不复制出四套启动脚本。`--kind verify` 可以只做验证、不做正式计时；其 JSON 不应出现可误读的正式带宽。
+B1 使用 `--links 1`，并且 IP、端点和 worker CPU 列表各只传第一项。measure 将 `--kind` 改为 `measure` 并显式给出 `--warmup`、`--rounds`；独立诊断将其改为 `trace` 并给出不超过 64 的 `--trace-rounds`。完整命令以 README 为准。
 
-配置示例的语义如下，IP、CPU 和路径均由实际机器填写：
+两端应直接重定向 stdout/stderr，并人工记录程序与 hcom 的 commit/hash、完整命令、`ldd`、退出码、设备/端口/MTU/NUMA、端口计数和日志路径。每个 repeat 使用新的 run-id 与日志文件；双方均为退出码 0、sender 结果记录匹配且硬件证据齐全时，才能接受该次跑测。接收端中途退出、超时或记录缺失均判失败，不能拿旧日志代替。
 
-```json
-{
-  "sender": {
-    "binary": "/absolute/path/on/sender/rdma_600",
-    "library_dirs": ["/absolute/path/on/sender/lib"],
-    "rdma_ips": ["<sender_nic0_ip>", "<sender_nic1_ip>"],
-    "app_cpu": 2,
-    "worker_cpus": [3, 4]
-  },
-  "receiver": {
-    "binary": "/absolute/path/on/receiver/rdma_600",
-    "library_dirs": ["/absolute/path/on/receiver/lib"],
-    "oob_ip": "<receiver_oob_ip>",
-    "oob_ports": [19000, 19001],
-    "rdma_ips": ["<receiver_nic0_ip>", "<receiver_nic1_ip>"],
-    "app_cpu": 2,
-    "worker_cpus": [3, 4]
-  }
-}
-```
-
-上例的两条 rail 是阶段 2 的配置草案；当前 stage1 配置只使用一条，按仓库 hosts.example.json 填写（包括 stage1 轮数/超时设置）。阶段 2 才扩展并验证第二张 NIC、第二个端口和第二个 worker CPU，不能暗示当前解析器已经支持它们。应用不假定 OOB IP 就是 RDMA IP。
-
-脚本工作流程：两台主机各运行一次，receiver 的 `LISTENING` 由人工或外部调度器作为 sender 的启动信号。
-
-```python
-cfg = load_and_validate_config()
-role = parse_role_from_cli()
-create_fresh_local_result_directory()
-record_local_binary_and_library_identity(role)
-process = start_locally(role_argv(role), log_files)
-stream_local_stdout_and_stderr(process)
-wait_for_exit_with_deadline(process)
-if role == "sender":
-    validate_sender_result_record()
-    save_sender_report()
-```
-
-最少必须做到：
-
-- receiver 的 `LISTENING` 必须明确 flush 后输出；接收进程报错退出或启动超时，人工/外部调度器不得继续启动 sender。C++ 的 HELLO/READY 才是实际数据准备条件。
-- 使用 `subprocess` 参数数组直接启动本地进程。持续读取或重定向两端 stdout/stderr，不能因为管道未消费导致测试阻塞。
-- 两端本地脚本分别检查自己启动的进程退出码；sender 校验结果记录。当前脚本不自动收集另一台机器的退出码，人工汇总或外部调度器必须确认双方成功后才接受整次跑测。缺少记录、重复记录或参数不匹配均失败，禁止拿旧文件代替。
-- 失败/超时只清理当前主机、本次调用启动的本地进程组；不能 `pkill` 全部同名程序。
-- 第一版可以要求二进制提前部署，不自动编译/拷贝/安装系统依赖。README 给出手工部署和两终端运行方法，便于排除包装脚本问题。
-- 当前脚本记录本机 binary hash、命令、ldd 与本地退出状态；性能对比时另行保存静态 hcom 链接输入 hash、源码 commit/dirty diff，人工对齐两端构建。不要把尚未自动收集的证据描述为脚本已有能力。
+`hosts.example.json` 仅是人工填写和归档参数的参考模板，程序不会读取它。配置中出现两条 IP 或成功建立两个 channel 都不构成双 NIC 流量证据，仍须核对实际设备/QP 归属以及测试前后两端口计数。本项目不自动编译、部署、跨主机启动或清理进程，也不引入 SSH 编排。
 
 构建依据：[ubs-comm build.sh](C:/code/RDMA_DEMO/ubs-comm/build.sh) 支持 service/RDMA 构建开关，默认产物位于 `dist/hcom`；[现有 perf CMakeLists.txt](C:/code/RDMA_DEMO/ubs-comm/test/hcom/tools/perf_test/CMakeLists.txt) 可参考 include、hcom、boundscheck 等依赖。实施者需核实实际产物，不凭记忆杜撰 include 路径或库名。
 
@@ -159,7 +117,7 @@ boundscheck 等额外依赖按实测构建需求补充显式路径。链接动�
 3. 根据设计预生成 600 个 Put 描述符；每个远端地址为 `peer_dst + i*4096`。实现 generation、单个 round-ready 状态、本地完成累计计数和 ACK 状态。
 4. 实现异步 Put + 单个 ROUND_READY Send 提交循环、接收 CQ 发布 round ready、verify 校验、ACK、等待与 drain。不要用空 callback 指针模拟异步。
 5. 实现 verify/warmup/measure 三个阶段；generation 连续递增，正式数据和描述符提前准备，日志输出在测量之后。
-6. 交付 `run.py`、配置示例和 README，必须同时提供手工双端命令与脚本命令。
+6. 交付配置记录示例和 README，提供双端直接运行命令与日志保存约定。
 
 ### 4.3 验证顺序与通过条件
 
@@ -170,14 +128,14 @@ boundscheck 等额外依赖按实测构建需求补充显式路径。链接动�
 | 小运行 | 1 个验证轮次 | 首次建链、600 次直接写入、1 个 ROUND_READY、ACK、退出均成功 |
 | 正确性 | 20 轮，每个 word 含 generation/block/word 模式 | 全部有效数据及间隙哨兵正确，round-ready 不丢失、不重复 |
 | 复用 | 观察 generation 和 ACK 栅栏 | 下一轮数据提交不早于本轮 ACK；无覆盖 |
-| 失败退出 | 接收进程中途退出或连接无法建立 | 有界退出、非零状态，脚本保存错误，不输出有效带宽 |
+| 失败退出 | 接收进程中途退出或连接无法建立 | 有界退出、非零状态，人工保存错误日志，不输出有效带宽 |
 | 性能 | warmup=1000，measure=10000，repeat=5，trace 关闭 | 五次有效运行；报告中位数及波动，不能预设目标带宽 |
 
 每次独立正式运行都先做正确性验证；若正式阶段轮数很少或运行时间过短，在报告中标出，并统一增加轮数重测。
 
-阶段 1 交付：可构建代码、可用脚本、README、B1 原始结果与报告、PROGRESS 状态。没有硬件时交付上述可完成部分和准确的待执行命令，性能字段保留未测。
+阶段 1 交付：可构建代码、双端直接运行命令、README、B1 原始结果与报告、PROGRESS 状态。没有硬件时交付上述可完成部分和准确的待执行命令，性能字段保留未测。
 
-## 4.5. 阶段 1.5：direct B1 热路径优化（已实现，硬件验证 pending）
+## 4.5. 阶段 1.5：direct 热路径优化（已实现，硬件待验证）
 
 ### 1.5.1 目标与不变项
 
@@ -261,7 +219,7 @@ callback 动态分配的处理有明确边界：A/B 必做版本继续使用公�
 | 性能对照 | original/A/AB 各 5 次、统一绑核与库，独立 profile，保留原始结果 |
 | 归因 | A 的等待收益与 B 的记账收益分别报告；callback 分配是否优化明确记录 |
 
-交付独立改动、README 中当前生效行为、PROGRESS、三组结果和一份阶段 1.5 报告；代码及本地检查完成但无硬件时记为 IMPLEMENTED / LOCAL_PASS_HW_PENDING，不能预填提速数据。保留原版供比较；若某项优化无收益或回退，说明证据，阶段 2 选用经验证的共同实现，不强行叠加退化改动。
+当前 A+B 已从 `main@38e6637` 同步并共同用于 B1/B2；callback 仍为每请求动态分配。源码和本地检查完成但无硬件，状态为 IMPLEMENTED / LOCAL_PASS_HW_PENDING，不能预填提速数据。目标机仍需按阶段 1.5 报告中的 original/A/AB 口径采集真实结果；阶段 2 的 B1/B2 对照必须保持相同 A+B 二进制与配置。
 
 ## 5. 阶段 2：在阶段 1 direct 基础上增加双链接并测量收益
 
@@ -318,7 +276,7 @@ direct B2 没有 receiver scatter 或 CPU 重叠指标。未同步跨机时钟�
 
 ### 5.3 验证和比较
 
-1. 重跑采用相同阶段 1.5 设置的 B1 正确性与性能；再做 B2 的完整校验和延迟单 rail 的验证，确认 ACK 栅栏和各 rail generation 正确。若阶段 1.5 尚未验收，B1/B2 都保留相同未优化实现并标明，不能只优化其中一组。
+1. 重跑采用相同阶段 1.5 A+B 设置的 B1 正确性与性能；再做 B2 的完整校验和延迟单 rail 的验证，确认 ACK 栅栏和各 rail generation 正确。无论阶段 1.5 硬件对照是否完成，B1/B2 都必须使用完全相同的等待/记账实现，不能只优化其中一组。
 2. 记录实际设备、端口、QP 对应关系，以及两张网卡测试前后端口计数。只有建立两个 channel 的日志不足以证明双 NIC 正常承载数据。
 3. 关闭 trace，在同一配置/同一二进制下交替运行 B1/B2，各 5 次；下一次 repeat 反转顺序，减少温度/频率与运行顺序偏差。
 4. 单独开启 trace，再运行 B1/B2，产出上述指标的分位数或分布摘要；记录 trace 对 e2e 的影响，不将它混入正式对照表。
@@ -446,7 +404,7 @@ token 使用设计约定：`(generation << 8) | chunk_id`，24 位 generation、
 
 ### 阶段 1 提示词
 
-> 请读取 perf_test/DESIGN_CN.md 和 perf_test/IMPLEMENTATION_PLAN_CN.md，实施阶段 1：单 RDMA 链接 direct baseline。只使用当前 ubs-comm，循环异步 Put 600 个 1 KiB 块，第 i 块直接写最终 `dst + i*4096`；600 个 Put 后在同一真实 QP 上仅 Send 一次 ROUND_READY，receiver 校验最终 dst 后发 ACK 再复用。不得分配 staging 或做 CPU scatter；在 `Start()` 前显式关闭 TLS。交付最小 C++ 程序、CMake、可运行的 Python 跑测脚本、配置示例、README 和 PROGRESS。先验证完整内容与缓冲生命周期，再运行 baseline，保存真实日志和性能结果。不要实现双链接、SGL 或修改 IMM。没有目标 RDMA 硬件时完成可执行的本地工作并标明硬件验证 pending，禁止虚构结果。
+> 请读取当前 worktree 的 DESIGN_CN.md 和 IMPLEMENTATION_PLAN_CN.md，实施阶段 1：单 RDMA 链接 direct baseline。只使用当前 ubs-comm，循环异步 Put 600 个 1 KiB 块，第 i 块直接写最终 `dst + i*4096`；600 个 Put 后在同一真实 QP 上仅 Send 一次 ROUND_READY，receiver 校验最终 dst 后发 ACK 再复用。不得分配 staging 或做 CPU scatter；在 `Start()` 前显式关闭 TLS。交付最小 C++ 程序、CMake、双端直接运行命令、配置记录示例、README 和 PROGRESS。先验证完整内容与缓冲生命周期，再运行 baseline，保存真实日志和性能结果。不要实现双链接、SGL 或修改 IMM。没有目标 RDMA 硬件时完成可执行的本地工作并标明硬件验证 pending，禁止虚构结果。
 
 ### 阶段 1.5 提示词
 

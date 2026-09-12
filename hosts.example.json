@@ -1,15 +1,18 @@
 {
+  "_note": "Reference record only. rdma_600 does not read this file; pass all values on its command line.",
   "sender": {
     "binary": "/absolute/path/on/sender/rdma_600",
     "library_dirs": [
       "/absolute/path/on/sender/ubs-comm/dist/hcom_3rdparty/libboundscheck/lib"
     ],
     "rdma_ips": [
-      "<sender_nic0_rdma_ip>"
+      "<sender_nic0_rdma_ip>",
+      "<sender_nic1_rdma_ip>"
     ],
     "app_cpu": 2,
     "worker_cpus": [
-      3
+      3,
+      4
     ]
   },
   "receiver": {
@@ -19,20 +22,31 @@
     ],
     "oob_ip": "<receiver_oob_ip>",
     "oob_ports": [
-      19000
+      19000,
+      19001
     ],
     "rdma_ips": [
-      "<receiver_nic0_rdma_ip>"
+      "<receiver_nic0_rdma_ip>",
+      "<receiver_nic1_rdma_ip>"
     ],
     "app_cpu": 2,
     "worker_cpus": [
-      3
+      3,
+      4
     ]
   },
   "stage1": {
     "verify_rounds": 20,
     "warmup_rounds": 1000,
     "measure_rounds": 10000,
+    "timeout_sec": 10,
+    "process_timeout_sec": 600
+  },
+  "stage2": {
+    "verify_rounds": 20,
+    "warmup_rounds": 1000,
+    "measure_rounds": 10000,
+    "trace_rounds": 32,
     "timeout_sec": 10,
     "process_timeout_sec": 600
   }

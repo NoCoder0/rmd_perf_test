@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.16)
 
-project(rdma_600_stage1 LANGUAGES CXX)
+project(rdma_600_stage2_direct LANGUAGES CXX)
 
 if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
     message(FATAL_ERROR "rdma_600 targets the Linux RDMA hosts; configure it on the deployment machine.")
@@ -65,6 +65,16 @@ execute_process(
     ERROR_QUIET)
 if(NOT RDMA_600_GIT_COMMIT)
     set(RDMA_600_GIT_COMMIT "unknown")
+else()
+    execute_process(
+        COMMAND git -C "${CMAKE_CURRENT_SOURCE_DIR}" diff --quiet HEAD --
+        RESULT_VARIABLE RDMA_600_GIT_DIFF_RESULT
+        ERROR_QUIET)
+    if(RDMA_600_GIT_DIFF_RESULT EQUAL 1)
+        string(APPEND RDMA_600_GIT_COMMIT "-dirty")
+    elseif(NOT RDMA_600_GIT_DIFF_RESULT EQUAL 0)
+        string(APPEND RDMA_600_GIT_COMMIT "-status-unknown")
+    endif()
 endif()
 
 add_executable(rdma_600 rdma_600.cpp)
