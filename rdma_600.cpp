@@ -773,6 +773,17 @@ struct alignas(kCounterAlignment) CallbackOwnedCounters {
     std::atomic<uint64_t> dataDoneCallbacks{0};
     std::atomic<uint64_t> sendDoneCallbacks{0};
     std::atomic<uint64_t> activeCallbacks{0};
+    std::atomic<uint64_t> dataDoneGeneration{0};
+    std::atomic<uint64_t> dataDoneTimestampNs{0};
+    std::atomic<uint64_t> roundReadySendDoneGeneration{0};
+    std::atomic<uint64_t> roundReadySendDoneTimestampNs{0};
+};
+
+struct CompletionGateCounts {
+    uint64_t ack = 0;
+    uint64_t dataDone = 0;
+    uint64_t roundReadySendDone = 0;
+    uint64_t tie = 0;
 };
 
 class Stage1Benchmark {
@@ -1113,6 +1124,8 @@ private:
             RecordFailure("ROUND_ACK generation is not strictly increasing");
             return -1;
         }
+        const uint64_t observedNs = IsMeasureGeneration(generation) ? CallbackNowNs("ROUND_ACK timestamp") : 0;
+        mAckObservedTimestampNs.store(observedNs, std::memory_order_relaxed);
         mAckGeneration.store(generation, std::memory_order_release);
         return 0;
     }
@@ -1158,19 +1171,33 @@ private:
                     RecordFailure("Put callback failed: " + std::to_string(context.Result()));
                     return;
                 }
-                mCallbackCounters.dataDoneCallbacks.fetch_add(1, std::memory_order_release);
+                const uint64_t completed =
+                    mCallbackCounters.dataDoneCallbacks.fetch_add(1, std::memory_order_release) + 1;
+                if ((completed % kBlocks) == 0) {
+                    const uint64_t generation = completed / kBlocks;
+                    const uint64_t completedNs =
+                        IsMeasureGeneration(generation) ? CallbackNowNs("all-data-done timestamp") : 0;
+                    mCallbackCounters.dataDoneTimestampNs.store(completedNs, std::memory_order_relaxed);
+                    mCallbackCounters.dataDoneGeneration.store(generation, std::memory_order_release);
+                }
             },
             std::placeholders::_1);
     }
 
-    Callback *NewSendCallback()
+    Callback *NewSendCallback(uint16_t opcode = 0, uint64_t generation = 0)
     {
         return UBSHcomNewCallback(
-            [this](UBSHcomServiceContext &context) {
+            [this, opcode, generation](UBSHcomServiceContext &context) {
                 ActiveCallbackGuard guard(mCallbackCounters.activeCallbacks);
                 if (context.Result() != 0) {
                     RecordFailure("Send/Reply callback failed: " + std::to_string(context.Result()));
                     return;
+                }
+                if (opcode == kOpRoundReady) {
+                    const uint64_t completedNs =
+                        IsMeasureGeneration(generation) ? CallbackNowNs("ROUND_READY Send timestamp") : 0;
+                    mCallbackCounters.roundReadySendDoneTimestampNs.store(completedNs, std::memory_order_relaxed);
+                    mCallbackCounters.roundReadySendDoneGeneration.store(generation, std::memory_order_release);
                 }
                 mCallbackCounters.sendDoneCallbacks.fetch_add(1, std::memory_order_release);
             },
@@ -1193,6 +1220,10 @@ private:
         if (mParams.measureRounds != 0) {
             mSubmitNs.reserve(mParams.measureRounds);
             mE2eNs.reserve(mParams.measureRounds);
+            mPostSubmitWaitNs.reserve(mParams.measureRounds);
+            mAckObservedElapsedNs.reserve(mParams.measureRounds);
+            mAllDataDoneElapsedNs.reserve(mParams.measureRounds);
+            mRoundReadySendDoneElapsedNs.reserve(mParams.measureRounds);
             mMeasureWallStartNs = NowNs();
             for (uint32_t round = 0; round < mParams.measureRounds; ++round, ++generation) {
                 RunSenderRound(generation, true);
@@ -1224,17 +1255,20 @@ private:
             }
         }
         mRoundReadyPayload = EncodeAck(kRoundReadyMagic, generation);
-        PostAsyncSend(channel, mRoundReadyPayload.data(), mRoundReadyPayload.size(), kOpRoundReady);
+        PostAsyncSend(channel, mRoundReadyPayload.data(), mRoundReadyPayload.size(), kOpRoundReady, generation);
         const uint64_t submitNs = NowNs();
         WaitData("round completion", [this, generation, expectedData, expectedSend] {
             return mAckGeneration.load(std::memory_order_acquire) >= generation &&
                 mCallbackCounters.dataDoneCallbacks.load(std::memory_order_acquire) >= expectedData &&
-                mCallbackCounters.sendDoneCallbacks.load(std::memory_order_acquire) >= expectedSend;
+                mCallbackCounters.dataDoneGeneration.load(std::memory_order_acquire) >= generation &&
+                mCallbackCounters.sendDoneCallbacks.load(std::memory_order_acquire) >= expectedSend &&
+                mCallbackCounters.roundReadySendDoneGeneration.load(std::memory_order_acquire) >= generation;
         });
         const uint64_t endNs = NowNs();
         if (measure) {
             mSubmitNs.push_back(submitNs - startNs);
             mE2eNs.push_back(endNs - startNs);
+            RecordRoundDiagnostics(startNs, submitNs, endNs);
         }
     }
 
@@ -1314,9 +1348,10 @@ private:
         });
     }
 
-    void PostAsyncSend(const UBSHcomChannelPtr &channel, uint8_t *data, size_t size, uint16_t opcode)
+    void PostAsyncSend(
+        const UBSHcomChannelPtr &channel, uint8_t *data, size_t size, uint16_t opcode, uint64_t generation = 0)
     {
-        Callback *callback = NewSendCallback();
+        Callback *callback = NewSendCallback(opcode, generation);
         if (callback == nullptr) {
             throw std::runtime_error("unable to allocate Send callback");
         }
@@ -1332,6 +1367,86 @@ private:
     {
         return mAppCounters.attemptedSendCallbacks +
             mCallbackCounters.workerAttemptedSendCallbacks.load(std::memory_order_acquire);
+    }
+
+    bool IsMeasureGeneration(uint64_t generation) const noexcept
+    {
+        const uint64_t firstMeasure =
+            static_cast<uint64_t>(mParams.verifyRounds) + mParams.warmupRounds + 1;
+        return mParams.measureRounds != 0 && generation >= firstMeasure && generation <= mParams.TotalRounds();
+    }
+
+    uint64_t CallbackNowNs(const char *what) noexcept
+    {
+        struct timespec ts {};
+        if (clock_gettime(CLOCK_MONOTONIC_RAW, &ts) != 0) {
+            RecordFailure(std::string(what) + " failed: " + std::strerror(errno));
+            return 0;
+        }
+        return static_cast<uint64_t>(ts.tv_sec) * 1000000000ULL + static_cast<uint64_t>(ts.tv_nsec);
+    }
+
+    void RecordRoundDiagnostics(uint64_t startNs, uint64_t submitNs, uint64_t endNs)
+    {
+        const uint64_t ackNs = mAckObservedTimestampNs.load(std::memory_order_acquire);
+        const uint64_t dataDoneNs = mCallbackCounters.dataDoneTimestampNs.load(std::memory_order_acquire);
+        const uint64_t sendDoneNs =
+            mCallbackCounters.roundReadySendDoneTimestampNs.load(std::memory_order_acquire);
+        const auto requireRoundTimestamp = [startNs, endNs](uint64_t timestamp, const char *name) {
+            if (timestamp < startNs || timestamp > endNs) {
+                throw std::runtime_error(std::string(name) + " timestamp is outside the measured round");
+            }
+        };
+        requireRoundTimestamp(ackNs, "ROUND_ACK observed");
+        requireRoundTimestamp(dataDoneNs, "all data done");
+        requireRoundTimestamp(sendDoneNs, "ROUND_READY Send done");
+        if (submitNs < startNs || submitNs > endNs) {
+            throw std::runtime_error("submit timestamp is outside the measured round");
+        }
+
+        mPostSubmitWaitNs.push_back(endNs - submitNs);
+        mAckObservedElapsedNs.push_back(ackNs - startNs);
+        mAllDataDoneElapsedNs.push_back(dataDoneNs - startNs);
+        mRoundReadySendDoneElapsedNs.push_back(sendDoneNs - startNs);
+
+        const uint64_t gateNs = std::max({ackNs, dataDoneNs, sendDoneNs});
+        const bool ackGate = ackNs == gateNs;
+        const bool dataGate = dataDoneNs == gateNs;
+        const bool sendGate = sendDoneNs == gateNs;
+        const uint32_t gateCount = static_cast<uint32_t>(ackGate) + static_cast<uint32_t>(dataGate) +
+            static_cast<uint32_t>(sendGate);
+        if (gateCount != 1) {
+            ++mCompletionGateCounts.tie;
+        } else if (ackGate) {
+            ++mCompletionGateCounts.ack;
+        } else if (dataGate) {
+            ++mCompletionGateCounts.dataDone;
+        } else {
+            ++mCompletionGateCounts.roundReadySendDone;
+        }
+    }
+
+    const char *DominantCompletionGate() const noexcept
+    {
+        const uint64_t maximum = std::max({mCompletionGateCounts.ack, mCompletionGateCounts.dataDone,
+            mCompletionGateCounts.roundReadySendDone, mCompletionGateCounts.tie});
+        const uint32_t winners = static_cast<uint32_t>(mCompletionGateCounts.ack == maximum) +
+            static_cast<uint32_t>(mCompletionGateCounts.dataDone == maximum) +
+            static_cast<uint32_t>(mCompletionGateCounts.roundReadySendDone == maximum) +
+            static_cast<uint32_t>(mCompletionGateCounts.tie == maximum);
+        if (winners != 1) {
+            return "mixed";
+        }
+        if (mCompletionGateCounts.ack == maximum) {
+            return "ack";
+        }
+        if (mCompletionGateCounts.dataDone == maximum) {
+            return "data_done";
+        }
+        if (mCompletionGateCounts.roundReadySendDone == maximum) {
+            return "round_ready_send_done";
+        }
+        return "tie";
     }
 
     void FillSenderVerifyPattern(uint64_t generation)
@@ -1512,19 +1627,52 @@ private:
                << ",\"rounds_in_flight\":1,\"data_wr_per_round\":600,\"round_ready_wr_per_round\":1"
                << ",\"ack_wr_per_round\":1,\"verify_passed\":true";
         if (mOptions.kind == RunKind::Verify) {
-            output << ",\"measure_rounds\":0,\"submit_p50_us\":null,\"e2e_avg_us\":null,\"e2e_p50_us\":null"
-                   << ",\"e2e_p95_us\":null,\"e2e_p99_us\":null,\"effective_GBps\":null,\"block_Mops\":null";
+            output << ",\"measure_rounds\":0,\"submit_avg_us\":null,\"submit_p50_us\":null"
+                   << ",\"submit_p95_us\":null,\"submit_p99_us\":null,\"e2e_avg_us\":null"
+                   << ",\"e2e_p50_us\":null,\"e2e_p95_us\":null,\"e2e_p99_us\":null"
+                   << ",\"post_submit_wait_avg_us\":null,\"post_submit_wait_p50_us\":null"
+                   << ",\"post_submit_wait_p95_us\":null,\"post_submit_wait_p99_us\":null"
+                   << ",\"ack_observed_p50_us\":null,\"ack_observed_p95_us\":null"
+                   << ",\"ack_observed_p99_us\":null,\"all_data_done_p50_us\":null"
+                   << ",\"all_data_done_p95_us\":null,\"all_data_done_p99_us\":null"
+                   << ",\"round_ready_send_done_p50_us\":null,\"round_ready_send_done_p95_us\":null"
+                   << ",\"round_ready_send_done_p99_us\":null,\"completion_gate_dominant\":null"
+                   << ",\"completion_gate_counts\":null,\"effective_GBps\":null,\"block_Mops\":null";
         } else {
             const uint64_t wallNs = mMeasureWallEndNs - mMeasureWallStartNs;
             const double wallSeconds = static_cast<double>(wallNs) / 1000000000.0;
             const double effectiveGbps = static_cast<double>(mParams.measureRounds) * kPayloadBytes / wallSeconds / 1e9;
             const double blockMops = static_cast<double>(mParams.measureRounds) * kBlocks / wallSeconds / 1e6;
             output << ",\"measure_rounds\":" << mParams.measureRounds
+                   << ",\"submit_avg_us\":" << AverageNs(mSubmitNs) / 1000.0
                    << ",\"submit_p50_us\":" << NsToUs(PercentileNs(mSubmitNs, 0.50))
+                   << ",\"submit_p95_us\":" << NsToUs(PercentileNs(mSubmitNs, 0.95))
+                   << ",\"submit_p99_us\":" << NsToUs(PercentileNs(mSubmitNs, 0.99))
                    << ",\"e2e_avg_us\":" << AverageNs(mE2eNs) / 1000.0
                    << ",\"e2e_p50_us\":" << NsToUs(PercentileNs(mE2eNs, 0.50))
                    << ",\"e2e_p95_us\":" << NsToUs(PercentileNs(mE2eNs, 0.95))
                    << ",\"e2e_p99_us\":" << NsToUs(PercentileNs(mE2eNs, 0.99))
+                   << ",\"post_submit_wait_avg_us\":" << AverageNs(mPostSubmitWaitNs) / 1000.0
+                   << ",\"post_submit_wait_p50_us\":" << NsToUs(PercentileNs(mPostSubmitWaitNs, 0.50))
+                   << ",\"post_submit_wait_p95_us\":" << NsToUs(PercentileNs(mPostSubmitWaitNs, 0.95))
+                   << ",\"post_submit_wait_p99_us\":" << NsToUs(PercentileNs(mPostSubmitWaitNs, 0.99))
+                   << ",\"ack_observed_p50_us\":" << NsToUs(PercentileNs(mAckObservedElapsedNs, 0.50))
+                   << ",\"ack_observed_p95_us\":" << NsToUs(PercentileNs(mAckObservedElapsedNs, 0.95))
+                   << ",\"ack_observed_p99_us\":" << NsToUs(PercentileNs(mAckObservedElapsedNs, 0.99))
+                   << ",\"all_data_done_p50_us\":" << NsToUs(PercentileNs(mAllDataDoneElapsedNs, 0.50))
+                   << ",\"all_data_done_p95_us\":" << NsToUs(PercentileNs(mAllDataDoneElapsedNs, 0.95))
+                   << ",\"all_data_done_p99_us\":" << NsToUs(PercentileNs(mAllDataDoneElapsedNs, 0.99))
+                   << ",\"round_ready_send_done_p50_us\":"
+                   << NsToUs(PercentileNs(mRoundReadySendDoneElapsedNs, 0.50))
+                   << ",\"round_ready_send_done_p95_us\":"
+                   << NsToUs(PercentileNs(mRoundReadySendDoneElapsedNs, 0.95))
+                   << ",\"round_ready_send_done_p99_us\":"
+                   << NsToUs(PercentileNs(mRoundReadySendDoneElapsedNs, 0.99))
+                   << ",\"completion_gate_dominant\":\"" << DominantCompletionGate() << "\""
+                   << ",\"completion_gate_counts\":{\"ack\":" << mCompletionGateCounts.ack
+                   << ",\"data_done\":" << mCompletionGateCounts.dataDone
+                   << ",\"round_ready_send_done\":" << mCompletionGateCounts.roundReadySendDone
+                   << ",\"tie\":" << mCompletionGateCounts.tie << "}"
                    << ",\"effective_GBps\":" << effectiveGbps
                    << ",\"block_Mops\":" << blockMops;
         }
@@ -1567,6 +1715,7 @@ private:
 
     std::atomic<uint64_t> mRoundReadyGeneration{0};
     std::atomic<uint64_t> mAckGeneration{0};
+    std::atomic<uint64_t> mAckObservedTimestampNs{0};
     std::atomic<uint64_t> mFinishGeneration{0};
     std::atomic<uint64_t> mFinishAckGeneration{0};
     AppOwnedCounters mAppCounters;
@@ -1574,6 +1723,11 @@ private:
 
     std::vector<uint64_t> mSubmitNs;
     std::vector<uint64_t> mE2eNs;
+    std::vector<uint64_t> mPostSubmitWaitNs;
+    std::vector<uint64_t> mAckObservedElapsedNs;
+    std::vector<uint64_t> mAllDataDoneElapsedNs;
+    std::vector<uint64_t> mRoundReadySendDoneElapsedNs;
+    CompletionGateCounts mCompletionGateCounts;
     uint64_t mMeasureWallStartNs = 0;
     uint64_t mMeasureWallEndNs = 0;
 };
