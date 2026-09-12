@@ -8,12 +8,15 @@
 
 - 一条 RDMA path：一个 service、一个 device、一个 `linkCount=1` 的 worker-poll channel/QP；内部 multirail 关闭。
 - 每轮总有效数据严格为 `600 × 1024 = 614400` 字节。
-- sender 的源块位于 `src + i * 4096`；receiver 先写入连续 `stage + i * 1024`，再由一个应用 scatter 线程复制到 `dst + i * 4096`。
-- 每 30 个异步 `Put(1024)`，在同一 channel/QP 上异步追加一个 `Send(DATA_READY)`；每轮为 600 个数据 WR、20 个通知 WR。
-- receiver 按 chunk 收到通知后立即 scatter；20 个 chunk 完成后异步 `Send(ROUND_ACK)`。收到 ACK 且 sender 的本地 data/Send callbacks 均完成后才复用下一轮缓冲。
+- sender 的源块位于 `src + i * 4096`；第 `i` 个普通 `Put(1024)` 直接写入 receiver 的最终地址 `dst + i * 4096`。没有 `stage` 缓冲，也没有 CPU scatter。
+- 600 个异步 `Put(1024)` 全部提交后，sender 在同一 channel/QP 上异步追加一个 `Send(ROUND_READY)`；每轮为 600 个数据 WR、1 个完成通知 WR。
+- receiver 收到 `ROUND_READY` 后，verify 轮检查最终 `dst` 的全部块和 stride gap，再异步 `Send(ROUND_ACK)`。measure 轮不做逐轮 CPU 拷贝或校验，结束后才完整检查最终 `dst`；收到 ACK 且 sender 的本地 data/Send callbacks 均完成后才复用下一轮缓冲。
 - `generation` 从 1 递增，覆盖 verify、warmup 与 measure，不会在阶段切换时清零。
+- 程序会在 `Start()` 前显式调用 `SetTlsOptions` 并设置 `enableTls=false`；因此不会初始化 TLS context，也不需要证书、私钥或 PSK 回调。
 
-阶段 1 明确拒绝双链接、SGL、`scatter=after-all` 和 `WRITE_WITH_IMM` 参数；它们属于后续阶段，不能混入 B1 结果。
+此变更将 B1 协议版本提升为 2；receiver 和 sender 必须同时重新构建并使用同一版 `rdma_600`。TLS 已关闭，只应在受控、可信的测试网络上运行。
+
+阶段 1 明确拒绝双链接、SGL、旧的 `--chunk-items` / `--scatter` / `--notify` 参数和 `WRITE_WITH_IMM`；它们不属于这个 direct baseline。
 
 ## 构建
 
@@ -109,11 +112,11 @@ bash ./build.sh \
 ./build/rdma_600 --self-test
 ```
 
-它验证 614400 字节布局、600 个 block、20 个 chunk、显式 HELLO/READY/DATA_READY 编解码、memory-key 编码、generation 数据模式和 destination stride 间隙。它不是建链、DMA、CQ、RQ、MR 或性能验证。
+它验证 614400 字节布局、600 个 direct block、显式 HELLO/READY/ROUND_READY 编解码、memory-key 编码、generation 数据模式和 destination stride 间隙。它不是建链、DMA、CQ、RQ、MR、TLS 初始化或性能验证。
 
 ## 手工双端运行
 
-先在 receiver 主机启动 receiver 角色，再在 sender 主机启动 sender 角色。`LISTENING` 仅供进程编排；真正的 READY 只会在 receiver 已分配、触页并注册 staging MR 后通过 HCOM HELLO/Reply 返回。
+先在 receiver 主机启动 receiver 角色，再在 sender 主机启动 sender 角色。`LISTENING` 仅供进程编排；真正的 READY 只会在 receiver 已分配、触页并注册最终 destination MR 后通过 HCOM HELLO/Reply 返回。
 
 ```bash
 export LD_LIBRARY_PATH="$UBS_ROOT/dist/hcom_3rdparty/libboundscheck/lib:${LD_LIBRARY_PATH:-}"
@@ -122,8 +125,8 @@ export LD_LIBRARY_PATH="$UBS_ROOT/dist/hcom_3rdparty/libboundscheck/lib:${LD_LIB
   --rdma-ip <receiver_nic0_rdma_ip> \
   --listen <receiver_oob_ip>:19000 \
   --kind verify --verify-rounds 20 --warmup 0 --rounds 0 \
-  --timeout-sec 10 --app-cpu <scatter_cpu> --worker-cpu <cq_cpu> \
-  --links 1 --mode plain --chunk-items 30 --scatter pipeline --notify send
+  --timeout-sec 10 --app-cpu <receiver_app_cpu> --worker-cpu <cq_cpu> \
+  --links 1 --mode plain
 ```
 
 确认 receiver 已输出 `LISTENING` 后，在 sender 主机启动匹配参数的 sender：
@@ -136,7 +139,7 @@ export LD_LIBRARY_PATH="$UBS_ROOT/dist/hcom_3rdparty/libboundscheck/lib:${LD_LIB
   --peer <receiver_oob_ip>:19000 \
   --kind verify --verify-rounds 20 --warmup 0 --rounds 0 \
   --timeout-sec 10 --app-cpu <submit_cpu> --worker-cpu <cq_cpu> \
-  --links 1 --mode plain --chunk-items 30 --scatter pipeline --notify send
+  --links 1 --mode plain
 ```
 
 用 `--kind measure`、`--warmup 1000 --rounds 10000` 进入正式计时；该模式仍会先跑完整 verify。sender 只在正常结束时输出一行 JSON。`--kind verify` 中所有正式带宽/延迟字段为 `null`，避免将正确性运行误读为性能结果。
@@ -201,11 +204,11 @@ results/<run-id>-sender/
 
 sender 使用本机 `CLOCK_MONOTONIC_RAW` 记录：
 
-- `submit_us`：第一个 `Put` 前至最后一个 DATA_READY `Send` 提交成功后；
+- `submit_us`：第一个 `Put` 前至唯一的 `ROUND_READY` `Send` 提交成功后；
 - `e2e_us`：第一个 `Put` 前至收齐 ROUND_ACK，且本地 data/Send callback 均完成；
 - 有效带宽：正式循环的总 614400 字节/轮除以整段正式 wall time。
 
-不同机器的时间戳不会相减。receiver 的 1 KiB memcpy 不逐条读时钟；阶段 2 才会增加独立 trace。正式 measure 每轮只检查通知 generation 和完成状态，结束后完整检查最终 destination 与 stride gap；verify 轮则检查所有 64-bit word 的 generation/block/word 数据模式。
+不同机器的时间戳不会相减。这个 direct baseline 没有 receiver 的 1 KiB memcpy 或 scatter 计时。正式 measure 每轮只检查 `ROUND_READY` generation 和完成状态，结束后完整检查最终 destination 与 stride gap；verify 轮则检查所有 64-bit word 的 generation/block/word 数据模式。
 
 ## 运行前清单
 

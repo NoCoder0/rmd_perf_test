@@ -34,9 +34,6 @@ class Case:
     name: str
     links: int = 1
     mode: str = "plain"
-    chunk_items: int = 30
-    scatter: str = "pipeline"
-    notify: str = "send"
 
 
 B1 = Case("B1")
@@ -217,12 +214,6 @@ def stage1_argv(role: str, config: Dict[str, Any], stage: Dict[str, int], kind: 
         "1",
         "--mode",
         "plain",
-        "--chunk-items",
-        "30",
-        "--scatter",
-        "pipeline",
-        "--notify",
-        "send",
     ]
 
 
@@ -387,12 +378,11 @@ def validate_result(result: Dict[str, Any], case: Case, kind: str, stage: Dict[s
         "block_bytes": 1024,
         "payload_bytes": 614400,
         "mode": case.mode,
-        "chunk_items": case.chunk_items,
-        "scatter": case.scatter,
-        "notify": case.notify,
+        "remote_layout": "direct-stride-4096",
+        "tls_enabled": False,
         "rounds_in_flight": 1,
         "data_wr_per_round": 600,
-        "notify_wr_per_round": 20,
+        "round_ready_wr_per_round": 1,
         "ack_wr_per_round": 1,
         "verify_passed": True,
     }
@@ -423,7 +413,7 @@ def write_sender_report(output: pathlib.Path, kind: str, outcome: Dict[str, Any]
             "|---|---:|---:|---:|",
             f"| B1 | {float(result['e2e_p50_us']):.3f} | {float(result['submit_p50_us']):.3f} | {float(result['effective_GBps']):.3f} |",
             "",
-            "This is one validated sender result. It is application effective throughput with one round in flight, including scatter and ACK; it is not a NIC peak claim.",
+            "This is one validated sender result. It is application effective throughput with one round in flight, including the ROUND_READY/ACK control path; it is not a NIC peak claim.",
             "",
         ]
     elif outcome.get("status") == "ok" and isinstance(result, dict) and kind == "verify":

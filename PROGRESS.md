@@ -12,10 +12,12 @@
 ## 阶段 1 已实现范围
 
 - 固定 B1 参数：单 service/device/channel/QP，`linkCount=1`，worker poll，内部 multirail 关闭。
-- `600 × 1 KiB` 异步 `Put`，每 30 个 Put 在同一 channel 上追加 DATA_READY Send；连续 staging、流水 CPU scatter、ROUND_ACK、generation 与 FINISH/FINISH_ACK drain。
-- 显式 HELLO/READY、DATA_READY、ACK、FINISH wire 编解码；READY 只在接收端 staging 初始化及 MR 注册后回复。
+- `600 × 1 KiB` 异步普通 `Put`；第 `i` 个请求从 `src + i * 4096` 直接写到最终 `dst + i * 4096`。没有 staging 分配、staging MR 或 CPU scatter。
+- 每轮 600 个 Put 后在同一 channel/QP 发送一个 `ROUND_READY`，receiver 完成 verify 校验（measure 结束后校验）后返回 `ROUND_ACK`；generation 与 FINISH/FINISH_ACK drain 保留。
+- 显式 HELLO/READY、ROUND_READY、ACK、FINISH wire 编解码；READY 只在接收端最终 destination 初始化及 MR 注册后回复。
+- HCOM service 在 `Start()` 前显式 `SetTlsOptions(enableTls=false)`，不初始化 TLS context，也不要求证书、私钥或 PSK 回调。
 - 发送和接收 callback/API 返回/超时/消息合法性检查；正常路径在释放 MR、channel 或状态前等待所有本地 callback。错误路径若无法在有界时间内 drain，则进程直接退出而非释放仍可能被 callback 使用的状态。
-- verify 使用 generation/block/word 全字校验和 dst 间隙哨兵；measure 预生成稳定数据并在结束时作全量最终检查。
+- verify 使用 generation/block/word 全字校验和 dst 间隙哨兵；measure 预生成稳定数据、每轮不做 CPU 拷贝或扫描，并在结束时作全量最终检查。
 - `run.py` 在两台主机分别以 `--role receiver` / `--role sender` 启动一个本地角色并归档证据，不承担 QP、MR 或数据面工作；失败时仅清理本机本次调用启动的进程组。
 
 ## 已执行的本机准备检查
@@ -24,8 +26,8 @@
 |---|---|---|
 | `run.py` AST 解析 | PASS | Windows 本机仅检查 Python 语法。 |
 | `python run.py --help` | PASS | 已确认 CLI 参数说明可输出；未启动本地测试进程。 |
-| 示例配置 / B1 参数生成 | PASS | 已验证 `hosts.example.json` 可通过脚本校验，verify argv 会固定 `--rounds 0`。 |
-| C++ 语法检查 | PASS（受限） | 使用窄 hcom API stub 与 Windows 编译器执行 `-fsyntax-only`；这只覆盖本文件语法，不替代真实 hcom 头文件、链接或 Linux 构建。 |
+| 示例配置 / B1 参数生成及结果契约 | PASS | `hosts.example.json` 可通过脚本校验；verify argv 固定 `--rounds 0`，且不再传 chunk/scatter/notify 参数；direct B1 JSON 能通过脚本校验。 |
+| C++ 语法检查 | PASS（受限） | 用实际 ubs-comm service 公共头执行 `g++ -fsyntax-only`；Windows 缺失 Linux 平台符号时仅临时注入兼容声明。该检查覆盖本文件/API 名称，不替代目标 Linux 的真实头、链接或 RDMA 构建。 |
 | C++ / CMake 构建 | NOT_RUN | 当前机器没有目标 Linux/AArch64 ubs-comm `dist/hcom` 产物可供链接。 |
 | `rdma_600 --self-test` | NOT_RUN | 需要先在目标 Linux 构建二进制；该检查本身不验证 RDMA。 |
 | 双机 RDMA verify / measure | NOT_RUN | 尚未提供两台目标 Linux 主机、网卡、驱动/provider、NUMA 或可用 RDMA 路径。 |
@@ -51,6 +53,6 @@
 
 ## 非目标 / 未解决项
 
-- 未实现双 NIC、SGL、scatter-off、跨轮窗口、callback 池、自动重连或 `WRITE_WITH_IMM`。
+- 未实现双 NIC、SGL、staging/scatter 对照、跨轮窗口、callback 池、自动重连或 `WRITE_WITH_IMM`。
 - 未确认实际 QP `max_send_sge`；阶段 1 plain B1 不依赖它，阶段 3 必须单独查询并核验。
 - 未产生性能结果、trace、NIC 端口计数或硬件正确性结论。

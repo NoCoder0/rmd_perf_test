@@ -4,9 +4,10 @@
 //
 // This executable deliberately implements only B1:
 //   * one service / one RDMA device / one worker-poll QP;
-//   * 600 asynchronous 1 KiB Put operations per round;
-//   * a DATA_READY Send after each 30 writes on the same channel;
-//   * receiver-side pipeline scatter and a per-round ACK.
+//   * 600 asynchronous 1 KiB Put operations per round, each directly targeting
+//     receiver dst + i * 4096;
+//   * one ROUND_READY Send after those writes on the same channel;
+//   * receiver-side validation and a per-round ACK (no staging or CPU scatter).
 //
 // It is intended to be built and run on the target Linux RDMA hosts.  The
 // --self-test mode has no RDMA dependency at runtime and validates the local
@@ -71,41 +72,39 @@ using ock::hcom::UBSHcomService;
 using ock::hcom::UBSHcomServiceContext;
 using ock::hcom::UBSHcomServiceOptions;
 using ock::hcom::UBSHcomServiceProtocol;
+using ock::hcom::UBSHcomTlsOptions;
 using ock::hcom::UBSHcomTwoSideThreshold;
 using ock::hcom::UBSHcomNewCallback;
 
-constexpr uint16_t kProtocolVersion = 1;
+constexpr uint16_t kProtocolVersion = 2;
 constexpr uint16_t kLinks = 1;
 constexpr uint32_t kBlocks = 600;
 constexpr uint32_t kBlockBytes = 1024;
 constexpr uint32_t kStrideBytes = 4096;
-constexpr uint32_t kChunkItems = 30;
-constexpr uint32_t kChunks = kBlocks / kChunkItems;
 constexpr uint64_t kPayloadBytes = static_cast<uint64_t>(kBlocks) * kBlockBytes;
+constexpr uint64_t kDestinationBytes = static_cast<uint64_t>(kBlocks) * kStrideBytes;
 constexpr uint8_t kDstGapSentinel = 0xa5;
-constexpr uint8_t kStageSentinel = 0xcd;
 constexpr uint8_t kSourceGapSentinel = 0x5a;
 
-static_assert(kBlocks % kChunkItems == 0, "stage 1 uses complete 30-item chunks");
 static_assert(kPayloadBytes == 614400, "the benchmark payload is fixed by design");
 
 constexpr uint16_t kOpHello = 700;
 constexpr uint16_t kOpReady = 701;
-constexpr uint16_t kOpDataReady = 702;
+constexpr uint16_t kOpRoundReady = 702;
 constexpr uint16_t kOpRoundAck = 703;
 constexpr uint16_t kOpFinish = 704;
 constexpr uint16_t kOpFinishAck = 705;
 
 constexpr uint32_t kHelloMagic = 0x52443630U;      // "RD60"
 constexpr uint32_t kReadyMagic = 0x52445259U;      // "RDRY"
+constexpr uint32_t kRoundReadyMagic = 0x52445244U; // "RDRD"
 constexpr uint32_t kAckMagic = 0x5244414bU;        // "RDAK"
 constexpr uint32_t kFinishMagic = 0x5244464eU;     // "RDFN"
 constexpr uint32_t kFinishAckMagic = 0x52444641U;  // "RDFA"
 
-constexpr size_t kHelloWireBytes = 36;
+constexpr size_t kHelloWireBytes = 32;
 constexpr size_t kMemoryKeyWireBytes = 80;
 constexpr size_t kReadyWireBytes = kHelloWireBytes + 16 + kMemoryKeyWireBytes;
-constexpr size_t kNoticeWireBytes = 24;
 constexpr size_t kAckWireBytes = 16;
 constexpr size_t kFinishWireBytes = 16;
 
@@ -133,7 +132,6 @@ struct CaseParameters {
     uint32_t blocks = kBlocks;
     uint32_t blockBytes = kBlockBytes;
     uint32_t strideBytes = kStrideBytes;
-    uint32_t chunkItems = kChunkItems;
     uint32_t verifyRounds = 0;
     uint32_t warmupRounds = 0;
     uint32_t measureRounds = 0;
@@ -146,17 +144,9 @@ struct CaseParameters {
 
 struct ReadyInfo {
     CaseParameters params;
-    uint64_t stageAddress = 0;
-    uint64_t stageBytes = 0;
-    UBSHcomMemoryKey stageKey{};
-};
-
-struct Notice {
-    uint64_t generation = 0;
-    uint32_t chunkId = 0;
-    uint32_t byteCount = 0;
-    uint16_t rail = 0;
-    uint16_t itemCount = 0;
+    uint64_t destinationAddress = 0;
+    uint64_t destinationBytes = 0;
+    UBSHcomMemoryKey destinationKey{};
 };
 
 class AlignedBuffer {
@@ -263,7 +253,6 @@ void EncodeParams(uint8_t *&cursor, const CaseParameters &params)
     PutU32(cursor, params.blocks);
     PutU32(cursor, params.blockBytes);
     PutU32(cursor, params.strideBytes);
-    PutU32(cursor, params.chunkItems);
     PutU32(cursor, params.verifyRounds);
     PutU32(cursor, params.warmupRounds);
     PutU32(cursor, params.measureRounds);
@@ -277,7 +266,6 @@ CaseParameters DecodeParams(const uint8_t *&cursor)
     params.blocks = GetU32(cursor);
     params.blockBytes = GetU32(cursor);
     params.strideBytes = GetU32(cursor);
-    params.chunkItems = GetU32(cursor);
     params.verifyRounds = GetU32(cursor);
     params.warmupRounds = GetU32(cursor);
     params.measureRounds = GetU32(cursor);
@@ -288,8 +276,8 @@ bool SameParams(const CaseParameters &left, const CaseParameters &right)
 {
     return left.version == right.version && left.links == right.links && left.blocks == right.blocks &&
         left.blockBytes == right.blockBytes && left.strideBytes == right.strideBytes &&
-        left.chunkItems == right.chunkItems && left.verifyRounds == right.verifyRounds &&
-        left.warmupRounds == right.warmupRounds && left.measureRounds == right.measureRounds;
+        left.verifyRounds == right.verifyRounds && left.warmupRounds == right.warmupRounds &&
+        left.measureRounds == right.measureRounds;
 }
 
 void EncodeMemoryKey(uint8_t *&cursor, const UBSHcomMemoryKey &key)
@@ -346,9 +334,9 @@ std::array<uint8_t, kReadyWireBytes> EncodeReady(const ReadyInfo &info)
     uint8_t *cursor = payload.data();
     PutU32(cursor, kReadyMagic);
     EncodeParams(cursor, info.params);
-    PutU64(cursor, info.stageAddress);
-    PutU64(cursor, info.stageBytes);
-    EncodeMemoryKey(cursor, info.stageKey);
+    PutU64(cursor, info.destinationAddress);
+    PutU64(cursor, info.destinationBytes);
+    EncodeMemoryKey(cursor, info.destinationKey);
     return payload;
 }
 
@@ -362,37 +350,10 @@ bool DecodeReady(const void *data, uint32_t size, ReadyInfo &info)
         return false;
     }
     info.params = DecodeParams(cursor);
-    info.stageAddress = GetU64(cursor);
-    info.stageBytes = GetU64(cursor);
-    info.stageKey = DecodeMemoryKey(cursor);
+    info.destinationAddress = GetU64(cursor);
+    info.destinationBytes = GetU64(cursor);
+    info.destinationKey = DecodeMemoryKey(cursor);
     return true;
-}
-
-std::array<uint8_t, kNoticeWireBytes> EncodeNotice(const Notice &notice)
-{
-    std::array<uint8_t, kNoticeWireBytes> payload{};
-    uint8_t *cursor = payload.data();
-    PutU64(cursor, notice.generation);
-    PutU32(cursor, notice.chunkId);
-    PutU32(cursor, notice.byteCount);
-    PutU16(cursor, notice.rail);
-    PutU16(cursor, notice.itemCount);
-    PutU32(cursor, 0);
-    return payload;
-}
-
-bool DecodeNotice(const void *data, uint32_t size, Notice &notice)
-{
-    if (data == nullptr || size != kNoticeWireBytes) {
-        return false;
-    }
-    const uint8_t *cursor = static_cast<const uint8_t *>(data);
-    notice.generation = GetU64(cursor);
-    notice.chunkId = GetU32(cursor);
-    notice.byteCount = GetU32(cursor);
-    notice.rail = GetU16(cursor);
-    notice.itemCount = GetU16(cursor);
-    return GetU32(cursor) == 0;
 }
 
 std::array<uint8_t, kAckWireBytes> EncodeAck(uint32_t magic, uint64_t generation)
@@ -522,8 +483,8 @@ void PrintUsage(std::ostream &stream)
            << "  rdma_600 --role receiver --rdma-ip <ip> --listen <oob-ip:port> [options]\n"
            << "  rdma_600 --role sender --rdma-ip <ip> --peer <receiver-oob-ip:port> [options]\n"
            << "  rdma_600 --self-test\n\n"
-           << "Stage 1 accepts only: --links 1 --mode plain --chunk-items 30 "
-              "--scatter pipeline --notify send.\n"
+           << "Stage 1 is fixed to: --links 1 --mode plain; 600 Put writes directly to "
+              "dst + i * 4096, with TLS disabled.\n"
            << "Options: --kind verify|measure --verify-rounds N --warmup N --rounds N\n"
            << "         --timeout-sec N --app-cpu N --worker-cpu N\n";
 }
@@ -560,13 +521,10 @@ Options ParseOptions(int argc, char **argv)
         return options;
     }
 
-    static const std::array<std::string, 15> kAllowedOptions = {
+    static const std::array<std::string, 13> kAllowedOptions = {
         "--role", "--rdma-ip", "--listen", "--peer", "--kind", "--verify-rounds", "--warmup", "--rounds",
-        "--timeout-sec", "--app-cpu", "--worker-cpu", "--links", "--mode", "--chunk-items", "--scatter"};
+        "--timeout-sec", "--app-cpu", "--worker-cpu", "--links", "--mode"};
     for (const auto &entry : values) {
-        if (entry.first == "--notify") {
-            continue;
-        }
         if (std::find(kAllowedOptions.begin(), kAllowedOptions.end(), entry.first) == kAllowedOptions.end()) {
             throw std::runtime_error("unknown option: " + entry.first);
         }
@@ -620,10 +578,8 @@ Options ParseOptions(int argc, char **argv)
     options.appCpu = ParseSignedCpu("--app-cpu", optional("--app-cpu", "-1"));
     options.workerCpu = ParseSignedCpu("--worker-cpu", optional("--worker-cpu", "-1"));
 
-    if (optional("--links", "1") != "1" || optional("--mode", "plain") != "plain" ||
-        optional("--chunk-items", "30") != "30" || optional("--scatter", "pipeline") != "pipeline" ||
-        optional("--notify", "send") != "send") {
-        throw std::runtime_error("this stage-1 binary only supports B1: links=1 plain chunk-items=30 pipeline send");
+    if (optional("--links", "1") != "1" || optional("--mode", "plain") != "plain") {
+        throw std::runtime_error("this stage-1 binary only supports B1: links=1 plain direct dst Put");
     }
     if (options.verifyRounds == 0) {
         throw std::runtime_error("--verify-rounds must be greater than zero");
@@ -697,48 +653,37 @@ bool RunSelfTest()
         for (size_t index = 0; index < std::size(key.eid); ++index) {
             key.eid[index] = static_cast<uint8_t>(index);
         }
-        ReadyInfo ready{parameters, 0x12345000U, kPayloadBytes, key};
+        ReadyInfo ready{parameters, 0x12345000U, kDestinationBytes, key};
         const auto readyWire = EncodeReady(ready);
         ReadyInfo decodedReady{};
         if (!DecodeReady(readyWire.data(), static_cast<uint32_t>(readyWire.size()), decodedReady) ||
-            !SameParams(ready.params, decodedReady.params) || ready.stageAddress != decodedReady.stageAddress ||
-            ready.stageBytes != decodedReady.stageBytes ||
-            std::memcmp(&ready.stageKey, &decodedReady.stageKey, sizeof(key)) != 0) {
+            !SameParams(ready.params, decodedReady.params) ||
+            ready.destinationAddress != decodedReady.destinationAddress ||
+            ready.destinationBytes != decodedReady.destinationBytes ||
+            std::memcmp(&ready.destinationKey, &decodedReady.destinationKey, sizeof(key)) != 0) {
             throw std::runtime_error("READY wire round trip failed");
         }
 
-        Notice originalNotice{7, 19, kChunkItems * kBlockBytes, 0, kChunkItems};
-        const auto noticeWire = EncodeNotice(originalNotice);
-        Notice decodedNotice{};
-        if (!DecodeNotice(noticeWire.data(), static_cast<uint32_t>(noticeWire.size()), decodedNotice) ||
-            decodedNotice.generation != originalNotice.generation || decodedNotice.chunkId != originalNotice.chunkId ||
-            decodedNotice.byteCount != originalNotice.byteCount || decodedNotice.rail != 0 ||
-            decodedNotice.itemCount != kChunkItems) {
-            throw std::runtime_error("DATA_READY wire round trip failed");
+        const auto roundReadyWire = EncodeAck(kRoundReadyMagic, 7);
+        uint64_t decodedGeneration = 0;
+        if (!DecodeAck(roundReadyWire.data(), static_cast<uint32_t>(roundReadyWire.size()), kRoundReadyMagic,
+                decodedGeneration) ||
+            decodedGeneration != 7) {
+            throw std::runtime_error("ROUND_READY wire round trip failed");
         }
 
         AlignedBuffer source;
-        AlignedBuffer stage;
         AlignedBuffer destination;
         source.Allocate(static_cast<size_t>(kBlocks) * kStrideBytes);
-        stage.Allocate(kPayloadBytes);
         destination.Allocate(static_cast<size_t>(kBlocks) * kStrideBytes);
         std::memset(source.Data(), kSourceGapSentinel, source.Size());
-        std::memset(stage.Data(), kStageSentinel, stage.Size());
         std::memset(destination.Data(), kDstGapSentinel, destination.Size());
 
         constexpr uint64_t generation = 7;
         for (uint32_t block = 0; block < kBlocks; ++block) {
             FillBlock(source.Data() + static_cast<size_t>(block) * kStrideBytes, generation, block);
-            std::memcpy(stage.Data() + static_cast<size_t>(block) * kBlockBytes,
+            std::memcpy(destination.Data() + static_cast<size_t>(block) * kStrideBytes,
                 source.Data() + static_cast<size_t>(block) * kStrideBytes, kBlockBytes);
-        }
-        for (uint32_t chunk = 0; chunk < kChunks; ++chunk) {
-            for (uint32_t item = 0; item < kChunkItems; ++item) {
-                const uint32_t block = chunk * kChunkItems + item;
-                std::memcpy(destination.Data() + static_cast<size_t>(block) * kStrideBytes,
-                    stage.Data() + static_cast<size_t>(block) * kBlockBytes, kBlockBytes);
-            }
         }
         for (uint32_t block = 0; block < kBlocks; ++block) {
             std::string error;
@@ -747,7 +692,7 @@ bool RunSelfTest()
                 throw std::runtime_error(error);
             }
         }
-        std::cout << "SELF_TEST: PASS (600 blocks, 20 chunks, 614400 bytes)" << std::endl;
+        std::cout << "SELF_TEST: PASS (600 direct blocks, 614400 bytes, dst stride 4096)" << std::endl;
         return true;
     } catch (const std::exception &error) {
         std::cerr << "SELF_TEST: FAIL: " << error.what() << std::endl;
@@ -781,9 +726,6 @@ public:
         mParams.verifyRounds = mOptions.verifyRounds;
         mParams.warmupRounds = mOptions.warmupRounds;
         mParams.measureRounds = mOptions.measureRounds;
-        for (auto &generation : mReadyGeneration) {
-            generation.store(0, std::memory_order_relaxed);
-        }
     }
 
     int Run()
@@ -844,6 +786,12 @@ private:
         if (mService == nullptr) {
             throw std::runtime_error("UBSHcomService::Create(RDMA) returned null");
         }
+        // HCOM defaults TLS to enabled.  This benchmark uses an isolated,
+        // trusted test path and does not provide certificates or PSK callbacks,
+        // so disable it before Start() creates the RDMA/OOB TLS context.
+        UBSHcomTlsOptions tlsOptions{};
+        tlsOptions.enableTls = false;
+        mService->SetTlsOptions(tlsOptions);
         mService->SetDeviceIpMask({mOptions.rdmaIp + "/32"});
         UBSHcomMultiRailOptions multiRail{};
         multiRail.enable = false;
@@ -899,17 +847,17 @@ private:
             return;
         }
 
-        mStage.Allocate(kPayloadBytes);
         mDestination.Allocate(static_cast<size_t>(kBlocks) * kStrideBytes);
-        std::memset(mStage.Data(), kStageSentinel, mStage.Size());
         std::memset(mDestination.Data(), kDstGapSentinel, mDestination.Size());
-        RequireOk(mService->RegisterMemoryRegion(reinterpret_cast<uintptr_t>(mStage.Data()), mStage.Size(), mStageMr),
-            "RegisterMemoryRegion(stage)");
-        mStageMrRegistered = true;
-        mStageKey = {};
-        mStageMr.GetMemoryKey(mStageKey);
-        if (mStageMr.GetAddress() != reinterpret_cast<uintptr_t>(mStage.Data()) || mStageMr.GetSize() < mStage.Size()) {
-            throw std::runtime_error("stage MR does not cover the supplied staging allocation");
+        RequireOk(mService->RegisterMemoryRegion(
+                      reinterpret_cast<uintptr_t>(mDestination.Data()), mDestination.Size(), mDestinationMr),
+            "RegisterMemoryRegion(destination)");
+        mDestinationMrRegistered = true;
+        mDestinationKey = {};
+        mDestinationMr.GetMemoryKey(mDestinationKey);
+        if (mDestinationMr.GetAddress() != reinterpret_cast<uintptr_t>(mDestination.Data()) ||
+            mDestinationMr.GetSize() < mDestination.Size()) {
+            throw std::runtime_error("destination MR does not cover the supplied destination allocation");
         }
     }
 
@@ -989,24 +937,24 @@ private:
         RequireOk(channel->Call(request, response, nullptr), "HELLO Call");
         ReadyInfo ready{};
         if (!DecodeReady(response.address, response.size, ready) || !SameParams(mParams, ready.params) ||
-            ready.stageAddress == 0 || ready.stageBytes != kPayloadBytes) {
+            ready.destinationAddress == 0 || ready.destinationBytes != kDestinationBytes) {
             throw std::runtime_error("invalid READY response");
         }
-        mPeerStageAddress = static_cast<uintptr_t>(ready.stageAddress);
-        mPeerStageKey = ready.stageKey;
+        mPeerDestinationAddress = static_cast<uintptr_t>(ready.destinationAddress);
+        mPeerDestinationKey = ready.destinationKey;
     }
 
     void BuildPutRequests()
     {
-        if (mPeerStageAddress == 0) {
+        if (mPeerDestinationAddress == 0) {
             throw std::runtime_error("cannot prepare Put descriptors without READY");
         }
         for (uint32_t block = 0; block < kBlocks; ++block) {
             UBSHcomOneSideRequest &request = mPutRequests[block];
             request.lAddress = reinterpret_cast<uintptr_t>(mSource.Data()) + static_cast<uintptr_t>(block) * kStrideBytes;
-            request.rAddress = mPeerStageAddress + static_cast<uintptr_t>(block) * kBlockBytes;
+            request.rAddress = mPeerDestinationAddress + static_cast<uintptr_t>(block) * kStrideBytes;
             request.lKey = mSourceKey;
-            request.rKey = mPeerStageKey;
+            request.rKey = mPeerDestinationKey;
             request.size = kBlockBytes;
         }
     }
@@ -1021,8 +969,8 @@ private:
         switch (context.OpCode()) {
             case kOpHello:
                 return OnHello(context);
-            case kOpDataReady:
-                return OnDataReady(context);
+            case kOpRoundReady:
+                return OnRoundReady(context);
             case kOpRoundAck:
                 return OnRoundAck(context);
             case kOpFinish:
@@ -1048,9 +996,9 @@ private:
         }
         ReadyInfo ready{};
         ready.params = mParams;
-        ready.stageAddress = reinterpret_cast<uintptr_t>(mStage.Data());
-        ready.stageBytes = mStage.Size();
-        ready.stageKey = mStageKey;
+        ready.destinationAddress = reinterpret_cast<uintptr_t>(mDestination.Data());
+        ready.destinationBytes = mDestination.Size();
+        ready.destinationKey = mDestinationKey;
         mReadyPayload = EncodeReady(ready);
         Callback *callback = NewSendCallback();
         if (callback == nullptr) {
@@ -1070,29 +1018,26 @@ private:
         return 0;
     }
 
-    int OnDataReady(UBSHcomServiceContext &context) noexcept
+    int OnRoundReady(UBSHcomServiceContext &context) noexcept
     {
         if (mOptions.role != Role::Receiver) {
-            RecordFailure("sender received DATA_READY");
+            RecordFailure("sender received ROUND_READY");
             return -1;
         }
-        Notice notice{};
-        if (!DecodeNotice(context.MessageData(), context.MessageDataLen(), notice) || notice.rail != 0 ||
-            notice.chunkId >= kChunks || notice.itemCount != kChunkItems ||
-            notice.byteCount != kChunkItems * kBlockBytes || notice.generation == 0) {
-            RecordFailure("invalid DATA_READY payload");
+        uint64_t generation = 0;
+        if (!DecodeAck(context.MessageData(), context.MessageDataLen(), kRoundReadyMagic, generation) || generation == 0) {
+            RecordFailure("invalid ROUND_READY payload");
             return -1;
         }
-        uint64_t expected = mReadyGeneration[notice.chunkId].load(std::memory_order_relaxed);
-        if (notice.generation != expected + 1) {
-            RecordFailure("DATA_READY generation is not strictly increasing for chunk " +
-                std::to_string(notice.chunkId));
+        const uint64_t previous = mRoundReadyGeneration.load(std::memory_order_relaxed);
+        if (generation != previous + 1) {
+            RecordFailure("ROUND_READY generation is not strictly increasing");
             return -1;
         }
-        // A successful SEND completion on this same QP publishes preceding WRITE
-        // data.  The release store only publishes that ready state to the app
-        // scatter thread; it is not used as a substitute for RDMA DMA ordering.
-        mReadyGeneration[notice.chunkId].store(notice.generation, std::memory_order_release);
+        // A successful SEND on this QP follows all 600 direct WRITE requests.
+        // The release store only publishes that complete-round state to the app
+        // thread; it is not a substitute for RDMA DMA ordering.
+        mRoundReadyGeneration.store(generation, std::memory_order_release);
         return 0;
     }
 
@@ -1208,26 +1153,22 @@ private:
             throw std::runtime_error("sender lost its channel before a round");
         }
         const uint64_t expectedData = mExpectedDataCallbacks.load(std::memory_order_relaxed) + kBlocks;
-        const uint64_t expectedSend = mExpectedSendCallbacks.load(std::memory_order_relaxed) + kChunks;
+        const uint64_t expectedSend = mExpectedSendCallbacks.load(std::memory_order_relaxed) + 1;
         const uint64_t startNs = NowNs();
 
-        for (uint32_t chunk = 0; chunk < kChunks; ++chunk) {
-            const uint32_t begin = chunk * kChunkItems;
-            for (uint32_t item = 0; item < kChunkItems; ++item) {
-                Callback *callback = NewDataCallback();
-                if (callback == nullptr) {
-                    throw std::runtime_error("unable to allocate Put callback");
-                }
-                mExpectedDataCallbacks.fetch_add(1, std::memory_order_relaxed);
-                const int rc = channel->Put(mPutRequests[begin + item], callback);
-                if (rc != 0) {
-                    throw std::runtime_error("Put failed: " + std::to_string(rc));
-                }
+        for (uint32_t block = 0; block < kBlocks; ++block) {
+            Callback *callback = NewDataCallback();
+            if (callback == nullptr) {
+                throw std::runtime_error("unable to allocate Put callback");
             }
-            const Notice notice{generation, chunk, kChunkItems * kBlockBytes, 0, kChunkItems};
-            mNoticePayloads[chunk] = EncodeNotice(notice);
-            PostAsyncSend(channel, mNoticePayloads[chunk].data(), mNoticePayloads[chunk].size(), kOpDataReady);
+            mExpectedDataCallbacks.fetch_add(1, std::memory_order_relaxed);
+            const int rc = channel->Put(mPutRequests[block], callback);
+            if (rc != 0) {
+                throw std::runtime_error("Put failed: " + std::to_string(rc));
+            }
         }
+        mRoundReadyPayload = EncodeAck(kRoundReadyMagic, generation);
+        PostAsyncSend(channel, mRoundReadyPayload.data(), mRoundReadyPayload.size(), kOpRoundReady);
         const uint64_t submitNs = NowNs();
         WaitUntil("round completion", [this, generation, expectedData, expectedSend] {
             return mAckGeneration.load(std::memory_order_acquire) >= generation &&
@@ -1244,11 +1185,11 @@ private:
     void RunReceiver()
     {
         for (uint64_t generation = 1; generation <= mParams.TotalRounds(); ++generation) {
-            for (uint32_t chunk = 0; chunk < kChunks; ++chunk) {
-                WaitUntil("DATA_READY", [this, chunk, generation] {
-                    return mReadyGeneration[chunk].load(std::memory_order_acquire) >= generation;
-                });
-                ScatterChunk(generation, chunk);
+            WaitUntil("ROUND_READY", [this, generation] {
+                return mRoundReadyGeneration.load(std::memory_order_acquire) >= generation;
+            });
+            if (generation <= mParams.verifyRounds) {
+                VerifyReceiverDestination(generation);
             }
             SendRoundAck(generation);
         }
@@ -1261,19 +1202,13 @@ private:
         SendFinishAck();
     }
 
-    void ScatterChunk(uint64_t generation, uint32_t chunk)
+    void VerifyReceiverDestination(uint64_t generation)
     {
-        const uint32_t begin = chunk * kChunkItems;
-        for (uint32_t item = 0; item < kChunkItems; ++item) {
-            const uint32_t block = begin + item;
-            uint8_t *destination = mDestination.Data() + static_cast<size_t>(block) * kStrideBytes;
-            const uint8_t *source = mStage.Data() + static_cast<size_t>(block) * kBlockBytes;
-            std::memcpy(destination, source, kBlockBytes);
-            if (generation <= mParams.verifyRounds) {
-                std::string error;
-                if (!VerifyBlock(destination, generation, block, error) || !VerifyGap(destination, error)) {
-                    throw std::runtime_error(error);
-                }
+        for (uint32_t block = 0; block < kBlocks; ++block) {
+            const uint8_t *destination = mDestination.Data() + static_cast<size_t>(block) * kStrideBytes;
+            std::string error;
+            if (!VerifyBlock(destination, generation, block, error) || !VerifyGap(destination, error)) {
+                throw std::runtime_error(error);
             }
         }
     }
@@ -1469,9 +1404,9 @@ private:
         if (mService != nullptr && channel != nullptr) {
             mService->Disconnect(channel);
         }
-        if (mService != nullptr && mStageMrRegistered) {
-            mService->DestroyMemoryRegion(mStageMr);
-            mStageMrRegistered = false;
+        if (mService != nullptr && mDestinationMrRegistered) {
+            mService->DestroyMemoryRegion(mDestinationMr);
+            mDestinationMrRegistered = false;
         }
         if (mService != nullptr && mSourceMrRegistered) {
             mService->DestroyMemoryRegion(mSourceMr);
@@ -1490,8 +1425,8 @@ private:
         output << "{\"case\":\"B1\",\"status\":\"ok\",\"commit\":\"" << RDMA_600_GIT_COMMIT
                << "\",\"role\":\"sender\",\"kind\":\"" << KindName(mOptions.kind)
                << "\",\"links\":1,\"blocks\":600,\"block_bytes\":1024,\"payload_bytes\":614400"
-               << ",\"mode\":\"plain\",\"chunk_items\":30,\"scatter\":\"pipeline\",\"notify\":\"send\""
-               << ",\"rounds_in_flight\":1,\"data_wr_per_round\":600,\"notify_wr_per_round\":20"
+               << ",\"mode\":\"plain\",\"remote_layout\":\"direct-stride-4096\",\"tls_enabled\":false"
+               << ",\"rounds_in_flight\":1,\"data_wr_per_round\":600,\"round_ready_wr_per_round\":1"
                << ",\"ack_wr_per_round\":1,\"verify_passed\":true";
         if (mOptions.kind == RunKind::Verify) {
             output << ",\"measure_rounds\":0,\"submit_p50_us\":null,\"e2e_p50_us\":null"
@@ -1527,27 +1462,26 @@ private:
     std::string mError;
 
     AlignedBuffer mSource;
-    AlignedBuffer mStage;
     AlignedBuffer mDestination;
     UBSHcomRegMemoryRegion mSourceMr;
-    UBSHcomRegMemoryRegion mStageMr;
+    UBSHcomRegMemoryRegion mDestinationMr;
     bool mSourceMrRegistered = false;
-    bool mStageMrRegistered = false;
+    bool mDestinationMrRegistered = false;
     UBSHcomMemoryKey mSourceKey{};
-    UBSHcomMemoryKey mStageKey{};
-    UBSHcomMemoryKey mPeerStageKey{};
-    uintptr_t mPeerStageAddress = 0;
+    UBSHcomMemoryKey mDestinationKey{};
+    UBSHcomMemoryKey mPeerDestinationKey{};
+    uintptr_t mPeerDestinationAddress = 0;
 
     std::array<UBSHcomOneSideRequest, kBlocks> mPutRequests{};
-    std::array<std::array<uint8_t, kNoticeWireBytes>, kChunks> mNoticePayloads{};
     std::array<uint8_t, kHelloWireBytes> mHelloPayload{};
     std::array<uint8_t, kReadyWireBytes> mReadyPayload{};
     std::array<uint8_t, kReadyWireBytes> mReadyResponse{};
+    std::array<uint8_t, kAckWireBytes> mRoundReadyPayload{};
     std::array<uint8_t, kAckWireBytes> mAckPayload{};
     std::array<uint8_t, kFinishWireBytes> mFinishPayload{};
     std::array<uint8_t, kFinishWireBytes> mFinishAckPayload{};
 
-    std::array<std::atomic<uint64_t>, kChunks> mReadyGeneration;
+    std::atomic<uint64_t> mRoundReadyGeneration{0};
     std::atomic<uint64_t> mAckGeneration{0};
     std::atomic<uint64_t> mFinishGeneration{0};
     std::atomic<uint64_t> mFinishAckGeneration{0};
