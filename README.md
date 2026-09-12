@@ -1,4 +1,4 @@
-# RDMA 600 × 1 KiB — 阶段 2 direct B1/B2
+# RDMA 600 × 1 KiB — 阶段 2 direct B1/B2（固定 rail 线程）
 
 本目录实现同一二进制下的 direct 单链接 B1 与双链接 B2。它基于 ubs-comm
 `oneside-msge-merge` / `9e4c035a5d68ccca02d05fade3b6f5907db24ef4` 的公共 service API；
@@ -21,11 +21,15 @@ B1/B2 比较只改变链接数，不能拿旧未优化 B1 与当前 B2 比较。
 - B2：每端两个独立 service，各自 `SetDeviceIpMask(<nic-ip>/32)`，各一个 worker 和
   `linkCount=1` channel/QP；内建 multirail 在每个 service 上关闭。rail0/rail1 各负责
   300 块，global block id 为 `rail*300 + local_id`。
-- 一个应用提交线程按 `Put(rail0,i), Put(rail1,i)` 交替投递。每 rail 的全部数据 Put
-  提交后，在同一 rail 的 QP 上追加一个 `ROUND_READY`。
-- receiver 应用线程独立观察每 rail ready；某 rail 到达后即可校验（verify）并投递该 rail
-  ACK，不等待另一 rail，也不等待 rail0 ACK 本地完成才处理 rail1。整轮仍须等两 rail ACK、
-  数据 callback 和 ready Send callback 后才能复用缓冲。
+- B1 保持一个应用线程。B2 使用两个从启动到 drain 都常驻的应用线程：主线程固定只操作
+  rail0/service0，第二线程固定只操作 rail1/service1；两线程同时各投递 300 个 Put，随后在
+  自己的 QP 上追加 `ROUND_READY`。不在每轮创建线程。
+- B2 receiver 同样由两个固定 rail 线程分别观察 ready、校验（verify）并通过自己的 service
+  投递 ACK；任一 rail 不等待另一 rail。整轮仍须等两 rail ACK、数据 callback 和 ready Send
+  callback 后才能复用缓冲。
+- 固定线程是针对当前 HCOM `thread_local` pool 亲和假设的快速性能穿刺方案。HCOM 源码同时
+  明示上层应禁止两个同协议 Service 并存，因此本用例必须标记为诊断实现，而非受支持的最终
+  产品架构；后续正式方案应在单 Service 下增加“小请求整包选 rail”能力并修复 pool key。
 - verify 每轮检查全部 word 与 stride gap；warmup/measure 不逐轮扫描，结束后完整检查最终
   destination，再在每 rail 上完成 FINISH/FINISH_ACK drain。
 - generation 从 1 开始，跨 verify/warmup/measure/trace 单调递增。协议版本为 3，双方必须
@@ -63,7 +67,7 @@ HELLO/READY/token 编解码和 rail 字段；它不建立 RDMA 连接，不能�
 
 - sender/receiver 的 `rdma_ips[0]` 与 `[1]`，每个地址分别属于预期的不同 RDMA NIC；
 - receiver 可从 sender 到达的 OOB IP，以及两个不同 OOB TCP 端口；
-- 每端一个 app CPU 和两个不同 worker CPU，app CPU 不得与任一 worker 重合；
+- B2 每端两个不同 app CPU 和两个不同 worker CPU；任一 app CPU 不得与任一 worker 重合；
 - 两端本机的 `binary` 和 `library_dirs` 绝对 Linux 路径。
 
 OOB IP 不要求是 RDMA IP。程序用 `/32` 过滤绑定 RDMA 设备，并拒绝 B2 中重复的 RDMA IP、
@@ -72,7 +76,8 @@ OOB IP 不要求是 RDMA IP。程序用 `/32` 过滤绑定 RDMA 设备，并拒�
 ## 手工运行
 
 以下示例先启动 receiver。逗号分隔列表按 rail0、rail1 对应；B1 可继续使用单值别名
-`--rdma-ip` 和 `--worker-cpu`。
+`--rdma-ip`、`--app-cpu` 和 `--worker-cpu`。B2 必须使用 `--app-cpus` 为两个固定 rail
+线程提供不同 CPU。
 
 若 `libboundscheck` 等依赖不在系统搜索路径，两端先按各自实际安装位置设置并核验：
 
@@ -87,7 +92,8 @@ ldd ./build/rdma_600
   --rdma-ips <receiver_nic0_ip>,<receiver_nic1_ip> \
   --listen <receiver_oob_ip>:19000,<receiver_oob_ip>:19001 \
   --kind verify --verify-rounds 20 --warmup 0 --rounds 0 \
-  --timeout-sec 10 --app-cpu <app_cpu> --worker-cpus <cq0_cpu>,<cq1_cpu> \
+  --timeout-sec 10 --app-cpus <rail0_app_cpu>,<rail1_app_cpu> \
+  --worker-cpus <cq0_cpu>,<cq1_cpu> \
   --links 2 --mode plain
 
 # sender / B2 verify（receiver 输出 LISTENING 后）
@@ -95,7 +101,8 @@ ldd ./build/rdma_600
   --rdma-ips <sender_nic0_ip>,<sender_nic1_ip> \
   --peer <receiver_oob_ip>:19000,<receiver_oob_ip>:19001 \
   --kind verify --verify-rounds 20 --warmup 0 --rounds 0 \
-  --timeout-sec 10 --app-cpu <app_cpu> --worker-cpus <cq0_cpu>,<cq1_cpu> \
+  --timeout-sec 10 --app-cpus <rail0_app_cpu>,<rail1_app_cpu> \
+  --worker-cpus <cq0_cpu>,<cq1_cpu> \
   --links 2 --mode plain
 ```
 
@@ -126,8 +133,8 @@ host_role, case, generation, rail, event, timestamp_ns
 
 全局 sender 事件 `S0/S1/S2` 的 `rail` 为 `null`；每 rail 事件为数字。事件定义：
 
-- `S0`：本轮首个数据 API 前；`S_post[r]`：该 rail 数据和 ROUND_READY API 都成功返回；
-  `S1`：最后一个 ROUND_READY API 成功返回。
+- `S0`：主线程发布本轮命令前；`S_post[r]`：该 rail 固定线程的数据和 ROUND_READY API 都
+  成功返回；`S1=max(S_post[r])`，表示最后一个 rail 完成提交的时刻。
 - `S_data[r]`：该 rail 最后一个数据 API 的成功 callback；`S_ack[r]`：收到且验证该 rail ACK；
   `S2`：两 rail ACK、本地数据和 Send 完成都满足。
 - `R_ready[r]`：callback 验证 ready 后、release 发布 ready 前；`R_ack[r]`：receiver 应用线程调用
@@ -141,7 +148,8 @@ host_role, case, generation, rail, event, timestamp_ns
 ## B1/B2 正式比较与硬件证据
 
 用同一二进制、相同配置和相同阶段 1.5 A+B 实现，trace 关闭，B1/B2 各跑 5 次并交替顺序，下一 repeat
-反转先后。保存原始 e2e p50/p95/p99、submit p50、有效 GB/s、CPU 使用量、网卡/MTU/NUMA/绑核、
+反转先后。B1 是一个提交线程，B2 是两个提交线程，当前结果只能作为小包双 rail 快速穿刺，不能将
+全部差异归因于第二张 NIC。保存原始 e2e p50/p95/p99、submit p50、有效 GB/s、CPU 使用量、网卡/MTU/NUMA/绑核、
 构建与 HCOM 静态库 hash。聚合规则固定为各 run 指标的中位数：
 
 结果 JSON 的 `commit` 来自构建时源码 HEAD；存在未提交的 tracked diff 时会带 `-dirty`。它不能替代

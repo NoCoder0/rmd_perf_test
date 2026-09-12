@@ -125,7 +125,7 @@ struct Options {
     uint32_t measureRounds = 10000;
     uint32_t traceRounds = 0;
     uint32_t timeoutSec = 10;
-    int appCpu = -1;
+    std::vector<int> appCpus;
     std::vector<int> workerCpus;
     bool selfTest = false;
 };
@@ -529,10 +529,11 @@ void PrintUsage(std::ostream &stream)
            << "  rdma_600 --role sender --rdma-ips <ip0[,ip1]> --peer <ep0[,ep1]> [options]\n"
            << "  rdma_600 --self-test\n\n"
            << "Stage 2 direct cases: --links 1 (B1) or --links 2 (B2), --mode plain.\n"
-           << "Singular --rdma-ip/--worker-cpu remain aliases for links=1.\n"
+           << "Singular --rdma-ip/--app-cpu/--worker-cpu remain aliases for links=1.\n"
            << "Options: --kind verify|measure|trace --verify-rounds N --warmup N --rounds N\n"
-           << "         --trace-rounds N (1..64 for trace) --timeout-sec N --app-cpu N\n"
-           << "         --worker-cpus <cpu0[,cpu1]>\n";
+           << "         --trace-rounds N (1..64 for trace) --timeout-sec N\n"
+           << "         --app-cpus <cpu0[,cpu1]> --worker-cpus <cpu0[,cpu1]>\n"
+           << "B2 uses two persistent rail-affine application threads; each app CPU must be distinct.\n";
 }
 
 Options ParseOptions(int argc, char **argv)
@@ -567,10 +568,10 @@ Options ParseOptions(int argc, char **argv)
         return options;
     }
 
-    static const std::array<std::string, 16> kAllowedOptions = {
+    static const std::array<std::string, 17> kAllowedOptions = {
         "--role", "--rdma-ip", "--rdma-ips", "--listen", "--peer", "--kind", "--verify-rounds", "--warmup",
-        "--rounds", "--trace-rounds", "--timeout-sec", "--app-cpu", "--worker-cpu", "--worker-cpus", "--links",
-        "--mode"};
+        "--rounds", "--trace-rounds", "--timeout-sec", "--app-cpu", "--app-cpus", "--worker-cpu",
+        "--worker-cpus", "--links", "--mode"};
     for (const auto &entry : values) {
         if (std::find(kAllowedOptions.begin(), kAllowedOptions.end(), entry.first) == kAllowedOptions.end()) {
             throw std::runtime_error("unknown option: " + entry.first);
@@ -629,13 +630,27 @@ Options ParseOptions(int argc, char **argv)
         options.workerCpus = {ParseSignedCpu("--worker-cpu", optional("--worker-cpu", "-1"))};
     }
 
+    if (values.count("--app-cpu") != 0 && values.count("--app-cpus") != 0) {
+        throw std::runtime_error("use only one of --app-cpu and --app-cpus");
+    }
+    if (values.count("--app-cpus") != 0) {
+        options.appCpus = ParseCpuCsv("--app-cpus", values.at("--app-cpus"));
+    } else if (options.links == 1) {
+        options.appCpus = {ParseSignedCpu("--app-cpu", optional("--app-cpu", "-1"))};
+    } else if (values.count("--app-cpu") != 0) {
+        throw std::runtime_error("B2 requires --app-cpus with one fixed application CPU per rail");
+    } else {
+        options.appCpus.assign(options.links, -1);
+    }
+
     if (options.rdmaIps.size() != options.links || options.endpoints.size() != options.links ||
-        options.workerCpus.size() != options.links) {
-        throw std::runtime_error("RDMA IP, OOB endpoint, and worker CPU counts must all equal --links");
+        options.appCpus.size() != options.links || options.workerCpus.size() != options.links) {
+        throw std::runtime_error("RDMA IP, OOB endpoint, app CPU, and worker CPU counts must all equal --links");
     }
     if (options.links == 2 && (options.rdmaIps[0] == options.rdmaIps[1] ||
-            options.endpoints[0] == options.endpoints[1] || options.workerCpus[0] == options.workerCpus[1])) {
-        throw std::runtime_error("B2 requires two distinct RDMA IPs, OOB endpoints, and worker CPUs");
+            options.endpoints[0] == options.endpoints[1] || options.appCpus[0] == options.appCpus[1] ||
+            options.workerCpus[0] == options.workerCpus[1])) {
+        throw std::runtime_error("B2 requires two distinct RDMA IPs, OOB endpoints, app CPUs, and worker CPUs");
     }
 
     const std::string kind = optional("--kind", "measure");
@@ -657,17 +672,17 @@ Options ParseOptions(int argc, char **argv)
     options.traceRounds = static_cast<uint32_t>(ParseUnsigned("--trace-rounds", optional("--trace-rounds", "0"),
         kMaxTraceRounds));
     options.timeoutSec = static_cast<uint32_t>(ParseUnsigned("--timeout-sec", optional("--timeout-sec", "10"), 32767));
-    options.appCpu = ParseSignedCpu("--app-cpu", optional("--app-cpu", "-1"));
-
     if (options.verifyRounds == 0) {
         throw std::runtime_error("--verify-rounds must be greater than zero");
     }
     if (options.timeoutSec == 0) {
         throw std::runtime_error("--timeout-sec must be greater than zero");
     }
-    for (int workerCpu : options.workerCpus) {
-        if (options.appCpu >= 0 && options.appCpu == workerCpu) {
-            throw std::runtime_error("--app-cpu must differ from every worker CPU");
+    for (int appCpu : options.appCpus) {
+        for (int workerCpu : options.workerCpus) {
+            if (appCpu >= 0 && appCpu == workerCpu) {
+                throw std::runtime_error("every app CPU must differ from every worker CPU");
+            }
         }
     }
     if (options.kind == RunKind::Verify) {
@@ -693,8 +708,8 @@ Options ParseOptions(int argc, char **argv)
         }
     }
     if (options.kind == RunKind::Measure &&
-        (options.appCpu < 0 || std::any_of(options.workerCpus.begin(), options.workerCpus.end(),
-            [](int cpu) { return cpu < 0; }))) {
+        (std::any_of(options.appCpus.begin(), options.appCpus.end(), [](int cpu) { return cpu < 0; }) ||
+            std::any_of(options.workerCpus.begin(), options.workerCpus.end(), [](int cpu) { return cpu < 0; }))) {
         throw std::runtime_error(
             "stage-1.5 measure requires explicit app and per-rail worker CPUs for pinned busy polling");
     }
@@ -885,9 +900,10 @@ private:
     std::atomic<uint64_t> &mCounter;
 };
 
-// Application-thread attempted counters stay ordinary; callback threads never
-// read or write them. Callback-owned counters remain atomic and separated onto
-// another cache line. The same layout is used by B1 and every B2 rail.
+// Each rail's attempted counters are owned by its fixed application thread.
+// The coordinator reads them only after the rail command's release/acquire
+// completion edge; callback threads never read or write them. Callback-owned
+// counters remain atomic and separated onto another cache line.
 struct alignas(kCounterAlignment) AppOwnedCounters {
     uint64_t attemptedDataCallbacks = 0;
     uint64_t attemptedSendCallbacks = 0;
@@ -926,6 +942,30 @@ struct RailState {
     CallbackOwnedCounters callbackCounters;
 };
 
+enum class RailCommand : uint8_t {
+    None,
+    ConnectAndHandshake,
+    SubmitRound,
+    RunReceiver,
+    SendFinish,
+};
+
+// B2 keeps rail 0 on the original application thread and gives rail 1 one
+// persistent application thread. A release/acquire command sequence publishes
+// all command arguments and makes command-side counter writes visible before
+// the coordinator consumes them. No HCOM operation is dispatched through a
+// transient thread.
+struct alignas(kCounterAlignment) SecondaryRailExecutor {
+    std::thread thread;
+    std::atomic<bool> started{false};
+    std::atomic<bool> stop{false};
+    std::atomic<uint64_t> issued{0};
+    std::atomic<uint64_t> completed{0};
+    std::atomic<RailCommand> command{RailCommand::None};
+    std::atomic<uint64_t> generation{0};
+    std::atomic<uint64_t> submitEndNs{0};
+};
+
 class DirectBenchmark {
 public:
     explicit DirectBenchmark(Options options) : mOptions(std::move(options))
@@ -947,9 +987,10 @@ public:
     int Run()
     {
         try {
-            PinCurrentThread(mOptions.appCpu);
+            PinCurrentThread(mOptions.appCpus[0]);
             SetupServices();
             SetupMemory();
+            StartSecondaryRailThread();
             if (mOptions.role == Role::Receiver) {
                 mReceiverReady.store(true, std::memory_order_release);
                 PrintListening();
@@ -965,6 +1006,7 @@ public:
             if (!DrainUntilComplete()) {
                 throw std::runtime_error("completion counters did not drain before teardown");
             }
+            StopSecondaryRailThread();
             if (TraceEnabled()) {
                 EmitTrace();
             }
@@ -976,6 +1018,7 @@ public:
         } catch (const std::exception &error) {
             RecordFailure(error.what());
             std::cerr << "ERROR: " << error.what() << std::endl;
+            StopSecondaryRailThread();
             if (!DrainUntilComplete()) {
                 std::cerr << "FATAL: callbacks did not drain before the deadline; exiting without unsafe teardown"
                           << std::endl;
@@ -1017,6 +1060,91 @@ private:
             return;
         }
         point.Publish(timestamp);
+    }
+
+    void StartSecondaryRailThread()
+    {
+        if (mOptions.links != 2) {
+            return;
+        }
+        mSecondary.thread = std::thread([this] { SecondaryRailThreadMain(); });
+        WaitControl("secondary rail application thread startup", [this] {
+            return mSecondary.started.load(std::memory_order_acquire);
+        });
+    }
+
+    void SecondaryRailThreadMain() noexcept
+    {
+        try {
+            PinCurrentThread(mOptions.appCpus[1]);
+            mSecondary.started.store(true, std::memory_order_release);
+            uint64_t seen = 0;
+            while (!mSecondary.stop.load(std::memory_order_acquire)) {
+                const uint64_t issued = mSecondary.issued.load(std::memory_order_acquire);
+                if (issued == seen) {
+                    CpuRelax();
+                    continue;
+                }
+                const RailCommand command = mSecondary.command.load(std::memory_order_relaxed);
+                const uint64_t generation = mSecondary.generation.load(std::memory_order_relaxed);
+                switch (command) {
+                    case RailCommand::ConnectAndHandshake:
+                        ConnectAndHandshakeRail(1);
+                        break;
+                    case RailCommand::SubmitRound:
+                        mSecondary.submitEndNs.store(SubmitRailRound(1, generation), std::memory_order_relaxed);
+                        break;
+                    case RailCommand::RunReceiver:
+                        RunReceiverRail(1);
+                        break;
+                    case RailCommand::SendFinish:
+                        SendFinishRail(1);
+                        break;
+                    case RailCommand::None:
+                        throw std::runtime_error("secondary rail received an empty command");
+                }
+                seen = issued;
+                mSecondary.completed.store(seen, std::memory_order_release);
+            }
+        } catch (const std::exception &error) {
+            mSecondary.started.store(true, std::memory_order_release);
+            RecordFailure(std::string("rail 1 application thread: ") + error.what());
+        } catch (...) {
+            mSecondary.started.store(true, std::memory_order_release);
+            RecordFailure("rail 1 application thread: unknown exception");
+        }
+    }
+
+    uint64_t IssueSecondaryRailCommand(RailCommand command, uint64_t generation = 0)
+    {
+        if (mOptions.links != 2 || !mSecondary.thread.joinable()) {
+            throw std::runtime_error("secondary rail command issued without its persistent thread");
+        }
+        const uint64_t previous = mSecondary.issued.load(std::memory_order_relaxed);
+        if (mSecondary.completed.load(std::memory_order_acquire) != previous) {
+            throw std::runtime_error("secondary rail already has an outstanding command");
+        }
+        mSecondary.generation.store(generation, std::memory_order_relaxed);
+        mSecondary.command.store(command, std::memory_order_relaxed);
+        const uint64_t sequence = previous + 1;
+        mSecondary.issued.store(sequence, std::memory_order_release);
+        return sequence;
+    }
+
+    void WaitSecondaryRailCommand(uint64_t sequence, const char *what)
+    {
+        WaitData(what, [this, sequence] {
+            return mSecondary.completed.load(std::memory_order_acquire) >= sequence;
+        });
+    }
+
+    void StopSecondaryRailThread() noexcept
+    {
+        if (!mSecondary.thread.joinable()) {
+            return;
+        }
+        mSecondary.stop.store(true, std::memory_order_release);
+        mSecondary.thread.join();
     }
 
     void SetupServices()
@@ -1165,50 +1293,75 @@ private:
 
     void ConnectSender()
     {
-        for (uint16_t rail = 0; rail < mOptions.links; ++rail) {
-            UBSHcomConnectOptions options{};
-            options.linkCount = 1;
-            options.mode = UBSHcomClientPollingMode::WORKER_POLL;
-            options.cbType = UBSHcomChannelCallBackType::CHANNEL_FUNC_CB;
-            UBSHcomChannelPtr channel;
-            RequireOk(mRails[rail].service->Connect("tcp://" + mOptions.endpoints[rail], channel, options),
-                ("Connect rail " + std::to_string(rail)).c_str());
-            if (channel == nullptr) {
-                throw std::runtime_error("Connect succeeded without a channel on rail " + std::to_string(rail));
-            }
-            if (!ConfigureChannel(rail, channel)) {
-                CheckFatal("ConfigureChannel after Connect");
-                throw std::runtime_error("ConfigureChannel failed after Connect");
-            }
-            {
-                std::lock_guard<std::mutex> lock(mChannelsMutex);
-                mRails[rail].channel = channel;
-            }
+        if (mOptions.links == 1) {
+            ConnectRail(0);
+            return;
         }
+        const uint64_t sequence = IssueSecondaryRailCommand(RailCommand::ConnectAndHandshake);
+        ConnectRail(0);
+        HandshakeRail(0);
+        WaitSecondaryRailCommand(sequence, "rail 1 connect and HELLO handshake");
         mChannelCv.notify_all();
     }
 
     void Handshake()
     {
-        const uint64_t expectedBytes = static_cast<uint64_t>(mBlocksPerRail) * kStrideBytes;
-        for (uint16_t rail = 0; rail < mOptions.links; ++rail) {
-            RailState &state = mRails[rail];
-            const UBSHcomChannelPtr channel = ChannelCopy(rail);
-            if (channel == nullptr) {
-                throw std::runtime_error("HELLO without a connected channel on rail " + std::to_string(rail));
-            }
-            state.helloPayload = EncodeHello(mParams, rail);
-            UBSHcomRequest request(state.helloPayload.data(), static_cast<uint32_t>(state.helloPayload.size()), kOpHello);
-            UBSHcomResponse response(state.readyResponse.data(), static_cast<uint32_t>(state.readyResponse.size()));
-            RequireOk(channel->Call(request, response, nullptr), ("HELLO Call rail " + std::to_string(rail)).c_str());
-            ReadyInfo ready{};
-            if (!DecodeReady(response.address, response.size, ready) || !SameParams(mParams, ready.params) ||
-                ready.rail != rail || ready.destinationAddress == 0 || ready.destinationBytes != expectedBytes) {
-                throw std::runtime_error("invalid READY response on rail " + std::to_string(rail));
-            }
-            state.peerDestinationAddress = static_cast<uintptr_t>(ready.destinationAddress);
-            state.peerDestinationKey = ready.destinationKey;
+        if (mOptions.links == 2) {
+            // B2 handshakes were completed by their fixed rail threads in
+            // ConnectSender(). Keeping this call makes the B1/B2 outer flow
+            // identical without letting rail 0 touch service 1.
+            return;
         }
+        HandshakeRail(0);
+    }
+
+    void ConnectRail(uint16_t rail)
+    {
+        UBSHcomConnectOptions options{};
+        options.linkCount = 1;
+        options.mode = UBSHcomClientPollingMode::WORKER_POLL;
+        options.cbType = UBSHcomChannelCallBackType::CHANNEL_FUNC_CB;
+        UBSHcomChannelPtr channel;
+        RequireOk(mRails[rail].service->Connect("tcp://" + mOptions.endpoints[rail], channel, options),
+            ("Connect rail " + std::to_string(rail)).c_str());
+        if (channel == nullptr) {
+            throw std::runtime_error("Connect succeeded without a channel on rail " + std::to_string(rail));
+        }
+        if (!ConfigureChannel(rail, channel)) {
+            CheckFatal("ConfigureChannel after Connect");
+            throw std::runtime_error("ConfigureChannel failed after Connect");
+        }
+        {
+            std::lock_guard<std::mutex> lock(mChannelsMutex);
+            mRails[rail].channel = channel;
+        }
+    }
+
+    void ConnectAndHandshakeRail(uint16_t rail)
+    {
+        ConnectRail(rail);
+        HandshakeRail(rail);
+    }
+
+    void HandshakeRail(uint16_t rail)
+    {
+        const uint64_t expectedBytes = static_cast<uint64_t>(mBlocksPerRail) * kStrideBytes;
+        RailState &state = mRails[rail];
+        const UBSHcomChannelPtr channel = ChannelCopy(rail);
+        if (channel == nullptr) {
+            throw std::runtime_error("HELLO without a connected channel on rail " + std::to_string(rail));
+        }
+        state.helloPayload = EncodeHello(mParams, rail);
+        UBSHcomRequest request(state.helloPayload.data(), static_cast<uint32_t>(state.helloPayload.size()), kOpHello);
+        UBSHcomResponse response(state.readyResponse.data(), static_cast<uint32_t>(state.readyResponse.size()));
+        RequireOk(channel->Call(request, response, nullptr), ("HELLO Call rail " + std::to_string(rail)).c_str());
+        ReadyInfo ready{};
+        if (!DecodeReady(response.address, response.size, ready) || !SameParams(mParams, ready.params) ||
+            ready.rail != rail || ready.destinationAddress == 0 || ready.destinationBytes != expectedBytes) {
+            throw std::runtime_error("invalid READY response on rail " + std::to_string(rail));
+        }
+        state.peerDestinationAddress = static_cast<uintptr_t>(ready.destinationAddress);
+        state.peerDestinationKey = ready.destinationKey;
     }
 
     void BuildPutRequests()
@@ -1472,12 +1625,10 @@ private:
 
     void RunSenderRound(uint64_t generation, bool measure)
     {
-        std::array<UBSHcomChannelPtr, kMaxLinks> channels;
         std::array<uint64_t, kMaxLinks> expectedData{};
         std::array<uint64_t, kMaxLinks> expectedSend{};
         for (uint16_t rail = 0; rail < mOptions.links; ++rail) {
-            channels[rail] = ChannelCopy(rail);
-            if (channels[rail] == nullptr) {
+            if (ChannelCopy(rail) == nullptr) {
                 throw std::runtime_error("sender lost channel before round on rail " + std::to_string(rail));
             }
             expectedData[rail] = mRails[rail].appCounters.attemptedDataCallbacks + mBlocksPerRail;
@@ -1490,31 +1641,16 @@ private:
             mTrace[traceIndex].s0.Publish(startNs);
         }
 
-        // One application submission thread alternates rails block-by-block.
-        for (uint32_t localBlock = 0; localBlock < mBlocksPerRail; ++localBlock) {
-            for (uint16_t rail = 0; rail < mOptions.links; ++rail) {
-                Callback *callback = NewDataCallback(rail, generation, localBlock + 1 == mBlocksPerRail);
-                if (callback == nullptr) {
-                    throw std::runtime_error("unable to allocate Put callback");
-                }
-                ++mRails[rail].appCounters.attemptedDataCallbacks;
-                const int rc = channels[rail]->Put(mRails[rail].putRequests[localBlock], callback);
-                if (rc != 0) {
-                    throw std::runtime_error("Put failed on rail " + std::to_string(rail) + ": " +
-                        std::to_string(rc));
-                }
-            }
+        uint64_t secondarySequence = 0;
+        if (mOptions.links == 2) {
+            secondarySequence = IssueSecondaryRailCommand(RailCommand::SubmitRound, generation);
         }
-
-        for (uint16_t rail = 0; rail < mOptions.links; ++rail) {
-            mRails[rail].roundReadyPayload = EncodeToken(kRoundReadyMagic, generation, rail);
-            PostAsyncSend(rail, channels[rail], mRails[rail].roundReadyPayload.data(),
-                mRails[rail].roundReadyPayload.size(), kOpRoundReady);
-            if (TraceIndex(generation, traceIndex)) {
-                mTrace[traceIndex].sPost[rail].Publish(NowNs());
-            }
+        const uint64_t rail0SubmitEndNs = SubmitRailRound(0, generation);
+        uint64_t submitNs = rail0SubmitEndNs;
+        if (mOptions.links == 2) {
+            WaitSecondaryRailCommand(secondarySequence, "rail 1 round submission");
+            submitNs = std::max(submitNs, mSecondary.submitEndNs.load(std::memory_order_relaxed));
         }
-        const uint64_t submitNs = NowNs();
         if (TraceIndex(generation, traceIndex)) {
             mTrace[traceIndex].s1.Publish(submitNs);
         }
@@ -1541,70 +1677,74 @@ private:
         }
     }
 
+    uint64_t SubmitRailRound(uint16_t rail, uint64_t generation)
+    {
+        const UBSHcomChannelPtr channel = ChannelCopyRequired(rail, "round submission");
+        RailState &state = mRails[rail];
+        for (uint32_t localBlock = 0; localBlock < mBlocksPerRail; ++localBlock) {
+            Callback *callback = NewDataCallback(rail, generation, localBlock + 1 == mBlocksPerRail);
+            if (callback == nullptr) {
+                throw std::runtime_error("unable to allocate Put callback on rail " + std::to_string(rail));
+            }
+            ++state.appCounters.attemptedDataCallbacks;
+            const int rc = channel->Put(state.putRequests[localBlock], callback);
+            if (rc != 0) {
+                throw std::runtime_error("Put failed on rail " + std::to_string(rail) + ": " +
+                    std::to_string(rc));
+            }
+        }
+
+        state.roundReadyPayload = EncodeToken(kRoundReadyMagic, generation, rail);
+        PostAsyncSend(rail, channel, state.roundReadyPayload.data(), state.roundReadyPayload.size(), kOpRoundReady);
+        const uint64_t submitEndNs = NowNs();
+        size_t traceIndex = 0;
+        if (TraceIndex(generation, traceIndex)) {
+            mTrace[traceIndex].sPost[rail].Publish(submitEndNs);
+        }
+        return submitEndNs;
+    }
+
     void RunReceiver()
     {
+        uint64_t secondarySequence = 0;
+        if (mOptions.links == 2) {
+            secondarySequence = IssueSecondaryRailCommand(RailCommand::RunReceiver);
+        }
+        RunReceiverRail(0);
+        if (mOptions.links == 2) {
+            WaitSecondaryRailCommand(secondarySequence, "rail 1 receiver loop and FINISH_ACK");
+        }
+    }
+
+    void RunReceiverRail(uint16_t rail)
+    {
+        RailState &state = mRails[rail];
         for (uint64_t generation = 1; generation <= mParams.TotalRounds(); ++generation) {
-            std::array<bool, kMaxLinks> ackPosted{};
-            std::array<uint64_t, kMaxLinks> sendTargets{};
-            uint16_t remaining = mOptions.links;
-            while (remaining != 0) {
-                bool progressed = false;
-                for (uint16_t rail = 0; rail < mOptions.links; ++rail) {
-                    if (ackPosted[rail] ||
-                        mRails[rail].roundReadyGeneration.load(std::memory_order_acquire) < generation) {
-                        continue;
-                    }
-                    if (generation <= mParams.verifyRounds) {
-                        VerifyReceiverRail(rail, generation);
-                    }
-                    size_t traceIndex = 0;
-                    if (TraceIndex(generation, traceIndex)) {
-                        mTrace[traceIndex].rAck[rail].Publish(NowNs());
-                    }
-                    RailState &state = mRails[rail];
-                    state.ackPayload = EncodeToken(kAckMagic, generation, rail);
-                    PostAsyncSend(rail, ChannelCopyRequired(rail, "ROUND_ACK"), state.ackPayload.data(),
-                        state.ackPayload.size(), kOpRoundAck);
-                    sendTargets[rail] = ExpectedSendCallbacks(rail);
-                    ackPosted[rail] = true;
-                    --remaining;
-                    progressed = true;
-                }
-                if (!progressed) {
-                    WaitData("next per-rail ROUND_READY", [this, generation, &ackPosted] {
-                        for (uint16_t rail = 0; rail < mOptions.links; ++rail) {
-                            if (!ackPosted[rail] &&
-                                mRails[rail].roundReadyGeneration.load(std::memory_order_acquire) >= generation) {
-                                return true;
-                            }
-                        }
-                        return false;
-                    });
-                }
+            WaitData("next per-rail ROUND_READY", [this, rail, generation] {
+                return mRails[rail].roundReadyGeneration.load(std::memory_order_acquire) >= generation;
+            });
+            if (generation <= mParams.verifyRounds) {
+                VerifyReceiverRail(rail, generation);
             }
-            // Do not wait for rail0 ACK completion before posting rail1 ACK.
-            WaitData("all ROUND_ACK local completions", [this, &sendTargets] {
-                for (uint16_t rail = 0; rail < mOptions.links; ++rail) {
-                    if (mRails[rail].callbackCounters.sendDoneCallbacks.load(std::memory_order_acquire) <
-                        sendTargets[rail]) {
-                        return false;
-                    }
-                }
-                return true;
+            size_t traceIndex = 0;
+            if (TraceIndex(generation, traceIndex)) {
+                mTrace[traceIndex].rAck[rail].Publish(NowNs());
+            }
+            state.ackPayload = EncodeToken(kAckMagic, generation, rail);
+            PostAsyncSend(rail, ChannelCopyRequired(rail, "ROUND_ACK"), state.ackPayload.data(),
+                state.ackPayload.size(), kOpRoundAck);
+            const uint64_t sendTarget = ExpectedSendCallbacks(rail);
+            WaitData("per-rail ROUND_ACK local completion", [this, rail, sendTarget] {
+                return mRails[rail].callbackCounters.sendDoneCallbacks.load(std::memory_order_acquire) >= sendTarget;
             });
         }
         if (mParams.measureRounds != 0 || mParams.traceRounds != 0) {
-            VerifyFinalDestination();
+            VerifyReceiverRail(rail, 0);
         }
-        WaitControl("FINISH on all rails", [this] {
-            for (uint16_t rail = 0; rail < mOptions.links; ++rail) {
-                if (mRails[rail].finishGeneration.load(std::memory_order_acquire) != mParams.TotalRounds()) {
-                    return false;
-                }
-            }
-            return true;
+        WaitControl("per-rail FINISH", [this, rail] {
+            return mRails[rail].finishGeneration.load(std::memory_order_acquire) == mParams.TotalRounds();
         });
-        SendFinishAcks();
+        SendFinishAckRail(rail);
     }
 
     void VerifyReceiverRail(uint16_t rail, uint64_t generation)
@@ -1620,51 +1760,40 @@ private:
         }
     }
 
-    void VerifyFinalDestination()
+    void SendFinish()
     {
-        for (uint16_t rail = 0; rail < mOptions.links; ++rail) {
-            VerifyReceiverRail(rail, 0);
+        uint64_t secondarySequence = 0;
+        if (mOptions.links == 2) {
+            secondarySequence = IssueSecondaryRailCommand(RailCommand::SendFinish);
+        }
+        SendFinishRail(0);
+        if (mOptions.links == 2) {
+            WaitSecondaryRailCommand(secondarySequence, "rail 1 FINISH/FINISH_ACK drain");
         }
     }
 
-    void SendFinish()
+    void SendFinishRail(uint16_t rail)
     {
-        std::array<uint64_t, kMaxLinks> targets{};
-        for (uint16_t rail = 0; rail < mOptions.links; ++rail) {
-            RailState &state = mRails[rail];
-            state.finishPayload = EncodeToken(kFinishMagic, mParams.TotalRounds(), rail);
-            PostAsyncSend(rail, ChannelCopyRequired(rail, "FINISH"), state.finishPayload.data(),
-                state.finishPayload.size(), kOpFinish);
-            targets[rail] = ExpectedSendCallbacks(rail);
-        }
-        WaitControl("FINISH local completion and FINISH_ACK on all rails", [this, &targets] {
-            for (uint16_t rail = 0; rail < mOptions.links; ++rail) {
-                if (mRails[rail].callbackCounters.sendDoneCallbacks.load(std::memory_order_acquire) < targets[rail] ||
-                    mRails[rail].finishAckGeneration.load(std::memory_order_acquire) != mParams.TotalRounds()) {
-                    return false;
-                }
-            }
-            return true;
+        RailState &state = mRails[rail];
+        state.finishPayload = EncodeToken(kFinishMagic, mParams.TotalRounds(), rail);
+        PostAsyncSend(rail, ChannelCopyRequired(rail, "FINISH"), state.finishPayload.data(),
+            state.finishPayload.size(), kOpFinish);
+        const uint64_t target = ExpectedSendCallbacks(rail);
+        WaitControl("per-rail FINISH local completion and FINISH_ACK", [this, rail, target] {
+            return mRails[rail].callbackCounters.sendDoneCallbacks.load(std::memory_order_acquire) >= target &&
+                mRails[rail].finishAckGeneration.load(std::memory_order_acquire) == mParams.TotalRounds();
         });
     }
 
-    void SendFinishAcks()
+    void SendFinishAckRail(uint16_t rail)
     {
-        std::array<uint64_t, kMaxLinks> targets{};
-        for (uint16_t rail = 0; rail < mOptions.links; ++rail) {
-            RailState &state = mRails[rail];
-            state.finishAckPayload = EncodeToken(kFinishAckMagic, mParams.TotalRounds(), rail);
-            PostAsyncSend(rail, ChannelCopyRequired(rail, "FINISH_ACK"), state.finishAckPayload.data(),
-                state.finishAckPayload.size(), kOpFinishAck);
-            targets[rail] = ExpectedSendCallbacks(rail);
-        }
-        WaitControl("FINISH_ACK local completion on all rails", [this, &targets] {
-            for (uint16_t rail = 0; rail < mOptions.links; ++rail) {
-                if (mRails[rail].callbackCounters.sendDoneCallbacks.load(std::memory_order_acquire) < targets[rail]) {
-                    return false;
-                }
-            }
-            return true;
+        RailState &state = mRails[rail];
+        state.finishAckPayload = EncodeToken(kFinishAckMagic, mParams.TotalRounds(), rail);
+        PostAsyncSend(rail, ChannelCopyRequired(rail, "FINISH_ACK"), state.finishAckPayload.data(),
+            state.finishAckPayload.size(), kOpFinishAck);
+        const uint64_t target = ExpectedSendCallbacks(rail);
+        WaitControl("per-rail FINISH_ACK local completion", [this, rail, target] {
+            return mRails[rail].callbackCounters.sendDoneCallbacks.load(std::memory_order_acquire) >= target;
         });
     }
 
@@ -1912,11 +2041,23 @@ private:
                << ",\"counter_alignment_bytes\":" << kCounterAlignment
                << ",\"callback_allocation\":\"per-request\""
                << ",\"links\":" << mOptions.links
-               << ",\"services\":" << mOptions.links << ",\"blocks\":600,\"blocks_per_rail\":" << mBlocksPerRail
+               << ",\"services\":" << mOptions.links << ",\"application_cpus\":[";
+        for (uint16_t rail = 0; rail < mOptions.links; ++rail) {
+            if (rail != 0) {
+                output << ',';
+            }
+            output << mOptions.appCpus[rail];
+        }
+        output << "],\"blocks\":600,\"blocks_per_rail\":" << mBlocksPerRail
                << ",\"block_bytes\":1024,\"payload_bytes\":614400"
                << ",\"mode\":\"plain\",\"remote_layout\":\"direct-stride-4096\",\"tls_enabled\":false"
                << ",\"internal_multirail\":false,\"channel_link_count\":1,\"rounds_in_flight\":1"
-               << ",\"application_submit_threads\":1,\"data_wr_per_round\":600,\"round_ready_wr_per_round\":"
+               << ",\"application_submit_threads\":" << mOptions.links
+               << ",\"rail_thread_affinity\":\"fixed-one-thread-per-service\""
+               << ",\"multi_service_scope\":\""
+               << (mOptions.links == 1 ? "single-service-supported" : "diagnostic-unsupported-by-hcom-contract")
+               << "\""
+               << ",\"data_wr_per_round\":600,\"round_ready_wr_per_round\":"
                << mOptions.links << ",\"ack_wr_per_round\":" << mOptions.links
                << ",\"direct_optimization\":\"stage1.5-AB\",\"verify_passed\":true"
                << ",\"trace_rounds\":" << mParams.traceRounds;
@@ -1963,6 +2104,7 @@ private:
     std::vector<uint64_t> mE2eNs;
     uint64_t mMeasureWallStartNs = 0;
     uint64_t mMeasureWallEndNs = 0;
+    SecondaryRailExecutor mSecondary;
 };
 
 }  // namespace

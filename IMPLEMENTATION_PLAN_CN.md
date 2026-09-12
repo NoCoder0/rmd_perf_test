@@ -71,13 +71,13 @@ perf_test_duo_card/
 "$PERF_ROOT/build/rdma_600" --role receiver --links 2 --kind verify \
   --rdma-ips <receiver_nic0_ip>,<receiver_nic1_ip> \
   --listen <receiver_oob_ip>:19000,<receiver_oob_ip>:19001 \
-  --app-cpu 2 --worker-cpus 3,4 --verify-rounds 20 --timeout-sec 10
+  --app-cpus 2,5 --worker-cpus 3,4 --verify-rounds 20 --timeout-sec 10
 
 # sender 主机（看到 receiver 的 LISTENING 后）
 "$PERF_ROOT/build/rdma_600" --role sender --links 2 --kind verify \
   --rdma-ips <sender_nic0_ip>,<sender_nic1_ip> \
   --peer <receiver_oob_ip>:19000,<receiver_oob_ip>:19001 \
-  --app-cpu 2 --worker-cpus 3,4 --verify-rounds 20 --timeout-sec 10
+  --app-cpus 2,5 --worker-cpus 3,4 --verify-rounds 20 --timeout-sec 10
 ```
 
 B1 使用 `--links 1`，并且 IP、端点和 worker CPU 列表各只传第一项。measure 将 `--kind` 改为 `measure` 并显式给出 `--warmup`、`--rounds`；独立诊断将其改为 `trace` 并给出不超过 64 的 `--trace-rounds`。完整命令以 README 为准。
@@ -229,7 +229,10 @@ callback 动态分配的处理有明确边界：A/B 必做版本继续使用公�
 
 1. 将单 rail 状态放入长度不超过 2 的数组；每个 rail 独立 service、设备、MR、channel、就绪和 ACK 状态。
 2. 每条分配 300 块，global_block_id 为 `rail*300 + local_id`。块总量、stride 和有效数据量保持不变。
-3. 一个提交线程按块交替提交：Put(rail0,i)、Put(rail1,i)，i=0…299；完成提交后每条 rail 各发一个 ROUND_READY。receiver 不增加 scatter 线程，独立检查两条 rail 的 ready 并异步发各自 ACK，不能因等 rail0 ready 或 ACK 本地完成而阻塞 rail1 的通知处理。
+3. 快速穿刺修订：B1 保持一个提交线程；B2 使用两个全程常驻且严格绑定 service 的 rail 线程，
+   同时各提交 300 次 Put，并由对应线程发送 ROUND_READY。receiver 同样每 rail 一个固定线程，独立
+   检查 ready、校验并发送 ACK。该修订用于规避当前 HCOM TLS cache 在同一线程切换两个 Service
+   时的抖动；HCOM 明示两个同协议 Service 并存不受支持，因此结果仅作诊断，不是最终产品架构。
 4. 等待两条 rail 的 ACK 和本地完成后才能开始下一轮；不能将 rail0 ACK 当整轮完成。
 5. 保留 `--links 1` 路径，使用同一个二进制重测 B1 与 B2。不能只用阶段 1 的历史 B1 数字与修改后的 B2 比较。
 
@@ -241,9 +244,9 @@ callback 动态分配的处理有明确边界：A/B 必做版本继续使用公�
 
 | 主机/线程 | 时间点 | 精确定义 |
 |---|---|---|
-| sender 应用 | S0 | 本轮首个数据 API 前 |
+| sender 应用 | S0 | 主线程发布本轮命令前 |
 | sender 应用 | S_post[r] | 对应 rail 的 Nrail=600/L 个数据和 ROUND_READY API 均返回成功后（B1 为 600，B2 为 300） |
-| sender 应用 | S1 | 本轮最后一个 ROUND_READY 提交成功后 |
+| sender 应用 | S1 | `max(S_post[r])`，即最后一个 rail 完成 ROUND_READY 提交的时刻 |
 | sender CQ | S_data[r] | 该 rail 本轮最后一个数据 API callback 成功的时刻 |
 | sender 接收 callback | S_ack[r] | 收到并校验该 rail 本轮 ACK 后 |
 | sender 应用 | S2 | 全部 ACK 与本地 data/Send 完成均已满足 |
@@ -257,7 +260,7 @@ callback 动态分配的处理有明确边界：A/B 必做版本继续使用公�
 - CQ 线程先写 `R_ready` 再 release 发布 ready，receiver 应用线程 acquire 后读取；不要反过来发布状态再填时间戳。
 - 完成计数到达阈值与对应时间戳发布必须一致；例如最后 callback 写好时间戳后再发布独立的 trace-ready 标记，不能让统计线程先看到“完成”而读取未初始化时间戳。
 - 按采样 generation 预分配记录，不循环覆盖尚未读取的 trace 槽；不同线程使用各自字段或数组，不同时 append 同一个 vector。
-- trace 模式仅有诊断轮次，保证 generation 和回调生命周期仍遵循正常协议。新增 trace 不应改变非 trace 的协议、提交顺序和线程数。
+- trace 模式仅有诊断轮次，保证 generation 和回调生命周期仍遵循正常协议。新增 trace 不应改变非 trace 的协议、提交顺序和固定 rail 线程数。
 
 可从这些打点得到：
 
@@ -287,7 +290,9 @@ latency_speedup = median(B1 每次运行的 e2e_p50) / median(B2 每次运行的
 bandwidth_ratio = median(B2 每次有效 GB/s) / median(B1 每次有效 GB/s)
 ```
 
-聚合方式在报告中固定；不要一组平均值、另一组最优值。不要求 B2 必须更快。若更慢或无收益，结合打点、CPU 与 NIC 证据分析，标清“观察事实”和“待验证解释”；不为追求 2 倍收益直接改成两个应用提交线程。
+聚合方式在报告中固定；不要一组平均值、另一组最优值。不要求 B2 必须更快。B2 当前比 B1 多一个
+应用提交线程，必须单独披露，不能把全部差异归因于第二张 NIC。若更慢或无收益，结合打点、CPU、
+HCOM pool 扩容日志与 NIC 证据分析，标清“观察事实”和“待验证解释”。
 
 阶段 2 通过条件：B1/B2 都正确、实际双 NIC 证据充分、两组性能原始数据齐全、打点可解释且无跨机器时间相减。单纯多建一条链不算完成本阶段。
 
@@ -412,7 +417,7 @@ token 使用设计约定：`(generation << 8) | chunk_id`，24 位 generation、
 
 ### 阶段 2 提示词
 
-> 请先读取两份设计/实施文档、PROGRESS 和阶段 1/1.5 结果，在阶段 1 direct baseline 上只扩展双链接：两个 service 分别绑定两张 NIC，每个 channel 一条 QP，每条传 300 块、直接写最终 dst，总数600。B1/B2 使用完全相同的阶段1.5优化与配置，保持一个应用提交线程、单轮在途和 ROUND_READY/ACK 完成口径，按块交替提交两条 rail。新增独立诊断打点，记录提交、本地完成、每rail round-ready和ACK。交付同一二进制下B1/B2真实对照、独立trace、双NIC流量证据与报告，不把阶段1.5收益算成双链接收益。正式性能关闭详细trace，不跨机器相减时间戳。本阶段不实现SGL/staging/scatter/IMM。
+> 请先读取两份设计/实施文档、PROGRESS 和阶段 1/1.5 结果，在阶段 1 direct baseline 上只扩展双链接：两个 service 分别绑定两张 NIC，每个 channel 一条 QP，每条传 300 块、直接写最终 dst，总数600。B1/B2 使用完全相同的阶段1.5优化与配置；B1 保持一个应用线程，B2 使用两个全程常驻、严格 service 亲和的 rail 线程并发提交，保持单轮在途和 ROUND_READY/ACK 完成口径。新增独立诊断打点，记录提交、本地完成、每rail round-ready和ACK。交付同一二进制下B1/B2真实对照、独立trace、双NIC流量证据与报告，明确B2多一个应用CPU且属于快速穿刺，不把阶段1.5收益算成双链接收益。正式性能关闭详细trace，不跨机器相减时间戳。本阶段不实现SGL/staging/scatter/IMM。
 
 ### 阶段 3 提示词
 

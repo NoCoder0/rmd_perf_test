@@ -101,7 +101,7 @@ direct：B1 单条 600 个 Put 后通知一次；B2 每条 300 个 Put 后分别
 
 若要严格拆分 gather、scatter 和通知粒度的影响，按需增加 `plain-staged(L,K)`：与对应 SGL 使用相同 staging、scatter、K 和通知/ACK，但逐块 Put。其数据 WR 为 600，通知数为 `L*ceil((600/L)/K)`。该对照不属于阶段 2，也不是主矩阵必做项；8/16/30 的主表代表三种实际配置的综合效果。
 
-`serial` 和双提交线程属于诊断项；`direct` 已是当前 B1 的唯一主 baseline。
+`serial` 属于诊断项；双提交线程已用于当前 B2 快速穿刺，`direct` 仍是 B1 的唯一主 baseline。
 
 ## 5. 连接、线程与 NUMA
 
@@ -127,13 +127,23 @@ sender service[0] / QP0 / NIC0  ── receiver service[0] / QP0 / NIC0
 sender service[1] / QP1 / NIC1  ── receiver service[1] / QP1 / NIC1
 ```
 
-阶段 1/1.5：每端一个应用线程，一个 hcom CQ worker，没有 scatter。阶段 2：仍为每端一个应用线程，但每 rail 一个 hcom worker；发送线程按块交替向两条 rail 提交各 300 次 Put，不等待 rail0 完成才发 rail1，末尾分别追加 ROUND_READY。接收应用线程独立观察两条 rail 的 ready 并返回各自 ACK，不增加 scatter。
+阶段 1/1.5：每端一个应用线程，一个 hcom CQ worker，没有 scatter。阶段 2 快速穿刺版：B1 保持
+一个应用线程；B2 的主线程固定 rail0，第二个常驻线程固定 rail1，两者同时各提交 300 次 Put，
+末尾分别追加 ROUND_READY。接收端也由两个固定 rail 线程独立观察 ready、校验并返回 ACK，
+不增加 scatter。固定线程从连接/HELLO 延续到 FINISH drain，禁止线程跨 Service 调用。
+
+该结构能避开当前 HCOM TLS cache 的同线程 pool 切换，但不改变 HCOM 源码关于“禁止两个同协议
+Service 并存”的明示限制。因此阶段 2 数据属于快速诊断；正式产品方向是在单 Service multirail
+中增加小请求整包选 rail，而不是把 1024/656 字节请求再次切片。
 
 阶段 3/4 才按 chunk 交替推进两条 rail；接收应用线程承担 scatter，与 CQ worker 分离。无需在原接收应用线程之外再额外启动一个通用 scatter 线程。
 
-这样无需自定义线程池，单/双链接保持相同应用线程数。双链接仍多一个 hcom worker，应在结果中记录总 CPU 使用量。若发送线程先达到瓶颈，双链接不一定更快；此时再做每 rail 一个提交线程的诊断实验，避免直接把变化全部归因于网卡。
+无需通用线程池，也不在每轮创建线程。B2 比 B1 多一个应用线程和一个 hcom worker，应在结果中
+记录总 CPU 使用量，避免直接把变化全部归因于网卡。
 
-CPU 绑定规则：应用线程和 CQ worker 使用不同物理核心；记录网卡 PCIe NUMA 节点、线程 CPU 和源/destination 内存 NUMA 节点。后续 staged 用例再额外记录 staging 与 scatter 线程的 NUMA 关系；不在 B1 隐藏加入 NUMA 自动调度。
+CPU 绑定规则：B2 用 `--app-cpus <rail0_cpu>,<rail1_cpu>`，两者及两个 CQ worker 都使用不同
+物理核心；记录网卡 PCIe NUMA 节点、线程 CPU 和源/destination 内存 NUMA 节点。后续 staged
+用例再额外记录 staging 与 scatter 线程的 NUMA 关系；不在 B1 隐藏加入 NUMA 自动调度。
 
 ## 6. 内存布局、描述符与初始化
 
@@ -548,9 +558,14 @@ S2-30 的数据方向从 20 个 WRITE + 20 个 Send 变为 20 个 WRITE_WITH_IMM
   --verify-rounds 20 --warmup 1000 --rounds 10000
 ```
 
-当前 B1/B2 使用 `--mode plain`，不接受 `--chunk-items`、`--scatter` 或 `--notify`；单链接提供一组、双链接提供两组 IP/端口/worker CPU。两端逐 rail 交换并校验最终解析出的参数和 MR，避免命令行漏传或 rail 交换。
+当前 B1/B2 使用 `--mode plain`，不接受 `--chunk-items`、`--scatter` 或 `--notify`；单链接提供
+一组 IP/端口/app CPU/worker CPU，双链接分别提供两组。两端逐 rail 交换并校验最终解析出的参数
+和 MR，避免命令行漏传或 rail 交换。
 
-当前 direct sender 每个 case 输出一行 JSON；B2 的 `case/links/blocks_per_rail/round_ready_wr_per_round/ack_wr_per_round` 分别为 `B2/2/300/2/2`，并记录两个 service、每 channel `linkCount=1`、内建 multirail 关闭及共同的 `stage1.5-AB` 标识。trace JSONL 契约见 README。
+当前 direct sender 每个 case 输出一行 JSON；B2 的
+`case/links/blocks_per_rail/application_submit_threads/round_ready_wr_per_round/ack_wr_per_round` 分别为
+`B2/2/300/2/2/2`，并记录固定 rail 线程、两个 service、每 channel `linkCount=1`、内建 multirail
+关闭及共同的 `stage1.5-AB` 标识。trace JSONL 契约见 README。
 
 ```json
 {

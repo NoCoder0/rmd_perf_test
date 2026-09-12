@@ -9,7 +9,10 @@
       "<sender_nic0_rdma_ip>",
       "<sender_nic1_rdma_ip>"
     ],
-    "app_cpu": 2,
+    "app_cpus": [
+      2,
+      5
+    ],
     "worker_cpus": [
       3,
       4
@@ -29,7 +32,10 @@
       "<receiver_nic0_rdma_ip>",
       "<receiver_nic1_rdma_ip>"
     ],
-    "app_cpu": 2,
+    "app_cpus": [
+      2,
+      5
+    ],
     "worker_cpus": [
       3,
       4
