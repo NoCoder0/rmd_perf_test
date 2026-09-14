@@ -2454,6 +2454,7 @@ private:
             WaitAndScatterSgl(generation, expectedSend, deadlineNs);
         }
         const uint64_t end = NowNs();
+        if (end >= deadlineNs) throw std::runtime_error("sparse_copy absolute deadline exceeded");
         if (TraceIndex(generation, trace)) mTrace[trace].localEnd.Publish(end);
         if (measure) mSparseCopyNs.push_back(end - start);
     }
@@ -3076,24 +3077,33 @@ private:
 
     void PrintRemoteStatus() const
     {
-        std::cout << "{\"schema_version\":5,\"protocol\":\"sparse-copy-v5-dual-rail-sgl\",\"case\":\""
-                  << CaseName(mOptions.mode, mOptions.links, mOptions.sglItems, mOptions.pipeline)
-                  << "\",\"role\":\"remote\",\"status\":\"ok\",\"commit\":\""
-                  << RDMA_600_GIT_COMMIT << "\",\"build_type\":\"" << RDMA_600_BUILD_TYPE
-                  << "\",\"processed_calls\":"
-                  << mParams.TotalRounds() << ",\"links\":" << mOptions.links << ",\"mode\":\""
-                  << (mOptions.mode == CopyMode::Direct ? "direct" : "sgl") << "\",\"sgl_items\":"
-                  << mOptions.sglItems << ",\"pipeline\":\""
-                  << (mOptions.pipeline == PipelineMode::On ? "on" : "off")
-                  << "\",\"hcom_multiservice_contract\":\""
-                  << (mOptions.links == 2 ? "diagnostic-unsupported-by-hcom-contract" : "not-applicable")
-                  << "\",\"compiled_sge_cap\":" << kCompiledSgeMax << ",\"qp_cap_source\":\""
-                  << (mOptions.mode == CopyMode::Direct ? "not-applicable" :
-                      (mOptions.qpCapDeclared ? "external-declaration" : "unknown"))
-                  << "\",\"qp_cap_validation\":\""
-                  << (mOptions.mode == CopyMode::Direct ? "not-applicable" :
-                      (mOptions.qpCapDeclared ? "declared-not-programmatically-verified" : "QP_CAP_PENDING"))
-                  << "\"}" << std::endl;
+        std::ostringstream out;
+        out << "{\"schema_version\":5,\"protocol\":\"sparse-copy-v5-dual-rail-sgl\",\"case\":\""
+            << CaseName(mOptions.mode, mOptions.links, mOptions.sglItems, mOptions.pipeline)
+            << "\",\"role\":\"remote\",\"status\":\"ok\",\"commit\":\""
+            << RDMA_600_GIT_COMMIT << "\",\"build_type\":\"" << RDMA_600_BUILD_TYPE
+            << "\",\"processed_calls\":" << mParams.TotalRounds() << ",\"links\":" << mOptions.links
+            << ",\"mode\":\"" << (mOptions.mode == CopyMode::Direct ? "direct" : "sgl")
+            << "\",\"sgl_items\":" << mOptions.sglItems << ",\"pipeline\":\""
+            << (mOptions.pipeline == PipelineMode::On ? "on" : "off")
+            << "\",\"hcom_multiservice_contract\":\""
+            << (mOptions.links == 2 ? "diagnostic-unsupported-by-hcom-contract" : "not-applicable")
+            << "\",\"compiled_sge_cap\":" << kCompiledSgeMax
+            << ",\"compiled_sge_cap_source\":\"ubs-comm-public-header\""
+            << ",\"linked_library_sge_cap_validation\":\"not-programmatically-verified\""
+            << ",\"qp_cap_source\":\""
+            << (mOptions.mode == CopyMode::Direct ? "not-applicable" :
+                (mOptions.qpCapDeclared ? "external-declaration" : "unknown"))
+            << "\",\"qp_cap_validation\":\""
+            << (mOptions.mode == CopyMode::Direct ? "not-applicable" :
+                (mOptions.qpCapDeclared ? "declared-not-programmatically-verified" : "QP_CAP_PENDING"))
+            << "\",\"qp_max_send_sge_declared\":[";
+        for (size_t rail = 0; rail < mOptions.qpMaxSendSge.size(); ++rail) {
+            if (rail != 0) out << ',';
+            out << mOptions.qpMaxSendSge[rail];
+        }
+        out << "]}";
+        std::cout << out.str() << std::endl;
     }
 
     Options mOptions;
