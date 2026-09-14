@@ -1,43 +1,29 @@
-# ubs-comm requester-driven sparse_copy：双 rail direct 设计
+# requester-driven sparse_copy：阶段3实现设计摘要
 
-更新日期：2026-09-14。当前实现覆盖 direct B1/B2；SGL、staging、scatter 和 IMM 不在本次范围。目标 Linux/RDMA 验证仍为 HW_PENDING。
+更新日期：2026-09-14。详细且具优先级的规范为 [STAGE3_DESIGN_CN.md](STAGE3_DESIGN_CN.md)；本文记录最终实现形态。
 
-## 语义与计时
+## 语义与模式
 
-local 是调用者、最终 destination 拥有者和唯一主计时端；remote 是 source 拥有者和 RDMA WRITE 发起端。remote 监听，local 连接。建链、MR 注册和 key 交换在调用外；每次调用内包含 600 对 offset 的生成、校验、编码和 COPY_REQ 传输，remote 接收复制/解析、本轮 WR 构造、600×1024 回写，以及 local 数据 ready。
+local 拥有最终 destination，并从生成 600 对真实 offset 开始计时，直到数据通知、CPU scatter（SGL）和本端 COPY_REQ callback 全部完成。remote 拥有 stride=4096 的 source，按请求索引分 rail。单次有效载荷 600×1024B，COPY_REQ 固定为 64B 头加 600 对 u64 offset，共 9664B。
 
-成功路径无逐轮 ACK。下一 COPY_REQ 表示 local 已消费上一代并授予 remote 下一代写权限。remote 仍必须回收本代 Put/DATA_DONE callbacks，才能复用 WR、source 验证数据和通知缓冲。
+direct B1/B2 保持 600 个普通 Put 和每 rail DATA_DONE。SGL S1/S2 为每 rail `ceil((600/links)/K)` 个 chunk：每 chunk 一个 PutV，所有 iov 使用同一 rkey 且远端 stage 地址连续；成功 post 后立即在同一 channel 发送一条 CHUNK_DONE。local 以 acquire 观察 generation-ready 后，从连续 stage scatter 到请求指定的 destination。pipeline on 随 ready 交错 scatter；off 等齐后调用相同 scatter 函数。
 
-## wire
+## wire 与内存
 
-协议名 `sparse-copy-v4-dual-rail`，version=4；HELLO/READY/COPY_REQ/DATA_DONE/FINISH 均使用新 magic，避免旧 sender-driven v3 被接受。
+协议为 `sparse-copy-v5-dual-rail-sgl`，version=5，新 magic。Parameters=40B；HELLO=252B，含 destination 与可选 stage 描述符/80B key；READY=64B；COPY_REQ=9664B；CHUNK_DONE=40B。所有整数显式网络字节序，精确长度和 reserved=0 均校验。direct 的 K=0、pipeline=off、stage 全零；SGL 使用 sparse-600、stage region 3。
 
-direct COPY_REQ 固定 9664 字节：64 字节头和 600 个 `(remote_source_offset, local_destination_offset)`，正文 9600 字节。B1/B2 都只在 rail0 发一份完整请求。两端所有 service 的 `maxSendRecvDataSize=16384`，split/RNDV threshold 为 `UINT32_MAX`。
+仅 local/SGL 额外按固定 rail 线程分配、触页并注册每 rail `R*1024` 连续 stage；destination MR 仍为 `R*4096`。remote 每 rail 的全部 iov、PutV request 和逐 chunk 通知缓冲具有跨异步 callback 的稳定生命周期。checked arithmetic 同时验证 offset、region 和 base+length。
 
-每条 rail 在本 rail 的最后一个数据 Put 后发送 DATA_DONE。local 返回条件为：所有 rail 的 DATA_DONE generation 到达，且本端 rail0 COPY_REQ Send callback 完成。失败路径可用 COPY_ERROR；发送不可用时由断链唤醒。
+## 并发、deadline 与能力
 
-## rail 与内存布局
+两 rail 架构仍为两个固定应用线程各自拥有一个 service/channel/MR 生命周期；local 主线程独占所有 CPU scatter，只读取 rail1 stage，不调用 rail1 service。remote pending/active 请求分离；active/iov/source/通知缓冲在本代全部 data/Send callbacks 回收前不复用。
 
-B1：一个 rail MR，600 槽。B2：每端每 rail 独立注册一个 300 槽 MR。每槽 4096 字节，前 1024 字节有效，gap 使用 sentinel 校验。
+local 在发请求前 release 发布 expected generation；CHUNK_DONE handler 校验 role/mode/rail/generation/chunk/first/count/bytes 后以 CAS release 发布 ready，重复、迟到、未来和越界均使整次 run 失败。scatter 以 acquire 读取 ready，consumed 与 ready 独立。每次 SparseCopy 使用从入口 t0 派生的统一绝对 deadline；direct 也使用该口径。
 
-rail 由请求索引唯一决定：B2 的 0..299 为 rail0、300..599 为 rail1。offset 是对应 rail MR 内偏移，不用 offset 大小选择 rail，不跨 rail 混用 key。每 rail 的 destination permutation 单独保证唯一；source 可重复，当前生成器提供非顺序 permutation。
+K 来自严格环境变量 `RDMA_600_SGL_ITEMS`，设计范围 1..30，默认16。可运行条件同时受公共头、实际链接库和真实创建 QP cap 限制。当前公共头上限16，因此 K30 为 UNSUPPORTED。公共 API 无真实 QP cap getter；`RDMA_600_QP_MAX_SEND_SGE` 只作为 `external-declaration` 登记，不伪称自动验证，SGL measure 缺失时拒绝。
 
-local 在每 rail HELLO 中发送本 rail destination 基址、大小、region id 和完整 MemoryKey。remote READY 只返回本 rail source region id、大小和对齐，不导出 source key。
+## 结果与安全边界
 
-## pending/active 与线程
+schema=5 明确记录 mode/K/pipeline/source format、9600B descriptor、stage/chunk/预期 WR 与通知数、cap 来源和 pending 状态。正式 measure 不记录逐 chunk trace；trace 另跑。成功 JSON 只在 FINISH、callback drain、MR/service teardown 和固定线程退出后输出。
 
-remote rail0 worker 收到 COPY_REQ 后，先占用预分配 pending 槽，复制完整消息，再以 release 发布。remote app acquire 后复制到独立 active，才释放 pending。local 可在上一代 DATA_DONE 后发下一请求；即使 remote 上代 callbacks 尚未全部处理，新请求也只进入 pending，不覆盖 active。
-
-B2 的 rail0 使用主线程，rail1 使用常驻线程。rail1 从 service 创建、MR 注册开始，贯穿连接/握手、每轮 WR 构造/Put/DATA_DONE、callback drain、FINISH 到 teardown；不会为每轮创建线程，也不会跨线程调用 rail1 service。命令参数和 active 请求经 issued release/acquire 发布，completed release/acquire 归还协调权。callback 在各 HCOM worker 执行，仅发布完成状态。
-
-阶段 1.5 规则保留：数据等待使用 CPU relax，每 256 次检查 deadline；attempted 由固定 app 线程以普通计数维护，completed 和 active callbacks 使用原子量并缓存行隔离；每请求 callback 分配保持不变。异步失败进入有界 drain，不能假设失败请求一定回调。
-
-## trace 与结果
-
-local trace 记录 `local_begin/request_posted/data_done[rail]/local_end`；remote 记录 `request_received/posted[rail]/data_callbacks_done[rail]/done_posted[rail]`。trace 仅在独立 trace run 开启。不同主机时钟不相减，remote 诊断不替代 local sparse_copy，重叠区间不相加。
-
-结果 schema=4，case 保持 B1/B2。每调用 payload 614400 字节，请求 9664 字节，data WR=600，DATA_DONE WR=L，success ACK=0。
-
-## 验证边界
-
-本机 self-test 和语法检查不能证明真实 MR/key、DMA 可见性、RQ/CQ、同 QP WRITE→SEND 顺序、双 NIC 分流或性能。目标机必须保存编译输入/hash、命令、两端日志、NIC/QP/流量、CPU/NUMA/MTU 和错误注入证据。B2 受当前 HCOM 多 Service 契约限制，定位为诊断穿刺。
+依赖 PutV 失败路径存在 callback 所有权风险，本 demo 不删除失败 callback、不重试，转为失败并有界 drain；无法证明 quiesce 时 `_Exit`，避免释放仍可能被 DMA/callback 使用的存储。真实 QP 顺序、DMA 可见性、linked-library ABI、双 NIC 和性能仍为 `TARGET_BUILD_AND_HW_PENDING`。

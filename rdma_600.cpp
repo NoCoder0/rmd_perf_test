@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MulanPSL-2.0
 //
-// Requester-driven direct B1/B2 benchmark for the 600 x 1 KiB
+// Requester-driven direct and SGL B1/B2/S1/S2 benchmark for the 600 x 1 KiB
 // ubs-comm RDMA experiment. Local owns the final destination and measures the
 // complete sparse_copy call. Remote owns the source and posts the RDMA writes.
 // In B2 each fixed application thread owns one service/NIC/QP for its complete
@@ -25,6 +25,7 @@
 #include <iostream>
 #include <limits>
 #include <map>
+#include <memory>
 #if defined(_WIN32)
 #include <malloc.h>
 #endif
@@ -48,6 +49,9 @@
 #ifndef RDMA_600_GIT_COMMIT
 #define RDMA_600_GIT_COMMIT "unknown"
 #endif
+#ifndef RDMA_600_BUILD_TYPE
+#define RDMA_600_BUILD_TYPE "unknown"
+#endif
 
 namespace {
 
@@ -61,6 +65,7 @@ using ock::hcom::UBSHcomMemoryKey;
 using ock::hcom::UBSHcomMultiRailOptions;
 using ock::hcom::UBSHcomNewCallback;
 using ock::hcom::UBSHcomOneSideRequest;
+using ock::hcom::UBSHcomOneSideSglRequest;
 using ock::hcom::UBSHcomRegMemoryRegion;
 using ock::hcom::UBSHcomReplyContext;
 using ock::hcom::UBSHcomRequest;
@@ -72,9 +77,9 @@ using ock::hcom::UBSHcomServiceProtocol;
 using ock::hcom::UBSHcomTlsOptions;
 using ock::hcom::UBSHcomTwoSideThreshold;
 
-// Version 4 deliberately rejects the older sender-driven protocol, which also
-// used version 3 but had incompatible roles and per-round ACK semantics.
-constexpr uint16_t kProtocolVersion = 4;
+// Version 5 deliberately rejects every older direct or sender-driven wire
+// format. Direct and SGL use the same parameterized protocol.
+constexpr uint16_t kProtocolVersion = 5;
 constexpr uint16_t kMaxLinks = 2;
 constexpr uint32_t kBlocks = 600;
 constexpr uint32_t kMaxBlocksPerRail = kBlocks;
@@ -87,8 +92,16 @@ constexpr uint8_t kDstGapSentinel = 0xa5;
 constexpr uint8_t kSourceGapSentinel = 0x5a;
 constexpr uint32_t kSourceRegionId = 1;
 constexpr uint32_t kDestinationRegionId = 2;
+constexpr uint32_t kStageRegionId = 3;
 constexpr uint16_t kModeDirect = 1;
+constexpr uint16_t kModeSgl = 2;
+constexpr uint16_t kPipelineOff = 0;
+constexpr uint16_t kPipelineOn = 1;
 constexpr uint16_t kSourceFormatDirectPairs = 1;
+constexpr uint16_t kSourceFormatSparse600 = 2;
+constexpr uint16_t kDefaultSglItems = 16;
+constexpr uint16_t kDesignMaxSglItems = 30;
+constexpr uint32_t kCompiledSgeMax = ock::hcom::NET_SGE_MAX_IOV;
 constexpr uint32_t kCopyErrorStageRemoteProcess = 1;
 constexpr uint32_t kCopyErrorCodeRequestFailed = 1;
 #if defined(__cpp_lib_hardware_interference_size)
@@ -108,20 +121,22 @@ constexpr uint16_t kOpDataDone = 703;
 constexpr uint16_t kOpCopyError = 704;
 constexpr uint16_t kOpFinish = 705;
 constexpr uint16_t kOpFinishAck = 706;
+constexpr uint16_t kOpChunkDone = 707;
 
-constexpr uint32_t kHelloMagic = 0x53434834U;      // "SCH4"
-constexpr uint32_t kReadyMagic = 0x53435234U;      // "SCR4"
-constexpr uint32_t kCopyReqMagic = 0x53435034U;    // "SCP4"
-constexpr uint32_t kDataDoneMagic = 0x53434434U;   // "SCD4"
-constexpr uint32_t kCopyErrorMagic = 0x53434534U;  // "SCE4"
-constexpr uint32_t kFinishMagic = 0x53434634U;     // "SCF4"
-constexpr uint32_t kFinishAckMagic = 0x53434134U;  // "SCA4"
+constexpr uint32_t kHelloMagic = 0x53434835U;      // "SCH5"
+constexpr uint32_t kReadyMagic = 0x53435235U;      // "SCR5"
+constexpr uint32_t kCopyReqMagic = 0x53435035U;    // "SCP5"
+constexpr uint32_t kDataDoneMagic = 0x53434435U;   // "SCD5"
+constexpr uint32_t kCopyErrorMagic = 0x53434535U;  // "SCE5"
+constexpr uint32_t kFinishMagic = 0x53434635U;     // "SCF5"
+constexpr uint32_t kFinishAckMagic = 0x53434135U;  // "SCA5"
+constexpr uint32_t kChunkDoneMagic = 0x53434335U;  // "SCC5"
 
-// Params are 32 bytes in protocol v4. HELLO carries this rail's local
-// destination registration; READY describes this rail's remote source region.
-constexpr size_t kParametersWireBytes = 32;
+// Params are 40 bytes in protocol v5. HELLO carries this rail's local
+// destination and optional stage registrations; READY describes its source.
+constexpr size_t kParametersWireBytes = 40;
 constexpr size_t kMemoryKeyWireBytes = 80;
-constexpr size_t kHelloWireBytes = 4 + kParametersWireBytes + 4 + 24 + kMemoryKeyWireBytes;
+constexpr size_t kHelloWireBytes = 4 + kParametersWireBytes + 4 + 24 + kMemoryKeyWireBytes + 20 + kMemoryKeyWireBytes;
 constexpr size_t kReadyWireBytes = 4 + kParametersWireBytes + 4 + 16;
 constexpr size_t kCopyReqHeaderBytes = 64;
 constexpr size_t kCopyEntryWireBytes = 16;
@@ -130,18 +145,27 @@ constexpr size_t kCopyReqWireBytes = kCopyReqHeaderBytes + kCopyReqDescriptorByt
 constexpr size_t kDataDoneWireBytes = 32;
 constexpr size_t kCopyErrorWireBytes = 32;
 constexpr size_t kTokenWireBytes = 24;
+constexpr size_t kChunkDoneWireBytes = 40;
 
-static_assert(kHelloWireBytes == 144, "HELLO wire size must include one destination key");
-static_assert(kReadyWireBytes == 56, "READY wire size is fixed");
-static_assert(kCopyReqWireBytes == 9664, "direct COPY_REQ must carry all 600 pairs");
+static_assert(kHelloWireBytes == 252, "HELLO wire size must include destination and stage descriptors");
+static_assert(kReadyWireBytes == 64, "READY wire size is fixed");
+static_assert(kCopyReqWireBytes == 9664, "COPY_REQ must carry all 600 sparse pairs");
+static_assert(kChunkDoneWireBytes == 40, "CHUNK_DONE wire size is fixed");
 
 enum class Role { Local, Remote };
 enum class RunKind { Verify, Measure, Trace };
+enum class CopyMode : uint16_t { Direct = kModeDirect, Sgl = kModeSgl };
+enum class PipelineMode : uint16_t { Off = kPipelineOff, On = kPipelineOn };
 
 struct Options {
     Role role = Role::Local;
     RunKind kind = RunKind::Measure;
     uint16_t links = 1;
+    CopyMode mode = CopyMode::Direct;
+    PipelineMode pipeline = PipelineMode::Off;
+    uint16_t sglItems = 0;
+    std::vector<uint32_t> qpMaxSendSge;
+    bool qpCapDeclared = false;
     std::vector<std::string> rdmaIps;
     std::vector<std::string> endpoints;
     uint32_t verifyRounds = 20;
@@ -164,6 +188,10 @@ struct CaseParameters {
     uint32_t warmupRounds = 0;
     uint32_t measureRounds = 0;
     uint32_t traceRounds = 0;
+    uint16_t mode = kModeDirect;
+    uint16_t sglItems = 0;
+    uint16_t pipeline = kPipelineOff;
+    uint16_t sourceFormat = kSourceFormatDirectPairs;
 
     uint64_t TotalRounds() const
     {
@@ -178,6 +206,10 @@ struct HelloInfo {
     uint64_t destinationAddress = 0;
     uint64_t destinationBytes = 0;
     UBSHcomMemoryKey destinationKey{};
+    uint32_t stageRegionId = 0;
+    uint64_t stageAddress = 0;
+    uint64_t stageBytes = 0;
+    UBSHcomMemoryKey stageKey{};
 };
 
 struct ReadyInfo {
@@ -191,6 +223,16 @@ struct ReadyInfo {
 struct CopyEntry {
     uint64_t remoteSourceOffset = 0;
     uint64_t localDestinationOffset = 0;
+};
+
+struct ChunkDoneInfo {
+    uint16_t rail = 0;
+    uint64_t generation = 0;
+    uint32_t chunkId = 0;
+    uint32_t firstItem = 0;
+    uint32_t itemCount = 0;
+    uint32_t payloadBytes = 0;
+    uint32_t chunkCount = 0;
 };
 
 class AlignedBuffer {
@@ -319,6 +361,10 @@ void EncodeParams(uint8_t *&cursor, const CaseParameters &params)
     PutU32(cursor, params.warmupRounds);
     PutU32(cursor, params.measureRounds);
     PutU32(cursor, params.traceRounds);
+    PutU16(cursor, params.mode);
+    PutU16(cursor, params.sglItems);
+    PutU16(cursor, params.pipeline);
+    PutU16(cursor, params.sourceFormat);
 }
 
 CaseParameters DecodeParams(const uint8_t *&cursor)
@@ -333,6 +379,10 @@ CaseParameters DecodeParams(const uint8_t *&cursor)
     params.warmupRounds = GetU32(cursor);
     params.measureRounds = GetU32(cursor);
     params.traceRounds = GetU32(cursor);
+    params.mode = GetU16(cursor);
+    params.sglItems = GetU16(cursor);
+    params.pipeline = GetU16(cursor);
+    params.sourceFormat = GetU16(cursor);
     return params;
 }
 
@@ -341,7 +391,35 @@ bool SameParams(const CaseParameters &left, const CaseParameters &right)
     return left.version == right.version && left.links == right.links && left.blocks == right.blocks &&
         left.blockBytes == right.blockBytes && left.strideBytes == right.strideBytes &&
         left.verifyRounds == right.verifyRounds && left.warmupRounds == right.warmupRounds &&
-        left.measureRounds == right.measureRounds && left.traceRounds == right.traceRounds;
+        left.measureRounds == right.measureRounds && left.traceRounds == right.traceRounds &&
+        left.mode == right.mode && left.sglItems == right.sglItems && left.pipeline == right.pipeline &&
+        left.sourceFormat == right.sourceFormat;
+}
+
+bool IsZeroMemoryKey(const UBSHcomMemoryKey &key)
+{
+    const UBSHcomMemoryKey zero{};
+    return std::memcmp(&key, &zero, sizeof(key)) == 0;
+}
+
+bool CheckedAddAddress(uint64_t base, uint64_t offset, uint64_t bytes, uint64_t regionBytes, uint64_t &address)
+{
+    if (bytes > regionBytes || offset > regionBytes - bytes || base > std::numeric_limits<uint64_t>::max() - offset) {
+        return false;
+    }
+    address = base + offset;
+    return address <= std::numeric_limits<uint64_t>::max() - bytes;
+}
+
+uint32_t ChunkCount(uint32_t blocksPerRail, uint16_t sglItems)
+{
+    return (blocksPerRail + sglItems - 1U) / sglItems;
+}
+
+uint32_t ChunkItemCount(uint32_t blocksPerRail, uint16_t sglItems, uint32_t chunkId)
+{
+    const uint64_t first = static_cast<uint64_t>(chunkId) * sglItems;
+    return first >= blocksPerRail ? 0 : std::min<uint32_t>(sglItems, blocksPerRail - static_cast<uint32_t>(first));
 }
 
 void EncodeMemoryKey(uint8_t *&cursor, const UBSHcomMemoryKey &key)
@@ -383,6 +461,11 @@ std::array<uint8_t, kHelloWireBytes> EncodeHello(const HelloInfo &info)
     PutU64(cursor, info.destinationAddress);
     PutU64(cursor, info.destinationBytes);
     EncodeMemoryKey(cursor, info.destinationKey);
+    PutU32(cursor, info.stageRegionId);
+    PutU32(cursor, 0);
+    PutU64(cursor, info.stageAddress);
+    PutU64(cursor, info.stageBytes);
+    EncodeMemoryKey(cursor, info.stageKey);
     return payload;
 }
 
@@ -407,6 +490,13 @@ bool DecodeHello(const void *data, uint32_t size, HelloInfo &info)
     info.destinationAddress = GetU64(cursor);
     info.destinationBytes = GetU64(cursor);
     info.destinationKey = DecodeMemoryKey(cursor);
+    info.stageRegionId = GetU32(cursor);
+    if (GetU32(cursor) != 0) {
+        return false;
+    }
+    info.stageAddress = GetU64(cursor);
+    info.stageBytes = GetU64(cursor);
+    info.stageKey = DecodeMemoryKey(cursor);
     return true;
 }
 
@@ -501,7 +591,7 @@ bool ValidateCopyEntries(const std::array<CopyEntry, kBlocks> &entries, uint16_t
 }
 
 std::array<uint8_t, kCopyReqWireBytes> EncodeCopyRequest(
-    uint64_t generation, uint16_t links, const std::array<CopyEntry, kBlocks> &entries)
+    uint64_t generation, const CaseParameters &params, const std::array<CopyEntry, kBlocks> &entries)
 {
     std::array<uint8_t, kCopyReqWireBytes> payload{};
     uint8_t *cursor = payload.data();
@@ -512,13 +602,13 @@ std::array<uint8_t, kCopyReqWireBytes> EncodeCopyRequest(
     PutU32(cursor, kBlocks);
     PutU32(cursor, kBlocks);
     PutU32(cursor, kBlockBytes);
-    PutU16(cursor, kModeDirect);
-    PutU16(cursor, links);
-    PutU16(cursor, 0);
-    PutU16(cursor, kSourceFormatDirectPairs);
+    PutU16(cursor, params.mode);
+    PutU16(cursor, params.links);
+    PutU16(cursor, params.sglItems);
+    PutU16(cursor, params.sourceFormat);
     PutU32(cursor, kSourceRegionId);
     PutU32(cursor, kDestinationRegionId);
-    PutU32(cursor, 0);
+    PutU32(cursor, params.mode == kModeSgl ? kStageRegionId : 0);
     PutU32(cursor, kCopyReqHeaderBytes);
     PutU32(cursor, kCopyReqDescriptorBytes);
     PutU32(cursor, static_cast<uint32_t>(kPayloadBytes));
@@ -530,7 +620,7 @@ std::array<uint8_t, kCopyReqWireBytes> EncodeCopyRequest(
     return payload;
 }
 
-bool DecodeCopyRequest(const void *data, uint32_t size, uint64_t expectedGeneration, uint16_t expectedLinks,
+bool DecodeCopyRequest(const void *data, uint32_t size, uint64_t expectedGeneration, const CaseParameters &params,
     uint64_t sourceBytesPerRail, uint64_t destinationBytesPerRail,
     std::array<CopyEntry, kBlocks> &entries, std::string &error)
 {
@@ -545,19 +635,77 @@ bool DecodeCopyRequest(const void *data, uint32_t size, uint64_t expectedGenerat
     }
     if (GetU64(cursor) != expectedGeneration || GetU32(cursor) != kBlocks ||
         GetU32(cursor) != kBlocks || GetU32(cursor) != kBlockBytes ||
-        GetU16(cursor) != kModeDirect || GetU16(cursor) != expectedLinks ||
-        GetU16(cursor) != 0 || GetU16(cursor) != kSourceFormatDirectPairs ||
+        GetU16(cursor) != params.mode || GetU16(cursor) != params.links ||
+        GetU16(cursor) != params.sglItems || GetU16(cursor) != params.sourceFormat ||
         GetU32(cursor) != kSourceRegionId || GetU32(cursor) != kDestinationRegionId ||
-        GetU32(cursor) != 0 || GetU32(cursor) != kCopyReqHeaderBytes ||
+        GetU32(cursor) != (params.mode == kModeSgl ? kStageRegionId : 0) || GetU32(cursor) != kCopyReqHeaderBytes ||
         GetU32(cursor) != kCopyReqDescriptorBytes || GetU32(cursor) != kPayloadBytes ||
         GetU32(cursor) != 0) {
-        return fail("COPY_REQ header fields do not match direct case");
+        return fail("COPY_REQ header fields do not match negotiated case");
     }
     for (CopyEntry &entry : entries) {
         entry.remoteSourceOffset = GetU64(cursor);
         entry.localDestinationOffset = GetU64(cursor);
     }
-    return ValidateCopyEntries(entries, expectedLinks, sourceBytesPerRail, destinationBytesPerRail, error);
+    return ValidateCopyEntries(entries, params.links, sourceBytesPerRail, destinationBytesPerRail, error);
+}
+
+std::array<uint8_t, kChunkDoneWireBytes> EncodeChunkDone(const ChunkDoneInfo &info)
+{
+    std::array<uint8_t, kChunkDoneWireBytes> payload{};
+    uint8_t *cursor = payload.data();
+    PutU32(cursor, kChunkDoneMagic);
+    PutU16(cursor, kProtocolVersion);
+    PutU16(cursor, info.rail);
+    PutU64(cursor, info.generation);
+    PutU32(cursor, info.chunkId);
+    PutU32(cursor, info.firstItem);
+    PutU32(cursor, info.itemCount);
+    PutU32(cursor, info.payloadBytes);
+    PutU32(cursor, info.chunkCount);
+    PutU32(cursor, 0);
+    return payload;
+}
+
+bool DecodeChunkDone(const void *data, uint32_t size, ChunkDoneInfo &info)
+{
+    if (data == nullptr || size != kChunkDoneWireBytes) return false;
+    const uint8_t *cursor = static_cast<const uint8_t *>(data);
+    if (GetU32(cursor) != kChunkDoneMagic || GetU16(cursor) != kProtocolVersion) return false;
+    info.rail = GetU16(cursor);
+    info.generation = GetU64(cursor);
+    info.chunkId = GetU32(cursor);
+    info.firstItem = GetU32(cursor);
+    info.itemCount = GetU32(cursor);
+    info.payloadBytes = GetU32(cursor);
+    info.chunkCount = GetU32(cursor);
+    return GetU32(cursor) == 0;
+}
+
+bool ValidateChunkDone(const ChunkDoneInfo &info, uint16_t expectedRail, uint64_t expectedGeneration,
+    uint32_t blocksPerRail, uint16_t sglItems, std::string &error)
+{
+    const uint32_t chunks = ChunkCount(blocksPerRail, sglItems);
+    const uint32_t count = ChunkItemCount(blocksPerRail, sglItems, info.chunkId);
+    const uint64_t first = static_cast<uint64_t>(info.chunkId) * sglItems;
+    if (info.rail != expectedRail || info.generation != expectedGeneration || info.generation == 0 ||
+        info.chunkId >= chunks || count == 0 || info.firstItem != first || info.itemCount != count ||
+        info.payloadBytes != count * kBlockBytes || info.chunkCount != chunks) {
+        error = "CHUNK_DONE fields do not match the current generation/chunk layout";
+        return false;
+    }
+    return true;
+}
+
+bool PublishChunkReady(std::atomic<uint64_t> &slot, uint64_t generation, std::string &error)
+{
+    uint64_t previous = slot.load(std::memory_order_relaxed);
+    if (previous == generation || !slot.compare_exchange_strong(previous, generation,
+            std::memory_order_release, std::memory_order_relaxed)) {
+        error = "duplicate/concurrent CHUNK_DONE";
+        return false;
+    }
+    return true;
 }
 
 std::array<uint8_t, kDataDoneWireBytes> EncodeDataDone(uint64_t generation, uint16_t rail,
@@ -719,6 +867,90 @@ std::string CaseName(uint16_t links)
     return links == 1 ? "B1" : "B2";
 }
 
+std::string CaseName(CopyMode mode, uint16_t links, uint16_t sglItems, PipelineMode pipeline)
+{
+    if (mode == CopyMode::Direct) return CaseName(links);
+    return std::string(links == 1 ? "S1-" : "S2-") + std::to_string(sglItems) + "-" +
+        (pipeline == PipelineMode::On ? "on" : "off");
+}
+
+uint64_t ParseStrictDecimal(const std::string &name, const std::string &value, uint64_t minimum, uint64_t maximum)
+{
+    if (value.empty() || std::any_of(value.begin(), value.end(), [](unsigned char c) { return c < '0' || c > '9'; })) {
+        throw std::runtime_error("invalid " + name + ": " + value);
+    }
+    uint64_t result = 0;
+    for (const char c : value) {
+        const uint64_t digit = static_cast<uint64_t>(c - '0');
+        if (result > maximum / 10U || (result == maximum / 10U && digit > maximum % 10U))
+            throw std::runtime_error("invalid " + name + ": " + value);
+        result = result * 10U + digit;
+    }
+    if (result < minimum || result > maximum) throw std::runtime_error("invalid " + name + ": " + value);
+    return result;
+}
+
+uint16_t ResolveSglItems(CopyMode mode, const char *environment)
+{
+    if (mode == CopyMode::Direct) return 0;
+    const std::string value = environment == nullptr ? std::to_string(kDefaultSglItems) : std::string(environment);
+    return static_cast<uint16_t>(ParseStrictDecimal("RDMA_600_SGL_ITEMS", value, 1, kDesignMaxSglItems));
+}
+
+std::vector<std::string> SplitCsv(const std::string &name, const std::string &value);
+
+std::vector<uint32_t> ParseQpCaps(const char *environment, uint16_t links, bool &declared)
+{
+    declared = environment != nullptr;
+    if (!declared) return {};
+    const std::vector<std::string> fields = SplitCsv("RDMA_600_QP_MAX_SEND_SGE", environment);
+    if (fields.size() != links) {
+        throw std::runtime_error("RDMA_600_QP_MAX_SEND_SGE item count must equal --links");
+    }
+    std::vector<uint32_t> caps;
+    for (const std::string &field : fields) {
+        caps.push_back(static_cast<uint32_t>(ParseStrictDecimal("RDMA_600_QP_MAX_SEND_SGE", field, 1,
+            std::numeric_limits<uint32_t>::max())));
+    }
+    return caps;
+}
+
+void ResolveModeAndPipeline(Options &options, const std::string &mode,
+    bool pipelineSpecified, const std::string &pipeline)
+{
+    if (mode == "direct") {
+        if (pipelineSpecified) throw std::runtime_error("--pipeline is only applicable to --mode sgl");
+        options.mode = CopyMode::Direct;
+        options.pipeline = PipelineMode::Off;
+        return;
+    }
+    if (mode != "sgl") throw std::runtime_error("--mode must be direct or sgl");
+    options.mode = CopyMode::Sgl;
+    if (pipeline == "on") options.pipeline = PipelineMode::On;
+    else if (pipeline == "off") options.pipeline = PipelineMode::Off;
+    else throw std::runtime_error("--pipeline must be on or off");
+}
+
+void ValidateSglCapability(const Options &options)
+{
+    if (options.mode == CopyMode::Direct) return;
+    if (options.sglItems == 0 || options.sglItems > kCompiledSgeMax) {
+        throw std::runtime_error("UNSUPPORTED: requested SGL K=" + std::to_string(options.sglItems) +
+            " exceeds compiled NET_SGE_MAX_IOV=" + std::to_string(kCompiledSgeMax));
+    }
+    if (options.qpCapDeclared) {
+        if (options.qpMaxSendSge.size() != options.links)
+            throw std::runtime_error("QP cap declaration count does not equal --links");
+        for (uint16_t rail = 0; rail < options.links; ++rail)
+            if (options.qpMaxSendSge[rail] < options.sglItems)
+                throw std::runtime_error("UNSUPPORTED: declared QP max_send_sge on rail " +
+                    std::to_string(rail) + " is below requested SGL K");
+    } else if (options.kind == RunKind::Measure) {
+        throw std::runtime_error(
+            "SGL measure requires RDMA_600_QP_MAX_SEND_SGE from a deployment-time real-QP query");
+    }
+}
+
 uint64_t ParseUnsigned(const std::string &name, const std::string &value, uint64_t maximum)
 {
     if (value.empty()) {
@@ -775,7 +1007,9 @@ void PrintUsage(std::ostream &stream)
            << "  rdma_600 --role remote --rdma-ips <ip0[,ip1]> --listen <ep0[,ep1]> [options]\n"
            << "  rdma_600 --role local --rdma-ips <ip0[,ip1]> --peer <ep0[,ep1]> [options]\n"
            << "  rdma_600 --self-test\n\n"
-           << "Requester-driven direct cases: --links 1 (B1) or --links 2 (B2), --mode direct.\n"
+           << "Modes: --mode direct (B1/B2), or --mode sgl --pipeline on|off (S1/S2).\n"
+           << "SGL K comes from RDMA_600_SGL_ITEMS (default 16, design range 1..30).\n"
+           << "SGL measure also requires RDMA_600_QP_MAX_SEND_SGE=<cap0[,cap1]>.\n"
            << "Singular --rdma-ip/--app-cpu/--worker-cpu remain aliases for links=1.\n"
            << "Options: --kind verify|measure|trace --verify-rounds N --warmup N --rounds N\n"
            << "         --trace-rounds N (1..64 for trace) --timeout-sec N\n"
@@ -815,10 +1049,10 @@ Options ParseOptions(int argc, char **argv)
         return options;
     }
 
-    static const std::array<std::string, 17> kAllowedOptions = {
+    static const std::array<std::string, 18> kAllowedOptions = {
         "--role", "--rdma-ip", "--rdma-ips", "--listen", "--peer", "--kind", "--verify-rounds", "--warmup",
         "--rounds", "--trace-rounds", "--timeout-sec", "--app-cpu", "--app-cpus", "--worker-cpu",
-        "--worker-cpus", "--links", "--mode"};
+        "--worker-cpus", "--links", "--mode", "--pipeline"};
     for (const auto &entry : values) {
         if (std::find(kAllowedOptions.begin(), kAllowedOptions.end(), entry.first) == kAllowedOptions.end()) {
             throw std::runtime_error("unknown option: " + entry.first);
@@ -841,8 +1075,12 @@ Options ParseOptions(int argc, char **argv)
     if (options.links == 0 || kBlocks % options.links != 0) {
         throw std::runtime_error("--links must be 1 or 2 and evenly divide 600");
     }
-    if (optional("--mode", "direct") != "direct") {
-        throw std::runtime_error("this binary supports only direct Put; no SGL/staging/scatter mode is available");
+    ResolveModeAndPipeline(options, optional("--mode", "direct"), values.count("--pipeline") != 0,
+        optional("--pipeline", "on"));
+    options.sglItems = ResolveSglItems(options.mode, std::getenv("RDMA_600_SGL_ITEMS"));
+    if (options.mode == CopyMode::Sgl) {
+        options.qpMaxSendSge = ParseQpCaps(std::getenv("RDMA_600_QP_MAX_SEND_SGE"), options.links,
+            options.qpCapDeclared);
     }
 
     const std::string role = required("--role");
@@ -960,6 +1198,7 @@ Options ParseOptions(int argc, char **argv)
         throw std::runtime_error(
             "measure requires explicit app and per-rail worker CPUs for pinned busy polling");
     }
+    ValidateSglCapability(options);
     return options;
 }
 
@@ -1048,17 +1287,205 @@ struct TraceRound {
     std::array<TracePoint, kMaxLinks> remotePosted;
     std::array<TracePoint, kMaxLinks> remoteDataCallbacksDone;
     std::array<TracePoint, kMaxLinks> remoteDonePosted;
+    std::array<std::array<TracePoint, kMaxBlocksPerRail>, kMaxLinks> localChunkReady;
+    std::array<std::array<TracePoint, kMaxBlocksPerRail>, kMaxLinks> localScatterBegin;
+    std::array<std::array<TracePoint, kMaxBlocksPerRail>, kMaxLinks> localScatterEnd;
+    std::array<std::array<TracePoint, kMaxBlocksPerRail>, kMaxLinks> remoteChunkPosted;
+    std::array<std::array<TracePoint, kMaxBlocksPerRail>, kMaxLinks> remoteChunkDonePosted;
 };
+
+bool ValidateHelloMetadata(const HelloInfo &hello, const CaseParameters &parameters, uint16_t rail,
+    uint64_t railBytes, uint64_t stageBytes)
+{
+    uint64_t ignored = 0;
+    if (!SameParams(hello.params, parameters) || hello.rail != rail ||
+        hello.destinationRegionId != kDestinationRegionId || hello.destinationAddress == 0 ||
+        hello.destinationAddress > std::numeric_limits<uintptr_t>::max() || hello.destinationBytes != railBytes ||
+        !CheckedAddAddress(hello.destinationAddress, 0, railBytes, railBytes, ignored)) return false;
+    if (parameters.mode == kModeDirect) {
+        return hello.stageRegionId == 0 && hello.stageAddress == 0 && hello.stageBytes == 0 &&
+            IsZeroMemoryKey(hello.stageKey);
+    }
+    return parameters.mode == kModeSgl && hello.stageRegionId == kStageRegionId && hello.stageAddress != 0 &&
+        hello.stageAddress <= std::numeric_limits<uintptr_t>::max() && hello.stageBytes == stageBytes &&
+        CheckedAddAddress(hello.stageAddress, 0, stageBytes, stageBytes, ignored);
+}
+
+void SelfTestSglMapping(uint16_t links, uint16_t sglItems, PipelineMode pipeline)
+{
+    const uint32_t blocksPerRail = kBlocks / links;
+    const uint32_t chunks = ChunkCount(blocksPerRail, sglItems);
+    std::array<AlignedBuffer, kMaxLinks> source;
+    std::array<AlignedBuffer, kMaxLinks> expected;
+    std::array<AlignedBuffer, kMaxLinks> actual;
+    std::array<AlignedBuffer, kMaxLinks> stage;
+    std::array<std::array<std::atomic<uint64_t>, kMaxBlocksPerRail>, kMaxLinks> ready{};
+    std::array<std::array<uint64_t, kMaxBlocksPerRail>, kMaxLinks> consumed{};
+    for (uint16_t rail = 0; rail < links; ++rail) {
+        const size_t sparseBytes = static_cast<size_t>(blocksPerRail) * kStrideBytes;
+        source[rail].Allocate(sparseBytes);
+        expected[rail].Allocate(sparseBytes);
+        actual[rail].Allocate(sparseBytes);
+        stage[rail].Allocate(static_cast<size_t>(blocksPerRail) * kBlockBytes);
+    }
+    for (uint64_t generation : {uint64_t{5}, uint64_t{6}}) {
+        auto entries = MakeCopyEntries(generation, links);
+        // Exercise the contract that source offsets may repeat while destinations may not.
+        entries[1].remoteSourceOffset = entries[0].remoteSourceOffset;
+        std::string error;
+        const uint64_t sparseBytes = static_cast<uint64_t>(blocksPerRail) * kStrideBytes;
+        if (!ValidateCopyEntries(entries, links, sparseBytes, sparseBytes, error))
+            throw std::runtime_error("SGL self-test mapping rejected: " + error);
+        for (uint16_t rail = 0; rail < links; ++rail) {
+            std::memset(source[rail].Data(), kSourceGapSentinel, source[rail].Size());
+            std::memset(expected[rail].Data(), kDstGapSentinel, expected[rail].Size());
+            std::memset(actual[rail].Data(), kDstGapSentinel, actual[rail].Size());
+            std::memset(stage[rail].Data(), 0xcc, stage[rail].Size());
+            for (uint32_t slot = 0; slot < blocksPerRail; ++slot)
+                FillBlock(source[rail].Data() + static_cast<size_t>(slot) * kStrideBytes, generation,
+                    static_cast<uint32_t>(rail) * blocksPerRail + slot);
+        }
+        for (uint32_t index = 0; index < kBlocks; ++index) {
+            const uint16_t rail = RailForRequestIndex(index, links);
+            std::memcpy(expected[rail].Data() + entries[index].localDestinationOffset,
+                source[rail].Data() + entries[index].remoteSourceOffset, kBlockBytes);
+        }
+
+        uint32_t scattered = 0;
+        bool requestCallbackDone = false;
+        const uint32_t totalChunks = chunks * links;
+        for (uint32_t reverse = totalChunks; reverse > 0; --reverse) {
+            const uint32_t linear = reverse - 1;
+            const uint16_t rail = static_cast<uint16_t>(linear % links);
+            const uint32_t chunk = linear / links;
+            const uint32_t first = chunk * sglItems;
+            const uint32_t count = ChunkItemCount(blocksPerRail, sglItems, chunk);
+            for (uint32_t item = 0; item < count; ++item) {
+                const CopyEntry &entry = entries[static_cast<uint32_t>(rail) * blocksPerRail + first + item];
+                std::memcpy(stage[rail].Data() + static_cast<size_t>(first + item) * kBlockBytes,
+                    source[rail].Data() + entry.remoteSourceOffset, kBlockBytes);
+            }
+            const ChunkDoneInfo info{rail, generation, chunk, first, count, count * kBlockBytes, chunks};
+            if (!ValidateChunkDone(info, rail, generation, blocksPerRail, sglItems, error))
+                throw std::runtime_error("valid CHUNK_DONE rejected: " + error);
+            if (!PublishChunkReady(ready[rail][chunk], generation, error))
+                throw std::runtime_error("valid CHUNK_DONE state transition rejected");
+            if (reverse == totalChunks && PublishChunkReady(ready[rail][chunk], generation, error))
+                throw std::runtime_error("duplicate CHUNK_DONE state transition was accepted");
+            if (pipeline == PipelineMode::On) {
+                for (uint32_t item = 0; item < count; ++item) {
+                    const CopyEntry &entry = entries[static_cast<uint32_t>(rail) * blocksPerRail + first + item];
+                    std::memcpy(actual[rail].Data() + entry.localDestinationOffset,
+                        stage[rail].Data() + static_cast<size_t>(first + item) * kBlockBytes, kBlockBytes);
+                }
+                consumed[rail][chunk] = generation;
+                ++scattered;
+            }
+            if (reverse > 1 && scattered == totalChunks)
+                throw std::runtime_error("slow-rail/chunk gate completed early");
+        }
+        if (pipeline == PipelineMode::Off) {
+            for (uint16_t rail = 0; rail < links; ++rail)
+                for (uint32_t chunk = 0; chunk < chunks; ++chunk) {
+                    if (ready[rail][chunk].load(std::memory_order_acquire) != generation)
+                        throw std::runtime_error("off pipeline observed an unready chunk");
+                    const uint32_t first = chunk * sglItems;
+                    const uint32_t count = ChunkItemCount(blocksPerRail, sglItems, chunk);
+                    for (uint32_t item = 0; item < count; ++item) {
+                        const CopyEntry &entry = entries[static_cast<uint32_t>(rail) * blocksPerRail + first + item];
+                        std::memcpy(actual[rail].Data() + entry.localDestinationOffset,
+                            stage[rail].Data() + static_cast<size_t>(first + item) * kBlockBytes, kBlockBytes);
+                    }
+                    consumed[rail][chunk] = generation;
+                    ++scattered;
+                }
+        }
+        if (scattered != totalChunks || (scattered == totalChunks && requestCallbackDone))
+            throw std::runtime_error("request callback delay gate self-test failed");
+        requestCallbackDone = true;
+        if (!(scattered == totalChunks && requestCallbackDone))
+            throw std::runtime_error("completed SGL generation was not released");
+        for (uint16_t rail = 0; rail < links; ++rail) {
+            if (std::memcmp(expected[rail].Data(), actual[rail].Data(), actual[rail].Size()) != 0)
+                throw std::runtime_error("SGL scatter differs from direct reference");
+            for (uint32_t chunk = 0; chunk < chunks; ++chunk)
+                if (consumed[rail][chunk] != generation)
+                    throw std::runtime_error("multi-generation consumed state was not published");
+        }
+    }
+}
 
 bool RunSelfTest()
 {
     try {
+        for (const std::string bad : {"", "-1", " 8", "8 ", "+8", "0", "31", "999999999999999999999"}) {
+            bool rejected = false;
+            try { (void)ResolveSglItems(CopyMode::Sgl, bad.c_str()); } catch (...) { rejected = true; }
+            if (!rejected) throw std::runtime_error("bad RDMA_600_SGL_ITEMS was accepted: " + bad);
+        }
+        if (ResolveSglItems(CopyMode::Direct, "not-even-parsed") != 0 ||
+            ResolveSglItems(CopyMode::Sgl, nullptr) != kDefaultSglItems)
+            throw std::runtime_error("SGL K default/direct isolation failed");
+        bool capsDeclared = false;
+        const auto caps = ParseQpCaps("8,16", 2, capsDeclared);
+        if (!capsDeclared || caps.size() != 2 || caps[0] != 8 || caps[1] != 16)
+            throw std::runtime_error("QP cap declaration parsing failed");
+        for (const char *badCaps : {"", "16", "16,", "0,16", "16, 16"}) {
+            bool rejected = false;
+            try { (void)ParseQpCaps(badCaps, 2, capsDeclared); } catch (...) { rejected = true; }
+            if (!rejected) throw std::runtime_error("bad QP cap declaration was accepted");
+        }
+        {
+            Options parsed{};
+            ResolveModeAndPipeline(parsed, "sgl", false, "on");
+            if (parsed.mode != CopyMode::Sgl || parsed.pipeline != PipelineMode::On)
+                throw std::runtime_error("default SGL pipeline parsing failed");
+            ResolveModeAndPipeline(parsed, "sgl", true, "off");
+            if (parsed.pipeline != PipelineMode::Off) throw std::runtime_error("off pipeline parsing failed");
+            bool rejected = false;
+            try { ResolveModeAndPipeline(parsed, "direct", true, "off"); } catch (...) { rejected = true; }
+            if (!rejected) throw std::runtime_error("direct accepted --pipeline");
+            rejected = false;
+            try { ResolveModeAndPipeline(parsed, "unknown", false, "on"); } catch (...) { rejected = true; }
+            if (!rejected) throw std::runtime_error("unknown mode was accepted");
+            Options capability{};
+            capability.mode = CopyMode::Sgl;
+            capability.links = 1;
+            capability.sglItems = static_cast<uint16_t>(std::min<uint32_t>(8, kCompiledSgeMax));
+            capability.kind = RunKind::Verify;
+            ValidateSglCapability(capability);
+            capability.kind = RunKind::Measure;
+            rejected = false;
+            try { ValidateSglCapability(capability); } catch (...) { rejected = true; }
+            if (!rejected) throw std::runtime_error("SGL measure accepted missing QP cap declaration");
+            capability.qpCapDeclared = true;
+            capability.qpMaxSendSge = {static_cast<uint32_t>(capability.sglItems - 1)};
+            rejected = false;
+            try { ValidateSglCapability(capability); } catch (...) { rejected = true; }
+            if (!rejected) throw std::runtime_error("SGL accepted QP cap below K");
+            if (kCompiledSgeMax < 30) {
+                capability.qpMaxSendSge = {30};
+                capability.sglItems = 30;
+                rejected = false;
+                try { ValidateSglCapability(capability); } catch (...) { rejected = true; }
+                if (!rejected) throw std::runtime_error("K30 accepted by current cap16 dependency");
+            }
+        }
+
         for (uint16_t links : {uint16_t{1}, uint16_t{2}}) {
-            CaseParameters parameters;
+          for (CopyMode mode : {CopyMode::Direct, CopyMode::Sgl}) {
+            for (uint16_t sglItems : (mode == CopyMode::Direct ? std::vector<uint16_t>{0} :
+                    std::vector<uint16_t>{1, 8, 16, 30})) {
+            CaseParameters parameters{};
             parameters.links = links;
             parameters.verifyRounds = 20;
             parameters.traceRounds = 3;
+            parameters.mode = static_cast<uint16_t>(mode);
+            parameters.sglItems = sglItems;
+            parameters.pipeline = mode == CopyMode::Sgl ? kPipelineOn : kPipelineOff;
+            parameters.sourceFormat = mode == CopyMode::Sgl ? kSourceFormatSparse600 : kSourceFormatDirectPairs;
             const uint64_t railBytes = static_cast<uint64_t>(kBlocks / links) * kStrideBytes;
+            const uint64_t stageBytes = static_cast<uint64_t>(kBlocks / links) * kBlockBytes;
             for (uint16_t rail = 0; rail < links; ++rail) {
                 UBSHcomMemoryKey key{};
                 for (size_t index = 0; index < std::size(key.keys); ++index) {
@@ -1069,18 +1496,39 @@ bool RunSelfTest()
                     key.eid[index] = static_cast<uint8_t>(index + rail);
                 }
 
-                HelloInfo helloInfo{parameters, rail, kDestinationRegionId, 0x12345000U + railBytes * rail,
-                    railBytes, key};
+                HelloInfo helloInfo{};
+                helloInfo.params = parameters;
+                helloInfo.rail = rail;
+                helloInfo.destinationRegionId = kDestinationRegionId;
+                helloInfo.destinationAddress = 0x12345000U + railBytes * rail;
+                helloInfo.destinationBytes = railBytes;
+                helloInfo.destinationKey = key;
+                if (mode == CopyMode::Sgl) {
+                    helloInfo.stageRegionId = kStageRegionId;
+                    helloInfo.stageAddress = 0x22345000U + stageBytes * rail;
+                    helloInfo.stageBytes = stageBytes;
+                    helloInfo.stageKey = key;
+                }
                 const auto hello = EncodeHello(helloInfo);
                 HelloInfo decodedHello{};
                 if (!DecodeHello(hello.data(), static_cast<uint32_t>(hello.size()), decodedHello) ||
-                    !SameParams(parameters, decodedHello.params) || decodedHello.rail != rail ||
-                    decodedHello.destinationRegionId != kDestinationRegionId ||
-                    decodedHello.destinationAddress != helloInfo.destinationAddress ||
-                    decodedHello.destinationBytes != railBytes ||
+                    !ValidateHelloMetadata(decodedHello, parameters, rail, railBytes, stageBytes) ||
                     std::memcmp(&decodedHello.destinationKey, &key, sizeof(key)) != 0) {
                     throw std::runtime_error("HELLO wire round trip failed");
                 }
+                HelloInfo invalidMetadata = decodedHello;
+                if (mode == CopyMode::Direct) invalidMetadata.stageKey.keys[0] = 1;
+                else invalidMetadata.stageBytes++;
+                if (ValidateHelloMetadata(invalidMetadata, parameters, rail, railBytes, stageBytes))
+                    throw std::runtime_error("invalid stage key/range metadata was accepted");
+                auto badHello = hello;
+                badHello[4 + kParametersWireBytes + 2] = 1;
+                if (DecodeHello(badHello.data(), static_cast<uint32_t>(badHello.size()), decodedHello))
+                    throw std::runtime_error("HELLO reserved field was accepted");
+                std::vector<uint8_t> trailingHello(hello.begin(), hello.end());
+                trailingHello.push_back(0);
+                if (DecodeHello(trailingHello.data(), static_cast<uint32_t>(trailingHello.size()), decodedHello))
+                    throw std::runtime_error("HELLO trailing byte was accepted");
 
                 ReadyInfo ready{parameters, rail, kSourceRegionId, kStrideBytes, railBytes};
                 const auto readyWire = EncodeReady(ready);
@@ -1091,6 +1539,10 @@ bool RunSelfTest()
                     decodedReady.sourceAlignment != kStrideBytes || decodedReady.sourceBytes != railBytes) {
                     throw std::runtime_error("READY wire round trip failed");
                 }
+                auto badReady = readyWire;
+                badReady[4 + kParametersWireBytes + 2] = 1;
+                if (DecodeReady(badReady.data(), static_cast<uint32_t>(badReady.size()), decodedReady))
+                    throw std::runtime_error("READY reserved field was accepted");
 
                 const auto token = EncodeToken(kFinishMagic, kOpFinish, 7, rail);
                 uint64_t decodedGeneration = 0;
@@ -1108,23 +1560,37 @@ bool RunSelfTest()
             if (!ValidateCopyEntries(entries, links, railBytes, railBytes, validationError)) {
                 throw std::runtime_error("generated sparse mapping failed validation: " + validationError);
             }
-            const auto request = EncodeCopyRequest(generation, links, entries);
+            auto outOfRangeEntries = entries;
+            outOfRangeEntries[0].remoteSourceOffset = std::numeric_limits<uint64_t>::max();
+            if (ValidateCopyEntries(outOfRangeEntries, links, railBytes, railBytes, validationError))
+                throw std::runtime_error("overflowing source offset was accepted");
+            const auto request = EncodeCopyRequest(generation, parameters, entries);
             std::array<CopyEntry, kBlocks> decodedEntries{};
-            if (!DecodeCopyRequest(request.data(), static_cast<uint32_t>(request.size()), generation, links,
+            if (!DecodeCopyRequest(request.data(), static_cast<uint32_t>(request.size()), generation, parameters,
                     railBytes, railBytes, decodedEntries, validationError) ||
                 std::memcmp(entries.data(), decodedEntries.data(), sizeof(entries)) != 0) {
                 throw std::runtime_error("COPY_REQ wire round trip failed: " + validationError);
             }
-            if (DecodeCopyRequest(request.data(), static_cast<uint32_t>(request.size() - 1), generation, links,
+            if (DecodeCopyRequest(request.data(), static_cast<uint32_t>(request.size() - 1), generation, parameters,
                     railBytes, railBytes, decodedEntries, validationError)) {
                 throw std::runtime_error("truncated COPY_REQ was accepted");
             }
+            std::vector<uint8_t> trailingRequest(request.begin(), request.end());
+            trailingRequest.push_back(0);
+            if (DecodeCopyRequest(trailingRequest.data(), static_cast<uint32_t>(trailingRequest.size()),
+                    generation, parameters, railBytes, railBytes, decodedEntries, validationError))
+                throw std::runtime_error("COPY_REQ trailing byte was accepted");
+            auto badHeader = request;
+            badHeader[63] = 1;
+            if (DecodeCopyRequest(badHeader.data(), static_cast<uint32_t>(badHeader.size()), generation,
+                    parameters, railBytes, railBytes, decodedEntries, validationError))
+                throw std::runtime_error("COPY_REQ reserved field was accepted");
             auto duplicateRequest = request;
             const uint32_t duplicateIndex = blocksPerRail > 1 ? 1 : 0;
             std::copy_n(duplicateRequest.data() + kCopyReqHeaderBytes + 8, 8,
                 duplicateRequest.data() + kCopyReqHeaderBytes + duplicateIndex * kCopyEntryWireBytes + 8);
             if (DecodeCopyRequest(duplicateRequest.data(), static_cast<uint32_t>(duplicateRequest.size()),
-                    generation, links, railBytes, railBytes, decodedEntries, validationError)) {
+                    generation, parameters, railBytes, railBytes, decodedEntries, validationError)) {
                 throw std::runtime_error("duplicate destination within one rail was accepted");
             }
 
@@ -1166,8 +1632,89 @@ bool RunSelfTest()
                     throw std::runtime_error("DATA_DONE wire round trip failed");
                 }
             }
+            if (mode == CopyMode::Sgl) {
+                const uint32_t chunks = ChunkCount(blocksPerRail, sglItems);
+                const uint32_t tail = ChunkItemCount(blocksPerRail, sglItems, chunks - 1);
+                if (chunks == 0 || tail == 0 || tail > sglItems ||
+                    (chunks - 1) * sglItems + tail != blocksPerRail)
+                    throw std::runtime_error("SGL chunk/tail layout failed");
+                for (uint16_t rail = 0; rail < links; ++rail) {
+                    const ChunkDoneInfo done{rail, generation, chunks - 1, (chunks - 1) * sglItems,
+                        tail, tail * kBlockBytes, chunks};
+                    const auto wire = EncodeChunkDone(done);
+                    ChunkDoneInfo decoded{};
+                    if (!DecodeChunkDone(wire.data(), static_cast<uint32_t>(wire.size()), decoded) ||
+                        !ValidateChunkDone(decoded, rail, generation, blocksPerRail, sglItems, validationError))
+                        throw std::runtime_error("CHUNK_DONE tail round trip failed");
+                    if (DecodeChunkDone(wire.data(), static_cast<uint32_t>(wire.size() - 1), decoded))
+                        throw std::runtime_error("truncated CHUNK_DONE was accepted");
+                    std::vector<uint8_t> trailingChunk(wire.begin(), wire.end());
+                    trailingChunk.push_back(0);
+                    if (DecodeChunkDone(trailingChunk.data(), static_cast<uint32_t>(trailingChunk.size()), decoded))
+                        throw std::runtime_error("CHUNK_DONE trailing byte was accepted");
+                    auto badChunkWire = wire;
+                    badChunkWire.back() = 1;
+                    if (DecodeChunkDone(badChunkWire.data(), static_cast<uint32_t>(badChunkWire.size()), decoded))
+                        throw std::runtime_error("CHUNK_DONE reserved field was accepted");
+                    ChunkDoneInfo wrong = decoded;
+                    wrong.generation++;
+                    if (ValidateChunkDone(wrong, rail, generation, blocksPerRail, sglItems, validationError))
+                        throw std::runtime_error("wrong-generation CHUNK_DONE accepted");
+                    wrong = decoded; wrong.chunkId = chunks;
+                    if (ValidateChunkDone(wrong, rail, generation, blocksPerRail, sglItems, validationError))
+                        throw std::runtime_error("out-of-range CHUNK_DONE accepted");
+                }
+            }
+            }
+          }
         }
-        std::cout << "SELF_TEST: PASS (sparse-copy-v4, B1/B2, 9664-byte request, 600 direct blocks)"
+
+        uint64_t address = 0;
+        if (CheckedAddAddress(std::numeric_limits<uint64_t>::max() - 3, 2, 4, 8, address) ||
+            CheckedAddAddress(0x1000, 7, 2, 8, address))
+            throw std::runtime_error("checked address arithmetic accepted overflow/range violation");
+        {
+            CaseParameters on{};
+            on.mode = kModeSgl; on.sglItems = 8; on.pipeline = kPipelineOn;
+            on.sourceFormat = kSourceFormatSparse600;
+            CaseParameters off = on;
+            off.pipeline = kPipelineOff;
+            CaseParameters unknown = on;
+            unknown.mode = 99;
+            if (SameParams(on, off) || SameParams(on, unknown))
+                throw std::runtime_error("mode/pipeline handshake mismatch was accepted");
+            const ReadyInfo offReady{off, 0, kSourceRegionId, kStrideBytes,
+                static_cast<uint64_t>(kBlocks) * kStrideBytes};
+            const auto offWire = EncodeReady(offReady);
+            ReadyInfo offDecoded{};
+            if (!DecodeReady(offWire.data(), static_cast<uint32_t>(offWire.size()), offDecoded) ||
+                !SameParams(off, offDecoded.params))
+                throw std::runtime_error("pipeline=off parameter wire round trip failed");
+            const std::array<std::array<uint32_t, 3>, 2> expectedChunks{{{{75, 38, 20}}, {{38, 19, 10}}}};
+            const std::array<std::array<uint32_t, 3>, 2> expectedTails{{{{8, 8, 30}}, {{4, 12, 30}}}};
+            const std::array<uint16_t, 3> items{{8, 16, 30}};
+            for (uint16_t links : {uint16_t{1}, uint16_t{2}}) {
+                const uint32_t blocks = kBlocks / links;
+                for (size_t i = 0; i < items.size(); ++i) {
+                    if (ChunkCount(blocks, items[i]) != expectedChunks[links - 1][i] ||
+                        ChunkItemCount(blocks, items[i], expectedChunks[links - 1][i] - 1) !=
+                            expectedTails[links - 1][i])
+                        throw std::runtime_error("documented SGL chunk table mismatch");
+                }
+            }
+        }
+        for (uint16_t links : {uint16_t{1}, uint16_t{2}})
+            for (uint16_t sglItems : {uint16_t{1}, uint16_t{8}, uint16_t{16}, uint16_t{30}})
+                for (PipelineMode pipeline : {PipelineMode::On, PipelineMode::Off})
+                    SelfTestSglMapping(links, sglItems, pipeline);
+
+        const auto copyError = EncodeCopyError(9, 3, 4, 5);
+        uint64_t errorGeneration = 0; uint32_t stage = 0, code = 0, detail = 0;
+        if (!DecodeCopyError(copyError.data(), static_cast<uint32_t>(copyError.size()), errorGeneration,
+                stage, code, detail) || errorGeneration != 9 || stage != 3 || code != 4 || detail != 5)
+            throw std::runtime_error("COPY_ERROR round trip failed");
+        std::cout << "SELF_TEST: PASS (sparse-copy-v5, B1/B2 + S1/S2, K=1/8/16/30, on/off, "
+                     "9664-byte sparse-600 request, reordered multi-generation scatter)"
                   << std::endl;
         return true;
     } catch (const std::exception &error) {
@@ -1218,19 +1765,31 @@ struct RailState {
     bool memoryRegistered = false;
     UBSHcomMemoryKey memoryKey{};
     UBSHcomMemoryKey peerDestinationKey{};
+    AlignedBuffer stageBuffer;
+    UBSHcomRegMemoryRegion stageMemoryRegion;
+    bool stageMemoryRegistered = false;
+    UBSHcomMemoryKey stageMemoryKey{};
     uintptr_t peerDestinationAddress = 0;
     uint64_t peerDestinationBytes = 0;
     uint64_t peerSourceBytes = 0;
+    uintptr_t peerStageAddress = 0;
+    uint64_t peerStageBytes = 0;
+    UBSHcomMemoryKey peerStageKey{};
     std::array<UBSHcomOneSideRequest, kMaxBlocksPerRail> putRequests{};
+    std::array<UBSHcomOneSideRequest, kMaxBlocksPerRail> sglIovs{};
+    std::array<UBSHcomOneSideSglRequest, kMaxBlocksPerRail> sglRequests{};
     std::array<uint8_t, kHelloWireBytes> helloPayload{};
     std::array<uint8_t, kReadyWireBytes> readyPayload{};
     std::array<uint8_t, kReadyWireBytes> readyResponse{};
     std::array<uint8_t, kDataDoneWireBytes> dataDonePayload{};
+    std::array<std::array<uint8_t, kChunkDoneWireBytes>, kMaxBlocksPerRail> chunkDonePayloads{};
     std::array<uint8_t, kTokenWireBytes> finishPayload{};
     std::array<uint8_t, kTokenWireBytes> finishAckPayload{};
     std::atomic<bool> helloClaimed{false};
     std::atomic<bool> helloSeen{false};
     std::atomic<uint64_t> dataDoneGeneration{0};
+    std::array<std::atomic<uint64_t>, kMaxBlocksPerRail> chunkReadyGeneration{};
+    std::array<uint64_t, kMaxBlocksPerRail> chunkConsumedGeneration{};
     std::atomic<uint64_t> finishGeneration{0};
     std::atomic<uint64_t> finishAckGeneration{0};
     AppOwnedCounters appCounters;
@@ -1259,6 +1818,7 @@ struct alignas(kCounterAlignment) SecondaryRailExecutor {
     std::atomic<uint64_t> completed{0};
     std::atomic<RailCommand> command{RailCommand::None};
     std::atomic<uint64_t> generation{0};
+    std::atomic<uint64_t> deadlineNs{0};
 };
 
 class SparseCopyBenchmark {
@@ -1270,8 +1830,14 @@ public:
         mParams.warmupRounds = mOptions.warmupRounds;
         mParams.measureRounds = mOptions.measureRounds;
         mParams.traceRounds = mOptions.traceRounds;
+        mParams.mode = static_cast<uint16_t>(mOptions.mode);
+        mParams.sglItems = mOptions.sglItems;
+        mParams.pipeline = static_cast<uint16_t>(mOptions.pipeline);
+        mParams.sourceFormat = mOptions.mode == CopyMode::Direct ? kSourceFormatDirectPairs : kSourceFormatSparse600;
         mBlocksPerRail = kBlocks / mOptions.links;
+        mChunksPerRail = mOptions.mode == CopyMode::Sgl ? ChunkCount(mBlocksPerRail, mOptions.sglItems) : 0;
         if (TraceEnabled()) {
+            mTrace.reset(new TraceRound[mParams.traceRounds]);
             const uint64_t first = static_cast<uint64_t>(mParams.verifyRounds) + 1;
             for (uint32_t i = 0; i < mParams.traceRounds; ++i) mTrace[i].generation = first + i;
         }
@@ -1288,17 +1854,16 @@ public:
                 PrintListening();
                 WaitForChannels();
                 RunRemote();
-                PrintRemoteStatus();
             } else {
                 ConnectLocal();
                 RunLocal();
-                PrintLocalResult();
             }
             CheckFatal("normal completion");
             if (!DrainUntilComplete()) throw std::runtime_error("callbacks did not drain before teardown");
             TeardownFixedRails();
             StopSecondaryRailThread();
             if (TraceEnabled()) EmitTrace();
+            if (mOptions.role == Role::Local) PrintLocalResult(); else PrintRemoteStatus();
             return 0;
         } catch (const std::exception &error) {
             RecordFailure(error.what());
@@ -1360,11 +1925,12 @@ private:
                 if (issued == seen) { CpuRelax(); continue; }
                 const RailCommand command = mSecondary.command.load(std::memory_order_relaxed);
                 const uint64_t generation = mSecondary.generation.load(std::memory_order_relaxed);
+                const uint64_t deadlineNs = mSecondary.deadlineNs.load(std::memory_order_relaxed);
                 try {
                     switch (command) {
                         case RailCommand::Setup: SetupRail(1); break;
                         case RailCommand::ConnectAndHandshake: ConnectAndHandshakeRail(1); break;
-                        case RailCommand::ProcessRemoteRound: ProcessRemoteRail(1, generation); break;
+                        case RailCommand::ProcessRemoteRound: ProcessRemoteRail(1, generation, deadlineNs); break;
                         case RailCommand::Finish: FinishRail(1); break;
                         case RailCommand::Teardown: TeardownRail(1); break;
                         case RailCommand::None: throw std::runtime_error("empty secondary rail command");
@@ -1383,7 +1949,7 @@ private:
         }
     }
 
-    uint64_t IssueSecondaryRailCommand(RailCommand command, uint64_t generation = 0)
+    uint64_t IssueSecondaryRailCommand(RailCommand command, uint64_t generation = 0, uint64_t deadlineNs = 0)
     {
         if (mOptions.links != 2 || !mSecondary.thread.joinable())
             throw std::runtime_error("secondary rail thread is unavailable");
@@ -1391,6 +1957,7 @@ private:
         if (mSecondary.completed.load(std::memory_order_acquire) != previous)
             throw std::runtime_error("secondary rail already has an outstanding command");
         mSecondary.generation.store(generation, std::memory_order_relaxed);
+        mSecondary.deadlineNs.store(deadlineNs, std::memory_order_relaxed);
         mSecondary.command.store(command, std::memory_order_relaxed);
         mSecondary.issued.store(previous + 1, std::memory_order_release);
         return previous + 1;
@@ -1497,6 +2064,20 @@ private:
             state.memoryRegion.GetSize() < state.buffer.Size())
             throw std::runtime_error("MR does not cover rail " + std::to_string(rail));
         if (mOptions.role == Role::Remote) FillRemoteSourceRail(rail, 0);
+        if (mOptions.role == Role::Local && mOptions.mode == CopyMode::Sgl) {
+            const size_t stageBytes = static_cast<size_t>(mBlocksPerRail) * kBlockBytes;
+            state.stageBuffer.Allocate(stageBytes);
+            std::memset(state.stageBuffer.Data(), 0, state.stageBuffer.Size());
+            RequireOk(state.service->RegisterMemoryRegion(reinterpret_cast<uintptr_t>(state.stageBuffer.Data()),
+                state.stageBuffer.Size(), state.stageMemoryRegion),
+                ("Register stage memory region rail " + std::to_string(rail)).c_str());
+            state.stageMemoryRegistered = true;
+            state.stageMemoryKey = {};
+            state.stageMemoryRegion.GetMemoryKey(state.stageMemoryKey);
+            if (state.stageMemoryRegion.GetAddress() != reinterpret_cast<uintptr_t>(state.stageBuffer.Data()) ||
+                state.stageMemoryRegion.GetSize() < state.stageBuffer.Size())
+                throw std::runtime_error("stage MR does not cover rail " + std::to_string(rail));
+        }
     }
 
     void PrintListening() const
@@ -1572,8 +2153,19 @@ private:
             mRails[rail].channel = channel;
         }
         RailState &state = mRails[rail];
-        HelloInfo hello{mParams, rail, kDestinationRegionId,
-            reinterpret_cast<uintptr_t>(state.buffer.Data()), state.buffer.Size(), state.memoryKey};
+        HelloInfo hello{};
+        hello.params = mParams;
+        hello.rail = rail;
+        hello.destinationRegionId = kDestinationRegionId;
+        hello.destinationAddress = reinterpret_cast<uintptr_t>(state.buffer.Data());
+        hello.destinationBytes = state.buffer.Size();
+        hello.destinationKey = state.memoryKey;
+        if (mOptions.mode == CopyMode::Sgl) {
+            hello.stageRegionId = kStageRegionId;
+            hello.stageAddress = reinterpret_cast<uintptr_t>(state.stageBuffer.Data());
+            hello.stageBytes = state.stageBuffer.Size();
+            hello.stageKey = state.stageMemoryKey;
+        }
         state.helloPayload = EncodeHello(hello);
         UBSHcomRequest request(state.helloPayload.data(), static_cast<uint32_t>(state.helloPayload.size()), kOpHello);
         UBSHcomResponse response(state.readyResponse.data(), static_cast<uint32_t>(state.readyResponse.size()));
@@ -1601,6 +2193,7 @@ private:
             case kOpHello: return OnHello(rail, context);
             case kOpCopyReq: return OnCopyReq(rail, context);
             case kOpDataDone: return OnDataDone(rail, context);
+            case kOpChunkDone: return OnChunkDone(rail, context);
             case kOpCopyError: return OnCopyError(rail, context);
             case kOpFinish: return OnFinish(rail, context);
             case kOpFinishAck: return OnFinishAck(rail, context);
@@ -1615,10 +2208,9 @@ private:
         }
         HelloInfo hello{};
         const uint64_t railBytes = static_cast<uint64_t>(mBlocksPerRail) * kStrideBytes;
+        const uint64_t stageBytes = static_cast<uint64_t>(mBlocksPerRail) * kBlockBytes;
         if (!DecodeHello(context.MessageData(), context.MessageDataLen(), hello) ||
-            !SameParams(hello.params, mParams) || hello.rail != rail ||
-            hello.destinationRegionId != kDestinationRegionId || hello.destinationAddress == 0 ||
-            hello.destinationBytes != railBytes) {
+            !ValidateHelloMetadata(hello, mParams, rail, railBytes, stageBytes)) {
             RecordFailure("invalid HELLO on rail " + std::to_string(rail)); return -1;
         }
         RailState &state = mRails[rail];
@@ -1629,6 +2221,9 @@ private:
         state.peerDestinationAddress = static_cast<uintptr_t>(hello.destinationAddress);
         state.peerDestinationBytes = hello.destinationBytes;
         state.peerDestinationKey = hello.destinationKey;
+        state.peerStageAddress = static_cast<uintptr_t>(hello.stageAddress);
+        state.peerStageBytes = hello.stageBytes;
+        state.peerStageKey = hello.stageKey;
         ReadyInfo ready{mParams, rail, kSourceRegionId, kStrideBytes, state.buffer.Size()};
         state.readyPayload = EncodeReady(ready);
         Callback *callback = NewSendCallback(rail);
@@ -1689,6 +2284,33 @@ private:
         return 0;
     }
 
+    int OnChunkDone(uint16_t rail, UBSHcomServiceContext &context) noexcept
+    {
+        if (mOptions.role != Role::Local || mOptions.mode != CopyMode::Sgl) {
+            RecordFailure("CHUNK_DONE on wrong role/mode"); return -1;
+        }
+        ChunkDoneInfo info{};
+        if (!DecodeChunkDone(context.MessageData(), context.MessageDataLen(), info)) {
+            RecordFailure("invalid CHUNK_DONE wire on rail " + std::to_string(rail)); return -1;
+        }
+        const uint64_t expectedGeneration = mExpectedGeneration.load(std::memory_order_acquire);
+        std::string error;
+        if (!ValidateChunkDone(info, rail, expectedGeneration, mBlocksPerRail, mOptions.sglItems, error)) {
+            RecordFailure(error + " rail=" + std::to_string(rail)); return -1;
+        }
+        std::atomic<uint64_t> &slot = mRails[rail].chunkReadyGeneration[info.chunkId];
+        if (!PublishChunkReady(slot, info.generation, error)) {
+            RecordFailure(error + " rail=" + std::to_string(rail) +
+                " chunk=" + std::to_string(info.chunkId));
+            return -1;
+        }
+        size_t trace = 0;
+        if (TraceIndex(info.generation, trace))
+            PublishCallbackTrace(info.generation, mTrace[trace].localChunkReady[rail][info.chunkId],
+                "local_chunk_ready");
+        return 0;
+    }
+
     int OnCopyError(uint16_t rail, UBSHcomServiceContext &context) noexcept
     {
         if (mOptions.role != Role::Local || rail != 0) {
@@ -1744,20 +2366,21 @@ private:
         return 0;
     }
 
-    Callback *NewDataCallback(uint16_t rail, uint64_t generation, bool last)
+    Callback *NewDataCallback(uint16_t rail, uint64_t generation, uint64_t completionTarget)
     {
-        return UBSHcomNewCallback([this, rail, generation, last](UBSHcomServiceContext &context) {
+        return UBSHcomNewCallback([this, rail, generation, completionTarget](UBSHcomServiceContext &context) {
             ActiveCallbackGuard guard(mActiveCallbacks);
             if (context.Result() != 0)
                 RecordFailure("Put callback failed rail " + std::to_string(rail) + ": " +
                     std::to_string(context.Result()));
-            if (last) {
+            const uint64_t completed =
+                mRails[rail].callbackCounters.dataDoneCallbacks.fetch_add(1, std::memory_order_acq_rel) + 1;
+            if (completed == completionTarget) {
                 size_t i = 0;
                 if (TraceIndex(generation, i))
                     PublishCallbackTrace(generation, mTrace[i].remoteDataCallbacksDone[rail],
                         "remote_data_callbacks_done");
             }
-            mRails[rail].callbackCounters.dataDoneCallbacks.fetch_add(1, std::memory_order_release);
         }, std::placeholders::_1);
     }
 
@@ -1784,6 +2407,9 @@ private:
             mMeasureWallStartNs = NowNs();
             for (uint32_t i = 0; i < mParams.measureRounds; ++i, ++generation) SparseCopy(generation, true);
             mMeasureWallEndNs = NowNs();
+            if (mMeasureWallEndNs <= mMeasureWallStartNs || mSparseCopyNs.size() != mParams.measureRounds ||
+                std::any_of(mSparseCopyNs.begin(), mSparseCopyNs.end(), [](uint64_t sample) { return sample == 0; }))
+                throw std::runtime_error("invalid/non-positive measurement timing");
             VerifyLocalDestination(MakeCopyEntries(mParams.verifyRounds, mOptions.links), mParams.verifyRounds);
         }
         for (uint32_t i = 0; i < mParams.traceRounds; ++i, ++generation) SparseCopy(generation, false);
@@ -1795,6 +2421,7 @@ private:
     void SparseCopy(uint64_t generation, bool measure)
     {
         const uint64_t start = NowNs();
+        const uint64_t deadlineNs = DeadlineFrom(start);
         size_t trace = 0;
         if (TraceIndex(generation, trace)) mTrace[trace].localBegin.Publish(start);
         const uint64_t seed = generation <= mParams.verifyRounds ? generation : mParams.verifyRounds;
@@ -1806,18 +2433,26 @@ private:
         for (uint16_t rail = 0; rail < mOptions.links; ++rail)
             if (mRails[rail].peerSourceBytes != railBytes)
                 throw std::runtime_error("invalid remote source metadata");
-        mCopyReqPayload = EncodeCopyRequest(generation, mOptions.links, mCopyEntries);
+        mCopyReqPayload = EncodeCopyRequest(generation, mParams, mCopyEntries);
+        if (NowNs() >= deadlineNs) throw std::runtime_error("deadline exceeded while preparing COPY_REQ");
+        if (mOptions.mode == CopyMode::Sgl) {
+            mExpectedGeneration.store(generation, std::memory_order_release);
+        }
         const uint64_t expectedSend = ExpectedSendCallbacks(0) + 1;
         PostAsyncSend(0, ChannelCopyRequired(0, "COPY_REQ"), mCopyReqPayload.data(),
             mCopyReqPayload.size(), kOpCopyReq);
         if (TraceIndex(generation, trace)) mTrace[trace].localRequestPosted.Publish(NowNs());
-        WaitData("sparse_copy completion", [this, generation, expectedSend] {
-            if (mRails[0].callbackCounters.sendDoneCallbacks.load(std::memory_order_acquire) < expectedSend)
-                return false;
-            for (uint16_t rail = 0; rail < mOptions.links; ++rail)
-                if (mRails[rail].dataDoneGeneration.load(std::memory_order_acquire) < generation) return false;
-            return true;
-        });
+        if (mOptions.mode == CopyMode::Direct) {
+            WaitDataUntil("sparse_copy completion", deadlineNs, [this, generation, expectedSend] {
+                if (mRails[0].callbackCounters.sendDoneCallbacks.load(std::memory_order_acquire) < expectedSend)
+                    return false;
+                for (uint16_t rail = 0; rail < mOptions.links; ++rail)
+                    if (mRails[rail].dataDoneGeneration.load(std::memory_order_acquire) < generation) return false;
+                return true;
+            });
+        } else {
+            WaitAndScatterSgl(generation, expectedSend, deadlineNs);
+        }
         const uint64_t end = NowNs();
         if (TraceIndex(generation, trace)) mTrace[trace].localEnd.Publish(end);
         if (measure) mSparseCopyNs.push_back(end - start);
@@ -1828,14 +2463,17 @@ private:
         WaitData("all HELLO", [this] { return AllHellosSeen(); });
         for (uint64_t generation = 1; generation <= mParams.TotalRounds(); ++generation) {
             try {
-                ReceivePendingCopyRequest();
+                const uint64_t deadlineNs = DeadlineFrom(NowNs());
+                ReceivePendingCopyRequest(deadlineNs);
                 DecodeActiveCopyRequest(generation);
                 uint64_t sequence = 0;
                 if (mOptions.links == 2)
-                    sequence = IssueSecondaryRailCommand(RailCommand::ProcessRemoteRound, generation);
-                ProcessRemoteRail(0, generation);
+                    sequence = IssueSecondaryRailCommand(RailCommand::ProcessRemoteRound, generation, deadlineNs);
+                ProcessRemoteRail(0, generation, deadlineNs);
                 if (mOptions.links == 2)
-                    WaitSecondaryRailCommand(sequence, "rail 1 remote copy");
+                    WaitDataUntil("rail 1 remote copy", deadlineNs, [this, sequence] {
+                        return mSecondary.completed.load(std::memory_order_acquire) >= sequence;
+                    });
             } catch (...) {
                 TrySendCopyError(generation, kCopyErrorStageRemoteProcess, kCopyErrorCodeRequestFailed, 0);
                 throw;
@@ -1851,9 +2489,10 @@ private:
         return true;
     }
 
-    void ReceivePendingCopyRequest()
+    void ReceivePendingCopyRequest(uint64_t deadlineNs)
     {
-        WaitData("COPY_REQ", [this] { return mPendingCopyReqPublished.load(std::memory_order_acquire); });
+        WaitDataUntil("COPY_REQ", deadlineNs,
+            [this] { return mPendingCopyReqPublished.load(std::memory_order_acquire); });
         mActiveCopyReqBytes = mPendingCopyReqBytes;
         if (mActiveCopyReqBytes <= mActiveCopyReqPayload.size())
             std::memcpy(mActiveCopyReqPayload.data(), mPendingCopyReqPayload.data(), mActiveCopyReqBytes);
@@ -1865,24 +2504,30 @@ private:
     {
         const uint64_t railBytes = static_cast<uint64_t>(mBlocksPerRail) * kStrideBytes;
         std::string error;
-        if (!DecodeCopyRequest(mActiveCopyReqPayload.data(), mActiveCopyReqBytes, generation, mOptions.links,
+        if (!DecodeCopyRequest(mActiveCopyReqPayload.data(), mActiveCopyReqBytes, generation, mParams,
             railBytes, railBytes, mActiveCopyEntries, error))
             throw std::runtime_error("invalid COPY_REQ: " + error);
     }
 
-    void ProcessRemoteRail(uint16_t rail, uint64_t generation)
+    void ProcessRemoteRail(uint16_t rail, uint64_t generation, uint64_t deadlineNs)
     {
         RailState &state = mRails[rail];
         if (generation <= mParams.verifyRounds) FillRemoteSourceRail(rail, generation);
+        if (mOptions.mode == CopyMode::Sgl) {
+            ProcessRemoteSglRail(rail, generation, deadlineNs);
+            return;
+        }
         BuildRemotePutRequests(rail);
         const uint64_t expectedData = state.appCounters.attemptedDataCallbacks + mBlocksPerRail;
         const UBSHcomChannelPtr channel = ChannelCopyRequired(rail, "remote copy");
         for (uint32_t i = 0; i < mBlocksPerRail; ++i) {
-            Callback *callback = NewDataCallback(rail, generation, i + 1 == mBlocksPerRail);
+            Callback *callback = NewDataCallback(rail, generation, expectedData);
             if (callback == nullptr) throw std::runtime_error("Put callback allocation failed");
             ++state.appCounters.attemptedDataCallbacks;
             const int rc = channel->Put(state.putRequests[i], callback);
             if (rc != 0) throw std::runtime_error("Put failed: " + std::to_string(rc));
+            if (((i + 1) & (kDataDeadlineCheckInterval - 1)) == 0 && NowNs() >= deadlineNs)
+                throw std::runtime_error("deadline exceeded while posting direct writes");
         }
         size_t trace = 0;
         if (TraceIndex(generation, trace)) mTrace[trace].remotePosted[rail].Publish(NowNs());
@@ -1890,9 +2535,148 @@ private:
         const uint64_t expectedSend = ExpectedSendCallbacks(rail) + 1;
         PostAsyncSend(rail, channel, state.dataDonePayload.data(), state.dataDonePayload.size(), kOpDataDone);
         if (TraceIndex(generation, trace)) mTrace[trace].remoteDonePosted[rail].Publish(NowNs());
-        WaitData("remote callbacks", [this, rail, expectedData, expectedSend] {
+        WaitDataUntil("remote callbacks", deadlineNs, [this, rail, expectedData, expectedSend] {
             return mRails[rail].callbackCounters.dataDoneCallbacks.load(std::memory_order_acquire) >= expectedData &&
                 mRails[rail].callbackCounters.sendDoneCallbacks.load(std::memory_order_acquire) >= expectedSend;
+        });
+    }
+
+    void ProcessRemoteSglRail(uint16_t rail, uint64_t generation, uint64_t deadlineNs)
+    {
+        RailState &state = mRails[rail];
+        BuildRemoteSglRequests(rail);
+        const uint64_t expectedData = state.appCounters.attemptedDataCallbacks + mChunksPerRail;
+        const uint64_t expectedSend = ExpectedSendCallbacks(rail) + mChunksPerRail;
+        const UBSHcomChannelPtr channel = ChannelCopyRequired(rail, "remote SGL copy");
+        for (uint32_t chunk = 0; chunk < mChunksPerRail; ++chunk) {
+            Callback *callback = NewDataCallback(rail, generation, expectedData);
+            if (callback == nullptr) throw std::runtime_error("PutV callback allocation failed");
+            ++state.appCounters.attemptedDataCallbacks;
+            const int rc = channel->PutV(state.sglRequests[chunk], callback);
+            if (rc != 0) throw std::runtime_error("PutV failed: " + std::to_string(rc));
+            size_t trace = 0;
+            if (TraceIndex(generation, trace))
+                mTrace[trace].remoteChunkPosted[rail][chunk].Publish(NowNs());
+            const uint32_t count = ChunkItemCount(mBlocksPerRail, mOptions.sglItems, chunk);
+            const ChunkDoneInfo done{rail, generation, chunk, chunk * mOptions.sglItems, count,
+                count * kBlockBytes, mChunksPerRail};
+            state.chunkDonePayloads[chunk] = EncodeChunkDone(done);
+            PostAsyncSend(rail, channel, state.chunkDonePayloads[chunk].data(), kChunkDoneWireBytes, kOpChunkDone);
+            if (TraceIndex(generation, trace))
+                mTrace[trace].remoteChunkDonePosted[rail][chunk].Publish(NowNs());
+            if (((chunk + 1) & (kDataDeadlineCheckInterval - 1)) == 0 && NowNs() >= deadlineNs)
+                throw std::runtime_error("deadline exceeded while posting SGL chunks");
+        }
+        WaitDataUntil("remote SGL callbacks", deadlineNs, [this, rail, expectedData, expectedSend] {
+            return mRails[rail].callbackCounters.dataDoneCallbacks.load(std::memory_order_acquire) >= expectedData &&
+                mRails[rail].callbackCounters.sendDoneCallbacks.load(std::memory_order_acquire) >= expectedSend;
+        });
+    }
+
+    void BuildRemoteSglRequests(uint16_t rail)
+    {
+        RailState &state = mRails[rail];
+        const uint32_t globalFirst = static_cast<uint32_t>(rail) * mBlocksPerRail;
+        const uint64_t sourceBase = reinterpret_cast<uintptr_t>(state.buffer.Data());
+        for (uint32_t chunk = 0; chunk < mChunksPerRail; ++chunk) {
+            const uint32_t first = chunk * mOptions.sglItems;
+            const uint32_t count = ChunkItemCount(mBlocksPerRail, mOptions.sglItems, chunk);
+            for (uint32_t item = 0; item < count; ++item) {
+                const CopyEntry &entry = mActiveCopyEntries[globalFirst + first + item];
+                uint64_t localAddress = 0;
+                uint64_t remoteAddress = 0;
+                const uint64_t stageOffset = static_cast<uint64_t>(first + item) * kBlockBytes;
+                if (!CheckedAddAddress(sourceBase, entry.remoteSourceOffset, kBlockBytes, state.buffer.Size(),
+                        localAddress) ||
+                    !CheckedAddAddress(state.peerStageAddress, stageOffset, kBlockBytes, state.peerStageBytes,
+                        remoteAddress))
+                    throw std::runtime_error("SGL address overflow/out of range rail=" + std::to_string(rail));
+                UBSHcomOneSideRequest &iov = state.sglIovs[first + item];
+                iov.lAddress = static_cast<uintptr_t>(localAddress);
+                iov.rAddress = static_cast<uintptr_t>(remoteAddress);
+                iov.lKey = state.memoryKey;
+                iov.rKey = state.peerStageKey;
+                iov.size = kBlockBytes;
+            }
+            state.sglRequests[chunk].iov = state.sglIovs.data() + first;
+            state.sglRequests[chunk].iovCount = static_cast<uint16_t>(count);
+        }
+    }
+
+    void ScatterChunk(uint16_t rail, uint32_t chunk, uint64_t generation)
+    {
+        RailState &state = mRails[rail];
+        if (state.chunkConsumedGeneration[chunk] == generation)
+            throw std::runtime_error("chunk scattered twice");
+        size_t trace = 0;
+        if (TraceIndex(generation, trace)) mTrace[trace].localScatterBegin[rail][chunk].Publish(NowNs());
+        const uint32_t first = chunk * mOptions.sglItems;
+        const uint32_t count = ChunkItemCount(mBlocksPerRail, mOptions.sglItems, chunk);
+        const uint32_t globalFirst = static_cast<uint32_t>(rail) * mBlocksPerRail;
+        for (uint32_t item = 0; item < count; ++item) {
+            const CopyEntry &entry = mCopyEntries[globalFirst + first + item];
+            uint64_t destination = 0;
+            uint64_t stage = 0;
+            if (!CheckedAddAddress(reinterpret_cast<uintptr_t>(state.buffer.Data()), entry.localDestinationOffset,
+                    kBlockBytes, state.buffer.Size(), destination) ||
+                !CheckedAddAddress(reinterpret_cast<uintptr_t>(state.stageBuffer.Data()),
+                    static_cast<uint64_t>(first + item) * kBlockBytes, kBlockBytes, state.stageBuffer.Size(), stage))
+                throw std::runtime_error("scatter address overflow/out of range rail=" + std::to_string(rail));
+            std::memcpy(reinterpret_cast<void *>(static_cast<uintptr_t>(destination)),
+                reinterpret_cast<const void *>(static_cast<uintptr_t>(stage)), kBlockBytes);
+        }
+        state.chunkConsumedGeneration[chunk] = generation;
+        if (TraceIndex(generation, trace)) mTrace[trace].localScatterEnd[rail][chunk].Publish(NowNs());
+    }
+
+    bool AllChunksReady(uint64_t generation) const noexcept
+    {
+        for (uint16_t rail = 0; rail < mOptions.links; ++rail)
+            for (uint32_t chunk = 0; chunk < mChunksPerRail; ++chunk)
+                if (mRails[rail].chunkReadyGeneration[chunk].load(std::memory_order_acquire) != generation)
+                    return false;
+        return true;
+    }
+
+    void WaitAndScatterSgl(uint64_t generation, uint64_t expectedRequestSend, uint64_t deadlineNs)
+    {
+        const uint32_t totalChunks = mChunksPerRail * mOptions.links;
+        uint32_t scattered = 0;
+        if (mOptions.pipeline == PipelineMode::Off) {
+            WaitDataUntil("all SGL chunks ready", deadlineNs, [this, generation] { return AllChunksReady(generation); });
+            for (uint16_t rail = 0; rail < mOptions.links; ++rail)
+                for (uint32_t chunk = 0; chunk < mChunksPerRail; ++chunk) {
+                    ScatterChunk(rail, chunk, generation);
+                    ++scattered;
+                }
+        } else {
+            uint32_t spins = 0;
+            uint32_t cursor = 0;
+            while (scattered < totalChunks) {
+                bool progress = false;
+                for (uint32_t examined = 0; examined < totalChunks; ++examined) {
+                    const uint32_t linear = (cursor + examined) % totalChunks;
+                    const uint16_t rail = static_cast<uint16_t>(linear % mOptions.links);
+                    const uint32_t chunk = linear / mOptions.links;
+                    RailState &state = mRails[rail];
+                    if (state.chunkConsumedGeneration[chunk] != generation &&
+                        state.chunkReadyGeneration[chunk].load(std::memory_order_acquire) == generation) {
+                        ScatterChunk(rail, chunk, generation);
+                        ++scattered;
+                        cursor = (linear + 1) % totalChunks;
+                        progress = true;
+                    }
+                }
+                if (!progress) {
+                    CheckFatal("pipelined scatter"); CpuRelax();
+                    if ((++spins & (kDataDeadlineCheckInterval - 1)) == 0 && NowNs() >= deadlineNs)
+                        throw std::runtime_error("timed out waiting for pipelined scatter");
+                }
+            }
+        }
+        if (scattered != totalChunks) throw std::runtime_error("scatter completed with wrong chunk count");
+        WaitDataUntil("COPY_REQ callback after scatter", deadlineNs, [this, expectedRequestSend] {
+            return mRails[0].callbackCounters.sendDoneCallbacks.load(std::memory_order_acquire) >= expectedRequestSend;
         });
     }
 
@@ -1903,8 +2687,15 @@ private:
         for (uint32_t i = 0; i < mBlocksPerRail; ++i) {
             const CopyEntry &entry = mActiveCopyEntries[first + i];
             UBSHcomOneSideRequest &request = state.putRequests[i];
-            request.lAddress = reinterpret_cast<uintptr_t>(state.buffer.Data()) + entry.remoteSourceOffset;
-            request.rAddress = state.peerDestinationAddress + entry.localDestinationOffset;
+            uint64_t localAddress = 0;
+            uint64_t remoteAddress = 0;
+            if (!CheckedAddAddress(reinterpret_cast<uintptr_t>(state.buffer.Data()), entry.remoteSourceOffset,
+                    kBlockBytes, state.buffer.Size(), localAddress) ||
+                !CheckedAddAddress(state.peerDestinationAddress, entry.localDestinationOffset, kBlockBytes,
+                    state.peerDestinationBytes, remoteAddress))
+                throw std::runtime_error("direct address overflow/out of range rail=" + std::to_string(rail));
+            request.lAddress = static_cast<uintptr_t>(localAddress);
+            request.rAddress = static_cast<uintptr_t>(remoteAddress);
             request.lKey = state.memoryKey;
             request.rKey = state.peerDestinationKey;
             request.size = kBlockBytes;
@@ -1927,7 +2718,13 @@ private:
             const uint32_t sourceSlot = static_cast<uint32_t>(entries[index].remoteSourceOffset / kStrideBytes);
             const uint32_t globalBlock = static_cast<uint32_t>(rail) * mBlocksPerRail + sourceSlot;
             std::string error;
-            const uint8_t *destination = mRails[rail].buffer.Data() + entries[index].localDestinationOffset;
+            uint64_t destinationAddress = 0;
+            if (!CheckedAddAddress(reinterpret_cast<uintptr_t>(mRails[rail].buffer.Data()),
+                    entries[index].localDestinationOffset, kStrideBytes, mRails[rail].buffer.Size(),
+                    destinationAddress))
+                throw std::runtime_error("verification address overflow/out of range");
+            const uint8_t *destination =
+                reinterpret_cast<const uint8_t *>(static_cast<uintptr_t>(destinationAddress));
             if (!VerifyBlock(destination, generation, globalBlock, error) || !VerifyGap(destination, error))
                 throw std::runtime_error("request " + std::to_string(index) + ": " + error);
         }
@@ -1993,18 +2790,30 @@ private:
             mRails[rail].callbackCounters.workerAttemptedSendCallbacks.load(std::memory_order_acquire);
     }
 
-    template <typename Predicate> void WaitData(const char *what, Predicate predicate)
+    uint64_t DeadlineFrom(uint64_t startNs) const
+    {
+        const uint64_t budget = static_cast<uint64_t>(mOptions.timeoutSec) * 1000000000ULL;
+        if (startNs > std::numeric_limits<uint64_t>::max() - budget)
+            throw std::runtime_error("deadline overflow");
+        return startNs + budget;
+    }
+
+    template <typename Predicate> void WaitDataUntil(const char *what, uint64_t deadlineNs, Predicate predicate)
     {
         CheckFatal(what);
-        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(mOptions.timeoutSec);
         uint32_t spins = 0;
         while (!predicate()) {
             CheckFatal(what); CpuRelax();
-            if ((++spins & (kDataDeadlineCheckInterval - 1)) == 0 &&
-                std::chrono::steady_clock::now() >= deadline)
+            if ((++spins & (kDataDeadlineCheckInterval - 1)) == 0 && NowNs() >= deadlineNs)
                 throw std::runtime_error(std::string("timed out waiting for ") + what);
         }
         CheckFatal(what);
+        if (NowNs() >= deadlineNs) throw std::runtime_error(std::string("deadline exceeded while completing ") + what);
+    }
+
+    template <typename Predicate> void WaitData(const char *what, Predicate predicate)
+    {
+        WaitDataUntil(what, DeadlineFrom(NowNs()), predicate);
     }
 
     template <typename Predicate> void WaitControl(const char *what, Predicate predicate)
@@ -2119,6 +2928,9 @@ private:
         UBSHcomChannelPtr channel;
         { std::lock_guard<std::mutex> lock(mChannelsMutex); channel = state.channel; state.channel.Set(nullptr); }
         if (state.service != nullptr && channel != nullptr) state.service->Disconnect(channel);
+        if (state.service != nullptr && state.stageMemoryRegistered) {
+            state.service->DestroyMemoryRegion(state.stageMemoryRegion); state.stageMemoryRegistered = false;
+        }
         if (state.service != nullptr && state.memoryRegistered) {
             state.service->DestroyMemoryRegion(state.memoryRegion); state.memoryRegistered = false;
         }
@@ -2127,12 +2939,16 @@ private:
         }
     }
 
-    void EmitTracePoint(const char *event, uint64_t generation, int rail, const TracePoint &point) const
+    void EmitTracePoint(const char *event, uint64_t generation, int rail, const TracePoint &point,
+        int chunk = -1) const
     {
-        std::cout << "{\"record_type\":\"trace\",\"trace_schema\":\"sparse-copy-v4-dual-rail-v1\","
+        std::cout << "{\"record_type\":\"trace\",\"trace_schema\":\"sparse-copy-v5-dual-rail-sgl-v1\","
                   << "\"host_role\":\"" << RoleName(mOptions.role) << "\",\"case\":\""
-                  << CaseName(mOptions.links) << "\",\"generation\":" << generation << ",\"rail\":";
+                  << CaseName(mOptions.mode, mOptions.links, mOptions.sglItems, mOptions.pipeline)
+                  << "\",\"generation\":" << generation << ",\"rail\":";
         if (rail < 0) std::cout << "null"; else std::cout << rail;
+        std::cout << ",\"chunk_id\":";
+        if (chunk < 0) std::cout << "null"; else std::cout << chunk;
         std::cout << ",\"event\":\"" << event << "\",\"timestamp_ns\":" << point.Read(event) << "}" << std::endl;
     }
 
@@ -2143,15 +2959,36 @@ private:
             if (mOptions.role == Role::Local) {
                 EmitTracePoint("local_begin", t.generation, -1, t.localBegin);
                 EmitTracePoint("local_request_posted", t.generation, 0, t.localRequestPosted);
-                for (uint16_t rail = 0; rail < mOptions.links; ++rail)
-                    EmitTracePoint("local_data_done", t.generation, rail, t.localDataDone[rail]);
+                for (uint16_t rail = 0; rail < mOptions.links; ++rail) {
+                    if (mOptions.mode == CopyMode::Direct) {
+                        EmitTracePoint("local_data_done", t.generation, rail, t.localDataDone[rail]);
+                    } else {
+                        for (uint32_t chunk = 0; chunk < mChunksPerRail; ++chunk) {
+                            EmitTracePoint("local_chunk_ready", t.generation, rail,
+                                t.localChunkReady[rail][chunk], chunk);
+                            EmitTracePoint("local_scatter_begin", t.generation, rail,
+                                t.localScatterBegin[rail][chunk], chunk);
+                            EmitTracePoint("local_scatter_end", t.generation, rail,
+                                t.localScatterEnd[rail][chunk], chunk);
+                        }
+                    }
+                }
                 EmitTracePoint("local_end", t.generation, -1, t.localEnd);
             } else {
                 EmitTracePoint("remote_request_received", t.generation, 0, t.remoteRequestReceived);
                 for (uint16_t rail = 0; rail < mOptions.links; ++rail) {
-                    EmitTracePoint("remote_posted", t.generation, rail, t.remotePosted[rail]);
+                    if (mOptions.mode == CopyMode::Direct) {
+                        EmitTracePoint("remote_posted", t.generation, rail, t.remotePosted[rail]);
+                        EmitTracePoint("remote_done_posted", t.generation, rail, t.remoteDonePosted[rail]);
+                    } else {
+                        for (uint32_t chunk = 0; chunk < mChunksPerRail; ++chunk) {
+                            EmitTracePoint("remote_chunk_posted", t.generation, rail,
+                                t.remoteChunkPosted[rail][chunk], chunk);
+                            EmitTracePoint("remote_chunk_done_posted", t.generation, rail,
+                                t.remoteChunkDonePosted[rail][chunk], chunk);
+                        }
+                    }
                     EmitTracePoint("remote_data_callbacks_done", t.generation, rail, t.remoteDataCallbacksDone[rail]);
-                    EmitTracePoint("remote_done_posted", t.generation, rail, t.remoteDonePosted[rail]);
                 }
             }
         }
@@ -2161,25 +2998,60 @@ private:
     {
         std::ostringstream out;
         out << std::fixed << std::setprecision(3)
-            << "{\"schema_version\":4,\"protocol\":\"sparse-copy-v4-dual-rail\""
+            << "{\"schema_version\":5,\"protocol\":\"sparse-copy-v5-dual-rail-sgl\""
             << ",\"measurement\":\"local-sparse-copy\",\"result_role\":\"local\",\"case\":\""
-            << CaseName(mOptions.links) << "\",\"status\":\"ok\",\"commit\":\"" << RDMA_600_GIT_COMMIT
-            << "\",\"role\":\"local\",\"kind\":\"" << KindName(mOptions.kind)
-            << "\",\"optimization\":\"stage1.5-AB\",\"data_wait\":\"busy-poll-relax\""
+            << CaseName(mOptions.mode, mOptions.links, mOptions.sglItems, mOptions.pipeline)
+            << "\",\"status\":\"ok\",\"commit\":\"" << RDMA_600_GIT_COMMIT
+            << "\",\"build_type\":\"" << RDMA_600_BUILD_TYPE << "\",\"cplusplus\":" << __cplusplus
+            << ",\"role\":\"local\",\"kind\":\"" << KindName(mOptions.kind)
+            << "\",\"optimization\":\""
+            << (mOptions.mode == CopyMode::Direct ? "stage1.5-AB" : "stage3-sgl-pipeline")
+            << "\",\"data_wait\":\"busy-poll-relax\""
             << ",\"deadline_check_interval\":256,\"counter_alignment_bytes\":" << kCounterAlignment
             << ",\"callback_allocation\":\"per-request\",\"links\":" << mOptions.links
             << ",\"services\":" << mOptions.links << ",\"blocks\":600,\"blocks_per_rail\":" << mBlocksPerRail
-            << ",\"block_bytes\":1024,\"payload_bytes_per_call\":614400,\"mode\":\"direct\""
+            << ",\"block_bytes\":1024,\"payload_bytes_per_call\":614400,\"mode\":\""
+            << (mOptions.mode == CopyMode::Direct ? "direct" : "sgl") << "\",\"sgl_items\":"
+            << mOptions.sglItems << ",\"pipeline\":\""
+            << (mOptions.pipeline == PipelineMode::On ? "on" : "off") << "\""
             << ",\"remote_layout\":\"per-rail-direct-stride-4096\""
             << ",\"request_index_rail_partition\":\"contiguous-equal\",\"tls_enabled\":false"
             << ",\"internal_multirail\":false,\"channel_link_count\":1,\"rounds_in_flight\":1"
+            << ",\"hcom_multiservice_contract\":\""
+            << (mOptions.links == 2 ? "diagnostic-unsupported-by-hcom-contract" : "not-applicable") << "\""
             << ",\"application_submit_threads\":" << mOptions.links
             << ",\"rail_thread_affinity\":\"fixed-setup-to-drain-one-thread-per-service\""
-            << ",\"source_format\":\"direct-pairs\",\"source_address_count\":600"
+            << ",\"source_format\":\""
+            << (mOptions.mode == CopyMode::Direct ? "direct-pairs" : "sparse-600")
+            << "\",\"source_address_count\":600"
             << ",\"destination_address_count\":600,\"request_descriptor_bytes\":9600"
             << ",\"request_bytes\":9664,\"request_send_wr_per_call\":1"
-            << ",\"data_wr_per_call_expected\":600,\"completion_send_wr_per_call_expected\":"
-            << mOptions.links << ",\"imm_events_per_call_expected\":0,\"ack_wr_per_call\":0"
+            << ",\"stage_bytes_total\":"
+            << (mOptions.mode == CopyMode::Sgl ? kPayloadBytes : 0)
+            << ",\"chunks_per_rail\":" << mChunksPerRail
+            << ",\"chunks_total\":" << mChunksPerRail * mOptions.links
+            << ",\"data_wr_per_call_expected\":"
+            << (mOptions.mode == CopyMode::Direct ? kBlocks : mChunksPerRail * mOptions.links)
+            << ",\"putv_api_calls_per_call_expected\":"
+            << (mOptions.mode == CopyMode::Sgl ? mChunksPerRail * mOptions.links : 0)
+            << ",\"completion_send_wr_per_call_expected\":"
+            << (mOptions.mode == CopyMode::Direct ? mOptions.links : mChunksPerRail * mOptions.links)
+            << ",\"verbs_trace_status\":\"not-collected\",\"imm_events_per_call_expected\":0,\"ack_wr_per_call\":0"
+            << ",\"compiled_sge_cap\":" << kCompiledSgeMax
+            << ",\"compiled_sge_cap_source\":\"ubs-comm-public-header\""
+            << ",\"linked_library_sge_cap_validation\":\"not-programmatically-verified\""
+            << ",\"qp_cap_source\":\""
+            << (mOptions.mode == CopyMode::Direct ? "not-applicable" :
+                (mOptions.qpCapDeclared ? "external-declaration" : "unknown")) << "\""
+            << ",\"qp_cap_validation\":\""
+            << (mOptions.mode == CopyMode::Direct ? "not-applicable" :
+                (mOptions.qpCapDeclared ? "declared-not-programmatically-verified" : "QP_CAP_PENDING")) << "\""
+            << ",\"qp_max_send_sge_declared\":[";
+        for (size_t rail = 0; rail < mOptions.qpMaxSendSge.size(); ++rail) {
+            if (rail != 0) out << ',';
+            out << mOptions.qpMaxSendSge[rail];
+        }
+        out << "]"
             << ",\"verify_passed\":true,\"trace_rounds\":" << mParams.traceRounds;
         if (mOptions.kind != RunKind::Measure) {
             out << ",\"measure_rounds\":0,\"sparse_copy_avg_us\":null,\"sparse_copy_p50_us\":null"
@@ -2204,14 +3076,30 @@ private:
 
     void PrintRemoteStatus() const
     {
-        std::cout << "{\"schema_version\":4,\"protocol\":\"sparse-copy-v4-dual-rail\",\"case\":\""
-                  << CaseName(mOptions.links) << "\",\"role\":\"remote\",\"status\":\"ok\",\"processed_calls\":"
-                  << mParams.TotalRounds() << ",\"links\":" << mOptions.links << "}" << std::endl;
+        std::cout << "{\"schema_version\":5,\"protocol\":\"sparse-copy-v5-dual-rail-sgl\",\"case\":\""
+                  << CaseName(mOptions.mode, mOptions.links, mOptions.sglItems, mOptions.pipeline)
+                  << "\",\"role\":\"remote\",\"status\":\"ok\",\"commit\":\""
+                  << RDMA_600_GIT_COMMIT << "\",\"build_type\":\"" << RDMA_600_BUILD_TYPE
+                  << "\",\"processed_calls\":"
+                  << mParams.TotalRounds() << ",\"links\":" << mOptions.links << ",\"mode\":\""
+                  << (mOptions.mode == CopyMode::Direct ? "direct" : "sgl") << "\",\"sgl_items\":"
+                  << mOptions.sglItems << ",\"pipeline\":\""
+                  << (mOptions.pipeline == PipelineMode::On ? "on" : "off")
+                  << "\",\"hcom_multiservice_contract\":\""
+                  << (mOptions.links == 2 ? "diagnostic-unsupported-by-hcom-contract" : "not-applicable")
+                  << "\",\"compiled_sge_cap\":" << kCompiledSgeMax << ",\"qp_cap_source\":\""
+                  << (mOptions.mode == CopyMode::Direct ? "not-applicable" :
+                      (mOptions.qpCapDeclared ? "external-declaration" : "unknown"))
+                  << "\",\"qp_cap_validation\":\""
+                  << (mOptions.mode == CopyMode::Direct ? "not-applicable" :
+                      (mOptions.qpCapDeclared ? "declared-not-programmatically-verified" : "QP_CAP_PENDING"))
+                  << "\"}" << std::endl;
     }
 
     Options mOptions;
     CaseParameters mParams;
     uint32_t mBlocksPerRail = kBlocks;
+    uint32_t mChunksPerRail = 0;
     std::array<RailState, kMaxLinks> mRails{};
     std::atomic<bool> mRemoteReady{false};
     std::atomic<bool> mTearingDown{false};
@@ -2221,6 +3109,7 @@ private:
     mutable std::mutex mChannelsMutex;
     std::condition_variable mChannelCv;
     alignas(kCounterAlignment) std::atomic<uint64_t> mActiveCallbacks{0};
+    alignas(kCounterAlignment) std::atomic<uint64_t> mExpectedGeneration{0};
     std::array<CopyEntry, kBlocks> mCopyEntries{};
     std::array<CopyEntry, kBlocks> mActiveCopyEntries{};
     std::array<uint8_t, kCopyReqWireBytes> mCopyReqPayload{};
@@ -2231,7 +3120,7 @@ private:
     std::atomic<bool> mPendingCopyReqOccupied{false};
     std::atomic<bool> mPendingCopyReqPublished{false};
     std::array<uint8_t, kCopyErrorWireBytes> mCopyErrorPayload{};
-    std::array<TraceRound, kMaxTraceRounds> mTrace{};
+    std::unique_ptr<TraceRound[]> mTrace;
     std::vector<uint64_t> mSparseCopyNs;
     uint64_t mMeasureWallStartNs = 0;
     uint64_t mMeasureWallEndNs = 0;

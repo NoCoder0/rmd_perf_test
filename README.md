@@ -1,90 +1,59 @@
-# RDMA 600 × 1 KiB — requester-driven direct B1/B2
+# RDMA 600 × 1 KiB：direct 与阶段3 SGL 流水 scatter
 
-阶段3工作分支为 `duo_card_sgl`，起点 `duo_card@b3f4e4e43ff87ffe2a1544a648bc0b01904b3806`。新增设计见 [STAGE3_DESIGN_CN.md](STAGE3_DESIGN_CN.md)，main的完整历史设计文档见 [参考索引](docs/main_reference/REFERENCE_INDEX_CN.md)。下文记录继承的direct基线；阶段3实现状态由后续报告单独登记。
+本分支 `duo_card_sgl` 在双 rail 固定线程 direct 基线上完成阶段3。local 是调用者、最终 destination/stage 拥有者和唯一主计时端；remote 拥有 sparse source 并发起 RDMA WRITE。状态为 `IMPLEMENTED / LOCAL_SELF_TEST_PASS / TARGET_BUILD_AND_HW_PENDING`，不能据本地检查声称 Linux 链接、真实 QP 顺序、双 NIC 或性能已通过。
 
-本分支在 `duo_card` 的双 rail 固定线程实现上迁入 requester-driven `sparse_copy`。当前代码状态为本地协议/语法检查通过，目标 Linux/AArch64 构建和双机 RDMA 验证仍为 `HW_PENDING`。
+协议统一为 `sparse-copy-v5-dual-rail-sgl`。每次调用都在计时内生成、校验并发送 600 个 source/destination offset，COPY_REQ 始终为 9664B；成功路径没有 round ACK。
 
-协议细节见 [DESIGN_CN.md](DESIGN_CN.md)，实施顺序见 [IMPLEMENTATION_PLAN_CN.md](IMPLEMENTATION_PLAN_CN.md)，迁移证据见 [STAGE2_SPARSE_COPY_REPORT_CN.md](STAGE2_SPARSE_COPY_REPORT_CN.md)。
+- `--mode direct`：B1/B2；600 个普通 Put，per-rail DATA_DONE，同 v5 wire 回归。
+- `--mode sgl --pipeline on|off`：S1/S2；remote 按 K 项构造 PutV，写入 local 每 rail 连续 stage；每个 PutV 成功 post 后立即在同一 channel 发送独立 CHUNK_DONE；local 主线程按 on/off 策略 scatter 到最终稀疏 destination。
+- `RDMA_600_SGL_ITEMS`：严格十进制 1..30，默认 16。当前公共头 `NET_SGE_MAX_IOV=16`，因此 K=30 明确报 `UNSUPPORTED`，不会静默降为 16。
+- `RDMA_600_QP_MAX_SEND_SGE`：每 rail 一个正整数的外部声明，例如 `16,16`。它只登记部署时对真实已创建 QP 的 query 结果来源，不是自动查询。SGL measure 缺失该声明会拒绝；verify/trace 可运行但结果标 `QP_CAP_PENDING`。
 
-角色固定：
+## 构建与本地自测
 
-- `local`：调用者、最终 destination 拥有者和主计时端；主动连接。
-- `remote`：source 拥有者和 RDMA WRITE 发起端；监听连接。
-- B1：单 rail 600 个 `Put(1024)`。
-- B2：双 rail，各 300 个 `Put(1024)`；每 rail 一个 service/NIC/QP 和一个从 setup 到 drain 固定的应用线程。
-
-一次调用由 local 完整生成、校验并编码 600 对源/目标偏移，rail0 发送一份 9664 字节 `COPY_REQ`。remote 复制到 pending，交接到独立 active，按请求索引分 rail 重建本轮 WR，并在每条真实 QP 的数据 Put 后分别发送 `DATA_DONE`。local 等齐所有 rail 的 `DATA_DONE`（数据 ready）和本端 COPY_REQ Send callback 后返回。成功路径没有逐轮 ACK；下一次 COPY_REQ 才授予下一代复用权限。
-
-协议为 `sparse-copy-v4-dual-rail`。version、magic、消息长度均与旧 sender-driven v3 区分，旧新二进制不会误握手。
-
-## 构建与自测
-
-目标 Linux 主机：
+目标 Linux/RDMA 主机：
 
 ```bash
 bash ./build.sh --ubs-root /absolute/path/to/ubs-comm
 ./build/rdma_600 --self-test
 ```
 
-自测覆盖 B1/B2 的 HELLO/READY、9664 字节请求、截断/重复目标拒绝、请求索引分 rail、每 rail 非顺序映射、DATA_DONE 和数据/gap 校验。它不验证 MR、DMA、CQ/RQ、真实 QP 顺序或双 NIC。
+本地 self-test 不连接 NIC，覆盖 v5 HELLO/READY/COPY_REQ/CHUNK_DONE、严格参数、K=1/8/16/30 尾 chunk、direct 映射、SGL on/off 乱序 scatter、重复 source、destination 唯一/gap、错代/重复/越界通知、多代复用和延迟 COPY_REQ callback gate。
 
-## B1 直接启动
+## 启动示例
 
-先在 remote：
+direct B1/B2 沿用 `--mode direct`；direct 不接受 `--pipeline`，也不受 SGL 环境变量改变工作量。示例 B1 remote：
 
 ```bash
-./build/rdma_600 --role remote \
-  --rdma-ip <remote_nic0_rdma_ip> --listen <remote_oob_ip>:19000 \
-  --links 1 --mode direct --kind verify --verify-rounds 20 --warmup 0 --rounds 0 \
-  --timeout-sec 10 --app-cpu <remote_app_cpu> --worker-cpu <remote_worker_cpu>
+./build/rdma_600 --role remote --rdma-ip <remote_nic0_ip> \
+  --listen <remote_oob_ip>:19000 --links 1 --mode direct --kind verify \
+  --verify-rounds 20 --warmup 0 --rounds 0 --timeout-sec 10 \
+  --app-cpu <app_cpu> --worker-cpu <worker_cpu>
 ```
 
-再在 local：
+B1 local 将 `--role remote --listen` 换为 `--role local --peer` 并使用 local RDMA IP。B2 使用两个逗号分隔值：`--rdma-ips`、`--listen/--peer`、`--app-cpus`、`--worker-cpus`，且 `--links 2`。
+
+SGL S2/K16/on verify（两端设置相同 K；cap 可暂缺但会标 pending）：
 
 ```bash
-./build/rdma_600 --role local \
-  --rdma-ip <local_nic0_rdma_ip> --peer <remote_oob_ip>:19000 \
-  --links 1 --mode direct --kind verify --verify-rounds 20 --warmup 0 --rounds 0 \
-  --timeout-sec 10 --app-cpu <local_app_cpu> --worker-cpu <local_worker_cpu>
-```
-
-## B2 直接启动
-
-remote：
-
-```bash
+export RDMA_600_SGL_ITEMS=16
+export RDMA_600_QP_MAX_SEND_SGE=16,16
 ./build/rdma_600 --role remote \
   --rdma-ips <remote_nic0_ip>,<remote_nic1_ip> \
   --listen <remote_oob_ip>:19000,<remote_oob_ip>:19001 \
-  --links 2 --mode direct --kind verify --verify-rounds 20 --warmup 0 --rounds 0 \
-  --timeout-sec 10 --app-cpus <remote_app0>,<remote_app1> \
-  --worker-cpus <remote_worker0>,<remote_worker1>
+  --links 2 --mode sgl --pipeline on --kind verify \
+  --verify-rounds 20 --warmup 0 --rounds 0 --timeout-sec 10 \
+  --app-cpus <app0>,<app1> --worker-cpus <worker0>,<worker1>
 ```
 
-local：
+local 使用相同 workload 参数和环境变量，改为 `--role local --peer ...`。off 对照只改 `--pipeline off`。正式 measure 使用 `--kind measure --verify-rounds 20 --warmup 1000 --rounds 10000`，必须显式绑核并提供真实 QP cap 声明。
 
-```bash
-./build/rdma_600 --role local \
-  --rdma-ips <local_nic0_ip>,<local_nic1_ip> \
-  --peer <remote_oob_ip>:19000,<remote_oob_ip>:19001 \
-  --links 2 --mode direct --kind verify --verify-rounds 20 --warmup 0 --rounds 0 \
-  --timeout-sec 10 --app-cpus <local_app0>,<local_app1> \
-  --worker-cpus <local_worker0>,<local_worker1>
-```
+## 结果、trace 与边界
 
-正式测量两端使用 `--kind measure --verify-rounds 20 --warmup 1000 --rounds 10000`。每端所有 app/worker CPU 应使用不同物理核心。详细 trace 必须单独以 `--kind trace --trace-rounds N` 运行；正式 measure 不采集事件时间。
+local 输出 schema 5，case 为 B1/B2 或 `S1-K-on/off`、`S2-K-on/off`。verify/trace 的性能字段为 null；measure 记录完整 sparse_copy 分位数、有效 GB/s、block Mops、request GB/s 和 wall。结果区分预期 PutV/WRITE/通知计数与未采集的 verbs trace，并记录公共头 cap、QP cap 声明来源及验证状态。
 
-本分支保持删除 Python 编排的状态：没有 `run.py`，也不应从 main 恢复。各主机直接启动二进制并自行保存 stdout/stderr。`hosts.example.json` 仅作为参数记录模板，程序不读取。
+trace 只能独立以 `--kind trace --trace-rounds 1..64` 运行。SGL 记录每 chunk 的 ready、scatter begin/end，以及 remote PutV/CHUNK_DONE post；不同主机时间戳不能相减。
 
-## 地址与结果口径
+目标机仍须验证：源码/二进制/静态库 hash，一致公共头与实际链接库，创建后真实 QP `max_send_sge`，每 chunk `groupCount=1/num_sge=count` 和 WRITE→SEND 同 QP，stage 地址，双 NIC 流量、NUMA/CPU/MTU、断链/部分 post/callback 延迟，以及 K8/K16 on/off 的多次 verify/measure。B2/S2 仍是 HCOM 多 Service 契约外的诊断穿刺。
 
-B2 请求索引 `0..299` 属于 rail0，`300..599` 属于 rail1。每个 offset 都是对应 rail MR 内的字节偏移，范围为 `0..299*4096`；两 rail 分别校验 300 个 destination 槽唯一。B1 同理使用 rail0 的 600 槽 MR。offset 不用于选择 rail。
-
-local 输出 schema 4，case 仍为 `B1`/`B2`，主指标为 `sparse_copy_avg_us/p50/p95/p99`、`effective_GBps`、`block_Mops`、`request_GBps` 和 measured wall。每次预期 1 个 COPY_REQ、600 个 data WR、L 个 DATA_DONE、0 个 success ACK。remote 只输出状态和独立本机 trace；跨主机时间戳不能相减，重叠区间不能相加。
-
-## 当前限制
-
-- 尚未在目标 Linux/AArch64 对实际 `ubs-comm@e709a37` 产物完成编译/链接。
-- 尚未跑双机 verify、故障注入、真实 NIC/QP 流量证明或 B1/B2 measure；没有迁移后 B2 性能结论。
-- ubs-comm 明示的同协议多 Service 限制仍使 B2 属于诊断穿刺，不代表正式产品 multirail 方案。
-- direct 无 staging/scatter/SGL/IMM；callback 仍按请求分配，本次不修改 ubs-comm。
+详细规范见 [STAGE3_DESIGN_CN.md](STAGE3_DESIGN_CN.md)，实现与验证台账见 [STAGE3_REPORT_CN.md](STAGE3_REPORT_CN.md)。`docs/main_reference/` 是 main 历史原文，只读保留；本分支不含 `run.py`。

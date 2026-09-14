@@ -81,7 +81,8 @@ add_executable(rdma_600 rdma_600.cpp)
 target_compile_features(rdma_600 PRIVATE cxx_std_17)
 target_compile_options(rdma_600 PRIVATE -Wall -Wextra -Wpedantic -Werror=return-type)
 target_compile_definitions(rdma_600 PRIVATE
-    "RDMA_600_GIT_COMMIT=\"${RDMA_600_GIT_COMMIT}\"")
+    "RDMA_600_GIT_COMMIT=\"${RDMA_600_GIT_COMMIT}\""
+    "RDMA_600_BUILD_TYPE=\"${CMAKE_BUILD_TYPE}\"")
 target_include_directories(rdma_600 PRIVATE
     "${HCOM_INCLUDE_DIR}"
     "${BOUNDSCHECK_INCLUDE_DIR}")

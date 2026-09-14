@@ -1,6 +1,6 @@
 # 阶段3：SGL gather + 流水 scatter 设计
 
-日期：2026-09-14。状态：DESIGN_COMPLETE，供独立 `gpt-5.6-sol / high` 实现会话执行；硬件能力与性能尚未验收。
+日期：2026-09-14。状态：DESIGN_COMPLETE；实现已落地，见 `STAGE3_REPORT_CN.md`。硬件能力与性能仍未验收。
 
 ## 1. 精确基线、文档及范围
 

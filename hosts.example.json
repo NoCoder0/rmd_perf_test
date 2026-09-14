@@ -37,5 +37,22 @@
     "trace_rounds": 32,
     "timeout_sec": 10,
     "process_timeout_sec": 600
+  },
+  "sgl": {
+    "mode": "sgl",
+    "pipeline": ["on", "off"],
+    "RDMA_600_SGL_ITEMS": [8, 16],
+    "RDMA_600_QP_MAX_SEND_SGE": {
+      "local": [16, 16],
+      "remote": [16, 16],
+      "source": "external-declaration backed by saved post-create QP query"
+    },
+    "current_k30_status": "UNSUPPORTED: public/library cap is 16",
+    "verify_rounds": 20,
+    "warmup_rounds": 1000,
+    "measure_rounds": 10000,
+    "trace_rounds": 32,
+    "timeout_sec": 10,
+    "hardware_status": "TARGET_BUILD_AND_HW_PENDING"
   }
 }

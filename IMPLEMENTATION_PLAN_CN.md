@@ -1,28 +1,35 @@
-# requester-driven sparse_copy 双 rail 实施计划
+# 阶段3实施与目标机验收计划
 
 更新日期：2026-09-14。
 
-## 已完成迁移范围
+## 已完成实现
 
-1. 从 main 阶段 1 引入 local/remote requester-driven 语义、完整 9664 字节 COPY_REQ、pending/active、DATA_DONE、无逐轮成功 ACK、local 主计时和 schema。
-2. 保留 duo_card 的 B1/B2 同二进制、每 rail 独立 service/NIC/QP/MR/key 和固定 rail 应用线程；rail1 生命周期扩展到 setup→drain/teardown。
-3. B2 按请求索引 0..299/300..599 分 rail；offset 是每 rail MR 内偏移，各 rail 分别做范围和 destination 唯一校验。
-4. 保留阶段 1.5 busy-poll relax、256 次 deadline、线程私有 attempted、callback-owned 原子完成、缓存行隔离、ActiveCallbackGuard 和每请求 callback。
-5. 保留独立 trace，但改为 local sparse_copy 时间线及 remote 本机诊断；正式 measure 不采样。
-6. 不恢复 Python `run.py`，不修改 ubs-comm，不实现 staging/scatter/SGL/IMM。
+1. direct 与 SGL 统一升级 v5，保留每轮 600/600 真实地址和 9664B 请求。
+2. 增加 `--mode sgl --pipeline on|off`、严格 K 环境变量和每 rail 外部 QP cap 声明；当前依赖明确拒绝 K30。
+3. local/SGL 每 rail 注册连续 stage；remote 构造连续远端 iov，按 chunk 执行 PutV 后立即同 channel Send CHUNK_DONE。
+4. 增加 generation/CAS ready、乱序 chunk 接收、统一 scatter、on/off gate、请求 callback gate和单一绝对 deadline。
+5. 保留固定 rail 线程、pending/active、保守 callback drain；成功输出移到 teardown 之后。
+6. schema/trace/self-test/启动文档更新；未修改 ubs-comm，未恢复 Python。
+
+## 本地完成条件
+
+- 使用当前 ubs-comm 公共头的全文件 `-fsyntax-only` 通过。
+- `RDMA_600_SELF_TEST_ONLY` 编译运行通过，覆盖 direct/SGL、单/双 rail、K1/8/16/30、尾 chunk、on/off、乱序/多代/错误通知/callback 延迟、wire 和 checked arithmetic。
+- `git diff --check`、文档 JSON 解析和 main_reference 完整性复核通过。
+
+这些条件不等价于目标 Linux 链接或 RDMA 验收。
 
 ## 目标机验收顺序
 
-1. 两端确认目标分支、源码 hash、`ubs-comm` 提交和实际链接静态库 hash。
-2. Linux/AArch64 Release 构建；运行 `./rdma_600 --self-test`。
-3. B1/B2 各跑 20 轮 verify，检查非顺序地址、gap、generation、错误退出、完整 9664 字节请求及所有 rail ready gate。
-4. B2 记录两张 NIC、两个真实 QP 和各约一半 payload 的端口计数证据；不能只凭 `links=2`。
-5. 单独 trace 短跑，按主机、generation、rail 检查事件；禁止跨主机时钟相减。
-6. B1/B2 各至少 5 次 `1000 warmup + 10000 measure`，交替顺序。保存每次原始 JSON 和 wall，报告跨 repeat 中位数/范围，不平均 p99。
-7. 做参数不一致、交换 endpoint/key、单 rail 延迟、断链和部分提交失败测试。local 不可提前返回，失败不得输出有效性能。
+1. 两端记录本提交、源码/二进制 hash、ubs-comm 提交、公共头和实际静态库 hash、编译器与构建选项。
+2. Linux/AArch64 Release 构建并运行 `--self-test`；证明两端使用相同 v5 workload 参数。
+3. 对每个真实创建 QP 做 query，记录 QP号/NIC/`max_send_sge`，再设置 `RDMA_600_QP_MAX_SEND_SGE`。校验声明与原始证据，不能只看设备 cap 或创建前日志。
+4. B1/B2 direct 回归各 20 verify；S1/S2 的 K8/K16 on/off 各 20 verify。K30 在当前依赖跳过并确认 UNSUPPORTED；K1只做边界/背压正确性。
+5. 独立 verbs/NIC trace 验证每 chunk `groupCount=1`、`num_sge=count`、stage 地址/rkey、WRITE 与紧随 CHUNK_DONE Send 使用同一真实 QP；双 rail 流量各约一半 payload。
+6. 独立应用 trace 核对 ready/scatter begin/end，不跨主机相减时间戳。
+7. 注入单 rail 延迟、断链、部分 post 失败、非法通知、请求 callback 和 scatter 延迟；任何失败不得留下 status=ok。
+8. 正确性完成后，对支持的 K8/K16 on/off 各至少 5 次 `1000 warmup + 10000 measure`，记录 CPU/NUMA/MTU 和原始结果；B1/B2 同场回归。
 
-## 后续阶段
+## 未扩展范围
 
-阶段 3 才新增 staging/SGL/scatter；阶段 4 才最小扩展 WRITE_WITH_IMM。任何后续优化都必须保持 local 主计时、600 个 destination 地址、请求驱动的复用信用和 B1/B2 回归。callback 池只在目标机 profile 证明分配是主要瓶颈后单独实验。
-
-旧协议数据只能解释历史：它不是本次迁移后 B2 性能。现阶段不能根据旧 submit/e2e 或 main 单卡结果声称双卡收益或重大回归。
+不实现 IMM、成功 ACK、跨代窗口、callback 池、内部 multirail 或多 service 契约修复。B2/S2 继续标 `diagnostic-unsupported-by-hcom-contract`。共享依赖 callback 失败重试风险如需修复，应另做 ubs-comm 补丁与全量重编。
