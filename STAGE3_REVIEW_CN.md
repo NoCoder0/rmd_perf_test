@@ -40,4 +40,6 @@ declared=252 encoded_fields=256 accepted=1 consumed_outside_wire=1
 
 ## 回修与最终复核
 
-等待原实现会话回修，完成后主会话在此记录修复提交与复核结果。
+原实现会话已按本文件要求完成待提交回修：HELLO 保留 reserved 并统一为256B，Encode/Decode 校验最终 cursor；新增独立字段计数、末尾非零 key、252/255/尾随边界测试。CHUNK_DONE 改为原子哨兵独占槽位，在可消费 generation 前运行 trace observer，重复通知不进入 observer；measure 短路不采时间。生产与 self-test 共用 ready 发布、固定起点完整扫描 scheduler、scatter payload、all-ready/completion gate，并覆盖慢 rail/末尾 chunk、乱序两代及 callback 延迟。流水有无进展均累计检查单元，每256个调用 fatal/deadline checkpoint。
+
+实现会话本地已运行 self-test-only 和真实公共头全文件 `-fsyntax-only`；完整命令及边界仍见 `STAGE3_REPORT_CN.md`。上述仅为回修说明，状态仍是 **PENDING_INDEPENDENT_REVIEW**；不代表主会话已复核通过。主会话应保留并重编运行 ignored `build/review_hello_extent.cpp`，再独立检查生产顺序、调度和文档。

@@ -10,7 +10,7 @@ direct B1/B2 保持 600 个普通 Put 和每 rail DATA_DONE。SGL S1/S2 为每 r
 
 ## wire 与内存
 
-协议为 `sparse-copy-v5-dual-rail-sgl`，version=5，新 magic。Parameters=40B；HELLO=252B，含 destination 与可选 stage 描述符/80B key；READY=64B；COPY_REQ=9664B；CHUNK_DONE=40B。所有整数显式网络字节序，精确长度和 reserved=0 均校验。direct 的 K=0、pipeline=off、stage 全零；SGL 使用 sparse-600、stage region 3。
+协议为 `sparse-copy-v5-dual-rail-sgl`，version=5，新 magic。Parameters=40B；HELLO=256B，其中两个 region descriptor 均为 `id4+reserved4+address8+bytes8+key80=104B`；READY=64B；COPY_REQ=9664B；CHUNK_DONE=40B。所有整数显式网络字节序，精确长度、最终 cursor 和 reserved=0 均校验。direct 的 K=0、pipeline=off、stage 全零；SGL 使用 sparse-600、stage region 3。
 
 仅 local/SGL 额外按固定 rail 线程分配、触页并注册每 rail `R*1024` 连续 stage；destination MR 仍为 `R*4096`。remote 每 rail 的全部 iov、PutV request 和逐 chunk 通知缓冲具有跨异步 callback 的稳定生命周期。checked arithmetic 同时验证 offset、region 和 base+length。
 
@@ -18,7 +18,7 @@ direct B1/B2 保持 600 个普通 Put 和每 rail DATA_DONE。SGL S1/S2 为每 r
 
 两 rail 架构仍为两个固定应用线程各自拥有一个 service/channel/MR 生命周期；local 主线程独占所有 CPU scatter，只读取 rail1 stage，不调用 rail1 service。remote pending/active 请求分离；active/iov/source/通知缓冲在本代全部 data/Send callbacks 回收前不复用。
 
-local 在发请求前 release 发布 expected generation；CHUNK_DONE handler 校验 role/mode/rail/generation/chunk/first/count/bytes 后以 CAS release 发布 ready，重复、迟到、未来和越界均使整次 run 失败。scatter 以 acquire 读取 ready，consumed 与 ready 独立。每次 SparseCopy 使用从入口 t0 派生的统一绝对 deadline；direct 也使用该口径。
+local 在发请求前 release 发布 expected generation；CHUNK_DONE handler 校验 role/mode/rail/generation/chunk/first/count/bytes 后先以原子哨兵独占槽位，trace 模式发布 ready 时间点，最后 release 发布可消费 generation；重复通知不能覆盖 trace。measure 不取逐 chunk 时钟。scatter 以 acquire 读取 ready，consumed 与 ready 独立；每轮扫描固定起点完整访问全部槽位，扫描结束才轮转下轮起点，并按累计256个检查单元检查 fatal/deadline。每次 SparseCopy 使用从入口 t0 派生的统一绝对 deadline；direct 也使用该口径。
 
 K 来自严格环境变量 `RDMA_600_SGL_ITEMS`，设计范围 1..30，默认16。可运行条件同时受公共头、实际链接库和真实创建 QP cap 限制。当前公共头上限16，因此 K30 为 UNSUPPORTED。公共 API 无真实 QP cap getter；`RDMA_600_QP_MAX_SEND_SGE` 只作为 `external-declaration` 登记，不伪称自动验证，SGL measure 缺失时拒绝。
 

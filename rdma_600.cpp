@@ -136,7 +136,9 @@ constexpr uint32_t kChunkDoneMagic = 0x53434335U;  // "SCC5"
 // destination and optional stage registrations; READY describes its source.
 constexpr size_t kParametersWireBytes = 40;
 constexpr size_t kMemoryKeyWireBytes = 80;
-constexpr size_t kHelloWireBytes = 4 + kParametersWireBytes + 4 + 24 + kMemoryKeyWireBytes + 20 + kMemoryKeyWireBytes;
+constexpr size_t kHelloPreambleWireBytes = 4 + kParametersWireBytes + 4;
+constexpr size_t kHelloRegionWireBytes = 4 + 4 + 8 + 8 + kMemoryKeyWireBytes;
+constexpr size_t kHelloWireBytes = kHelloPreambleWireBytes + 2 * kHelloRegionWireBytes;
 constexpr size_t kReadyWireBytes = 4 + kParametersWireBytes + 4 + 16;
 constexpr size_t kCopyReqHeaderBytes = 64;
 constexpr size_t kCopyEntryWireBytes = 16;
@@ -147,7 +149,7 @@ constexpr size_t kCopyErrorWireBytes = 32;
 constexpr size_t kTokenWireBytes = 24;
 constexpr size_t kChunkDoneWireBytes = 40;
 
-static_assert(kHelloWireBytes == 252, "HELLO wire size must include destination and stage descriptors");
+static_assert(kHelloWireBytes == 256, "HELLO wire size must include both complete region descriptors");
 static_assert(kReadyWireBytes == 64, "READY wire size is fixed");
 static_assert(kCopyReqWireBytes == 9664, "COPY_REQ must carry all 600 sparse pairs");
 static_assert(kChunkDoneWireBytes == 40, "CHUNK_DONE wire size is fixed");
@@ -466,6 +468,8 @@ std::array<uint8_t, kHelloWireBytes> EncodeHello(const HelloInfo &info)
     PutU64(cursor, info.stageAddress);
     PutU64(cursor, info.stageBytes);
     EncodeMemoryKey(cursor, info.stageKey);
+    if (cursor != payload.data() + payload.size())
+        throw std::logic_error("HELLO encoder cursor does not match the wire extent");
     return payload;
 }
 
@@ -497,7 +501,7 @@ bool DecodeHello(const void *data, uint32_t size, HelloInfo &info)
     info.stageAddress = GetU64(cursor);
     info.stageBytes = GetU64(cursor);
     info.stageKey = DecodeMemoryKey(cursor);
-    return true;
+    return cursor == static_cast<const uint8_t *>(data) + size;
 }
 
 std::array<uint8_t, kReadyWireBytes> EncodeReady(const ReadyInfo &info)
@@ -697,15 +701,39 @@ bool ValidateChunkDone(const ChunkDoneInfo &info, uint16_t expectedRail, uint64_
     return true;
 }
 
-bool PublishChunkReady(std::atomic<uint64_t> &slot, uint64_t generation, std::string &error)
+constexpr uint64_t kChunkReadyPublishing = std::numeric_limits<uint64_t>::max();
+
+template <typename Observer>
+bool PublishChunkReadyAfterObserver(
+    std::atomic<uint64_t> &slot, uint64_t generation, Observer observer, std::string &error)
 {
     uint64_t previous = slot.load(std::memory_order_relaxed);
-    if (previous == generation || !slot.compare_exchange_strong(previous, generation,
-            std::memory_order_release, std::memory_order_relaxed)) {
+    if (generation == 0 || generation == kChunkReadyPublishing || previous == generation ||
+        previous == kChunkReadyPublishing || !slot.compare_exchange_strong(previous, kChunkReadyPublishing,
+            std::memory_order_acq_rel, std::memory_order_relaxed)) {
         error = "duplicate/concurrent CHUNK_DONE";
         return false;
     }
+    try {
+        if (!observer()) {
+            slot.store(previous, std::memory_order_release);
+            error = "CHUNK_DONE observer failed before ready publication";
+            return false;
+        }
+    } catch (...) {
+        slot.store(previous, std::memory_order_release);
+        throw;
+    }
+    slot.store(generation, std::memory_order_release);
     return true;
+}
+
+template <typename Observer>
+bool PublishChunkReadyAfterOptionalObserver(std::atomic<uint64_t> &slot, uint64_t generation,
+    bool observe, Observer observer, std::string &error)
+{
+    return PublishChunkReadyAfterObserver(slot, generation,
+        [&] { return !observe || observer(); }, error);
 }
 
 std::array<uint8_t, kDataDoneWireBytes> EncodeDataDone(uint64_t generation, uint16_t rail,
@@ -1311,6 +1339,108 @@ bool ValidateHelloMetadata(const HelloInfo &hello, const CaseParameters &paramet
         CheckedAddAddress(hello.stageAddress, 0, stageBytes, stageBytes, ignored);
 }
 
+void ScatterChunkPayload(uint16_t rail, uint32_t chunk, uint32_t blocksPerRail, uint16_t sglItems,
+    const std::array<CopyEntry, kBlocks> &entries, void *destinationBase, size_t destinationBytes,
+    const void *stageBase, size_t stageBytes)
+{
+    const uint32_t first = chunk * sglItems;
+    const uint32_t count = ChunkItemCount(blocksPerRail, sglItems, chunk);
+    const uint32_t globalFirst = static_cast<uint32_t>(rail) * blocksPerRail;
+    for (uint32_t item = 0; item < count; ++item) {
+        const CopyEntry &entry = entries[globalFirst + first + item];
+        uint64_t destination = 0;
+        uint64_t stage = 0;
+        if (!CheckedAddAddress(reinterpret_cast<uintptr_t>(destinationBase), entry.localDestinationOffset,
+                kBlockBytes, destinationBytes, destination) ||
+            !CheckedAddAddress(reinterpret_cast<uintptr_t>(stageBase),
+                static_cast<uint64_t>(first + item) * kBlockBytes, kBlockBytes, stageBytes, stage))
+            throw std::runtime_error("scatter address overflow/out of range rail=" + std::to_string(rail));
+        std::memcpy(reinterpret_cast<void *>(static_cast<uintptr_t>(destination)),
+            reinterpret_cast<const void *>(static_cast<uintptr_t>(stage)), kBlockBytes);
+    }
+}
+
+struct SglSchedulerState {
+    uint32_t scattered = 0;
+    uint32_t cursor = 0;
+    uint32_t examinedSinceCheckpoint = 0;
+};
+
+template <typename Ready, typename Scatter, typename Checkpoint>
+bool ScanReadySglChunks(uint16_t links, uint32_t chunksPerRail, SglSchedulerState &state,
+    Ready ready, Scatter scatter, Checkpoint checkpoint)
+{
+    const uint32_t totalChunks = chunksPerRail * links;
+    if (totalChunks == 0 || state.cursor >= totalChunks || state.scattered > totalChunks)
+        throw std::logic_error("invalid SGL scheduler state");
+    const uint32_t scanStart = state.cursor;
+    bool progress = false;
+    for (uint32_t examined = 0; examined < totalChunks; ++examined) {
+        const uint32_t linear = (scanStart + examined) % totalChunks;
+        const uint16_t rail = static_cast<uint16_t>(linear % links);
+        const uint32_t chunk = linear / links;
+        if (ready(rail, chunk)) {
+            scatter(rail, chunk);
+            ++state.scattered;
+            progress = true;
+        }
+        if (++state.examinedSinceCheckpoint == kDataDeadlineCheckInterval) {
+            state.examinedSinceCheckpoint = 0;
+            checkpoint();
+        }
+    }
+    // Rotate only after the fixed-start scan has visited every slot exactly once.
+    state.cursor = (scanStart + 1) % totalChunks;
+    return progress;
+}
+
+bool SglCompletionReached(uint32_t scattered, uint32_t totalChunks, bool requestCallbackDone) noexcept
+{
+    return scattered == totalChunks && requestCallbackDone;
+}
+
+template <typename Ready>
+bool AllSglChunksReady(uint16_t links, uint32_t chunksPerRail, Ready ready)
+{
+    for (uint16_t rail = 0; rail < links; ++rail)
+        for (uint32_t chunk = 0; chunk < chunksPerRail; ++chunk)
+            if (!ready(rail, chunk)) return false;
+    return true;
+}
+
+void SelfTestReadyPublicationOrder()
+{
+    std::atomic<uint64_t> ready{4};
+    std::string error;
+    uint32_t observerCalls = 0;
+    uint32_t traceMarker = 0;
+    bool consumerSawReadyBeforeObserver = false;
+    bool observerSawReservation = false;
+    if (!PublishChunkReadyAfterOptionalObserver(ready, 5, true, [&] {
+            ++observerCalls;
+            traceMarker = 0x51;
+            consumerSawReadyBeforeObserver = ready.load(std::memory_order_acquire) == 5;
+            observerSawReservation = ready.load(std::memory_order_acquire) == kChunkReadyPublishing;
+            return true;
+        }, error) || consumerSawReadyBeforeObserver || !observerSawReservation || observerCalls != 1 ||
+        ready.load(std::memory_order_acquire) != 5)
+        throw std::runtime_error("CHUNK_DONE observer was not ordered before ready publication");
+    if (PublishChunkReadyAfterOptionalObserver(ready, 5, true, [&] {
+            ++observerCalls; traceMarker = 0x52; return true;
+        }, error) || observerCalls != 1 || traceMarker != 0x51 ||
+        ready.load(std::memory_order_acquire) != 5)
+        throw std::runtime_error("duplicate CHUNK_DONE overwrote its observer/ready state");
+    if (PublishChunkReadyAfterOptionalObserver(ready, 6, true,
+            [&] { ++observerCalls; return false; }, error) ||
+        observerCalls != 2 || ready.load(std::memory_order_acquire) != 5)
+        throw std::runtime_error("failed CHUNK_DONE observer exposed a consumable generation");
+    uint32_t measureSamples = 0;
+    if (!PublishChunkReadyAfterOptionalObserver(ready, 6, false,
+            [&] { ++measureSamples; return true; }, error) || measureSamples != 0 ||
+        ready.load(std::memory_order_acquire) != 6)
+        throw std::runtime_error("measure-mode CHUNK_DONE sampled a chunk observer");
+}
+
 void SelfTestSglMapping(uint16_t links, uint16_t sglItems, PipelineMode pipeline)
 {
     const uint32_t blocksPerRail = kBlocks / links;
@@ -1351,11 +1481,27 @@ void SelfTestSglMapping(uint16_t links, uint16_t sglItems, PipelineMode pipeline
                 source[rail].Data() + entries[index].remoteSourceOffset, kBlockBytes);
         }
 
-        uint32_t scattered = 0;
-        bool requestCallbackDone = false;
         const uint32_t totalChunks = chunks * links;
-        for (uint32_t reverse = totalChunks; reverse > 0; --reverse) {
-            const uint32_t linear = reverse - 1;
+        const uint32_t slowLinear = totalChunks - 1;
+        SglSchedulerState scheduler{};
+        uint32_t checkpoints = 0;
+        auto isPublished = [&](uint16_t rail, uint32_t chunk) {
+            return ready[rail][chunk].load(std::memory_order_acquire) == generation;
+        };
+        auto isReady = [&](uint16_t rail, uint32_t chunk) {
+            return consumed[rail][chunk] != generation && isPublished(rail, chunk);
+        };
+        auto scatter = [&](uint16_t rail, uint32_t chunk) {
+            if (consumed[rail][chunk] == generation)
+                throw std::runtime_error("shared SGL scheduler scattered a chunk twice");
+            ScatterChunkPayload(rail, chunk, blocksPerRail, sglItems, entries,
+                actual[rail].Data(), actual[rail].Size(), stage[rail].Data(), stage[rail].Size());
+            consumed[rail][chunk] = generation;
+        };
+        auto scan = [&] {
+            return ScanReadySglChunks(links, chunks, scheduler, isReady, scatter, [&] { ++checkpoints; });
+        };
+        auto publish = [&](uint32_t linear) {
             const uint16_t rail = static_cast<uint16_t>(linear % links);
             const uint32_t chunk = linear / links;
             const uint32_t first = chunk * sglItems;
@@ -1368,43 +1514,48 @@ void SelfTestSglMapping(uint16_t links, uint16_t sglItems, PipelineMode pipeline
             const ChunkDoneInfo info{rail, generation, chunk, first, count, count * kBlockBytes, chunks};
             if (!ValidateChunkDone(info, rail, generation, blocksPerRail, sglItems, error))
                 throw std::runtime_error("valid CHUNK_DONE rejected: " + error);
-            if (!PublishChunkReady(ready[rail][chunk], generation, error))
-                throw std::runtime_error("valid CHUNK_DONE state transition rejected");
-            if (reverse == totalChunks && PublishChunkReady(ready[rail][chunk], generation, error))
-                throw std::runtime_error("duplicate CHUNK_DONE state transition was accepted");
-            if (pipeline == PipelineMode::On) {
-                for (uint32_t item = 0; item < count; ++item) {
-                    const CopyEntry &entry = entries[static_cast<uint32_t>(rail) * blocksPerRail + first + item];
-                    std::memcpy(actual[rail].Data() + entry.localDestinationOffset,
-                        stage[rail].Data() + static_cast<size_t>(first + item) * kBlockBytes, kBlockBytes);
-                }
-                consumed[rail][chunk] = generation;
-                ++scattered;
-            }
-            if (reverse > 1 && scattered == totalChunks)
-                throw std::runtime_error("slow-rail/chunk gate completed early");
+            if (!PublishChunkReadyAfterOptionalObserver(
+                    ready[rail][chunk], generation, false, [] { return true; }, error))
+                throw std::runtime_error("valid CHUNK_DONE state transition rejected: " + error);
+        };
+
+        // Publish every chunk except one in reverse order. The withheld final chunk
+        // models a slow rail/tail while generation 6 also reuses generation-5 slots.
+        for (uint32_t reverse = totalChunks; reverse > 0; --reverse) {
+            const uint32_t linear = reverse - 1;
+            if (linear != slowLinear) publish(linear);
         }
-        if (pipeline == PipelineMode::Off) {
-            for (uint16_t rail = 0; rail < links; ++rail)
-                for (uint32_t chunk = 0; chunk < chunks; ++chunk) {
-                    if (ready[rail][chunk].load(std::memory_order_acquire) != generation)
-                        throw std::runtime_error("off pipeline observed an unready chunk");
-                    const uint32_t first = chunk * sglItems;
-                    const uint32_t count = ChunkItemCount(blocksPerRail, sglItems, chunk);
-                    for (uint32_t item = 0; item < count; ++item) {
-                        const CopyEntry &entry = entries[static_cast<uint32_t>(rail) * blocksPerRail + first + item];
-                        std::memcpy(actual[rail].Data() + entry.localDestinationOffset,
-                            stage[rail].Data() + static_cast<size_t>(first + item) * kBlockBytes, kBlockBytes);
-                    }
-                    consumed[rail][chunk] = generation;
-                    ++scattered;
-                }
+        if (AllSglChunksReady(links, chunks, isPublished))
+            throw std::runtime_error("slow-rail/final-chunk all-ready gate completed early");
+        if (pipeline == PipelineMode::On) {
+            std::vector<uint32_t> visits(totalChunks, 0);
+            auto countingReady = [&](uint16_t rail, uint32_t chunk) {
+                ++visits[chunk * links + rail];
+                return isReady(rail, chunk);
+            };
+            if (!ScanReadySglChunks(links, chunks, scheduler, countingReady, scatter, [&] { ++checkpoints; }))
+                throw std::runtime_error("pipelined scan made no progress with ready chunks");
+            if (std::any_of(visits.begin(), visits.end(), [](uint32_t count) { return count != 1; }) ||
+                scheduler.cursor != (totalChunks == 1 ? 0U : 1U))
+                throw std::runtime_error("fixed-start SGL scan skipped/revisited a slot or failed to rotate");
+            if (scheduler.scattered != totalChunks - 1)
+                throw std::runtime_error("slow-rail/final-chunk pipeline gate completed early");
+        } else if (scheduler.scattered != 0) {
+            throw std::runtime_error("pipeline=off scattered before the all-ready gate");
         }
-        if (scattered != totalChunks || (scattered == totalChunks && requestCallbackDone))
-            throw std::runtime_error("request callback delay gate self-test failed");
-        requestCallbackDone = true;
-        if (!(scattered == totalChunks && requestCallbackDone))
-            throw std::runtime_error("completed SGL generation was not released");
+        if (SglCompletionReached(scheduler.scattered, totalChunks, false))
+            throw std::runtime_error("delayed request callback released the SGL generation early");
+
+        publish(slowLinear);
+        if (!AllSglChunksReady(links, chunks, isPublished))
+            throw std::runtime_error("all-ready gate rejected the final slow chunk");
+        if (!scan() || scheduler.scattered != totalChunks)
+            throw std::runtime_error("shared SGL scheduler did not scatter the final ready chunks");
+        if (SglCompletionReached(scheduler.scattered, totalChunks, false) ||
+            !SglCompletionReached(scheduler.scattered, totalChunks, true))
+            throw std::runtime_error("production SGL completion gate ignored request callback state");
+        if (totalChunks >= kDataDeadlineCheckInterval && checkpoints == 0)
+            throw std::runtime_error("shared SGL scheduler did not run periodic deadline checkpoints");
         for (uint16_t rail = 0; rail < links; ++rail) {
             if (std::memcmp(expected[rail].Data(), actual[rail].Data(), actual[rail].Size()) != 0)
                 throw std::runtime_error("SGL scatter differs from direct reference");
@@ -1508,14 +1659,26 @@ bool RunSelfTest()
                     helloInfo.stageAddress = 0x22345000U + stageBytes * rail;
                     helloInfo.stageBytes = stageBytes;
                     helloInfo.stageKey = key;
+                    helloInfo.stageKey.eid[std::size(helloInfo.stageKey.eid) - 1] = 0xa5;
                 }
                 const auto hello = EncodeHello(helloInfo);
+                constexpr size_t independentlyCountedHelloBytes =
+                    4 + 40 + 4 + 2 * (4 + 4 + 8 + 8 + 80);
+                if (hello.size() != independentlyCountedHelloBytes || hello.size() != 256)
+                    throw std::runtime_error("HELLO independently counted wire extent is not 256 bytes");
+                if (mode == CopyMode::Sgl && hello.back() != 0xa5)
+                    throw std::runtime_error("HELLO final stage-key byte was not encoded inside the wire extent");
                 HelloInfo decodedHello{};
                 if (!DecodeHello(hello.data(), static_cast<uint32_t>(hello.size()), decodedHello) ||
                     !ValidateHelloMetadata(decodedHello, parameters, rail, railBytes, stageBytes) ||
-                    std::memcmp(&decodedHello.destinationKey, &key, sizeof(key)) != 0) {
+                    std::memcmp(&decodedHello.destinationKey, &key, sizeof(key)) != 0 ||
+                    (mode == CopyMode::Sgl &&
+                        std::memcmp(&decodedHello.stageKey, &helloInfo.stageKey, sizeof(key)) != 0)) {
                     throw std::runtime_error("HELLO wire round trip failed");
                 }
+                if (DecodeHello(hello.data(), static_cast<uint32_t>(hello.size() - 1), decodedHello) ||
+                    DecodeHello(hello.data(), 252, decodedHello))
+                    throw std::runtime_error("truncated/legacy-extent HELLO was accepted");
                 HelloInfo invalidMetadata = decodedHello;
                 if (mode == CopyMode::Direct) invalidMetadata.stageKey.keys[0] = 1;
                 else invalidMetadata.stageBytes++;
@@ -1703,6 +1866,7 @@ bool RunSelfTest()
                 }
             }
         }
+        SelfTestReadyPublicationOrder();
         for (uint16_t links : {uint16_t{1}, uint16_t{2}})
             for (uint16_t sglItems : {uint16_t{1}, uint16_t{8}, uint16_t{16}, uint16_t{30}})
                 for (PipelineMode pipeline : {PipelineMode::On, PipelineMode::Off})
@@ -1894,16 +2058,17 @@ private:
         return true;
     }
 
-    void PublishCallbackTrace(uint64_t generation, TracePoint &point, const char *event) noexcept
+    bool PublishCallbackTrace(uint64_t generation, TracePoint &point, const char *event) noexcept
     {
         size_t index = 0;
-        if (!TraceIndex(generation, index)) return;
+        if (!TraceIndex(generation, index)) return true;
         uint64_t timestamp = 0;
         if (!TryNowNs(timestamp)) {
             RecordFailure(std::string("clock_gettime failed while recording ") + event);
-            return;
+            return false;
         }
         point.Publish(timestamp);
+        return true;
     }
 
     void StartSecondaryRailThread()
@@ -2299,15 +2464,17 @@ private:
             RecordFailure(error + " rail=" + std::to_string(rail)); return -1;
         }
         std::atomic<uint64_t> &slot = mRails[rail].chunkReadyGeneration[info.chunkId];
-        if (!PublishChunkReady(slot, info.generation, error)) {
+        size_t trace = 0;
+        const bool traceEnabled = TraceIndex(info.generation, trace);
+        if (!PublishChunkReadyAfterOptionalObserver(slot, info.generation, traceEnabled,
+            [this, &info, rail, trace] {
+                return PublishCallbackTrace(info.generation,
+                    mTrace[trace].localChunkReady[rail][info.chunkId], "local_chunk_ready");
+            }, error)) {
             RecordFailure(error + " rail=" + std::to_string(rail) +
                 " chunk=" + std::to_string(info.chunkId));
             return -1;
         }
-        size_t trace = 0;
-        if (TraceIndex(info.generation, trace))
-            PublishCallbackTrace(info.generation, mTrace[trace].localChunkReady[rail][info.chunkId],
-                "local_chunk_ready");
         return 0;
     }
 
@@ -2611,73 +2778,52 @@ private:
             throw std::runtime_error("chunk scattered twice");
         size_t trace = 0;
         if (TraceIndex(generation, trace)) mTrace[trace].localScatterBegin[rail][chunk].Publish(NowNs());
-        const uint32_t first = chunk * mOptions.sglItems;
-        const uint32_t count = ChunkItemCount(mBlocksPerRail, mOptions.sglItems, chunk);
-        const uint32_t globalFirst = static_cast<uint32_t>(rail) * mBlocksPerRail;
-        for (uint32_t item = 0; item < count; ++item) {
-            const CopyEntry &entry = mCopyEntries[globalFirst + first + item];
-            uint64_t destination = 0;
-            uint64_t stage = 0;
-            if (!CheckedAddAddress(reinterpret_cast<uintptr_t>(state.buffer.Data()), entry.localDestinationOffset,
-                    kBlockBytes, state.buffer.Size(), destination) ||
-                !CheckedAddAddress(reinterpret_cast<uintptr_t>(state.stageBuffer.Data()),
-                    static_cast<uint64_t>(first + item) * kBlockBytes, kBlockBytes, state.stageBuffer.Size(), stage))
-                throw std::runtime_error("scatter address overflow/out of range rail=" + std::to_string(rail));
-            std::memcpy(reinterpret_cast<void *>(static_cast<uintptr_t>(destination)),
-                reinterpret_cast<const void *>(static_cast<uintptr_t>(stage)), kBlockBytes);
-        }
+        ScatterChunkPayload(rail, chunk, mBlocksPerRail, mOptions.sglItems, mCopyEntries,
+            state.buffer.Data(), state.buffer.Size(), state.stageBuffer.Data(), state.stageBuffer.Size());
         state.chunkConsumedGeneration[chunk] = generation;
         if (TraceIndex(generation, trace)) mTrace[trace].localScatterEnd[rail][chunk].Publish(NowNs());
     }
 
     bool AllChunksReady(uint64_t generation) const noexcept
     {
-        for (uint16_t rail = 0; rail < mOptions.links; ++rail)
-            for (uint32_t chunk = 0; chunk < mChunksPerRail; ++chunk)
-                if (mRails[rail].chunkReadyGeneration[chunk].load(std::memory_order_acquire) != generation)
-                    return false;
-        return true;
+        return AllSglChunksReady(mOptions.links, mChunksPerRail, [this, generation](uint16_t rail, uint32_t chunk) {
+            return mRails[rail].chunkReadyGeneration[chunk].load(std::memory_order_acquire) == generation;
+        });
     }
 
     void WaitAndScatterSgl(uint64_t generation, uint64_t expectedRequestSend, uint64_t deadlineNs)
     {
         const uint32_t totalChunks = mChunksPerRail * mOptions.links;
-        uint32_t scattered = 0;
+        SglSchedulerState scheduler{};
+        auto ready = [this, generation](uint16_t rail, uint32_t chunk) {
+            const RailState &state = mRails[rail];
+            return state.chunkConsumedGeneration[chunk] != generation &&
+                state.chunkReadyGeneration[chunk].load(std::memory_order_acquire) == generation;
+        };
+        auto scatter = [this, generation](uint16_t rail, uint32_t chunk) {
+            ScatterChunk(rail, chunk, generation);
+        };
+        auto checkpoint = [this, deadlineNs] {
+            CheckFatal("SGL scatter scheduler");
+            if (NowNs() >= deadlineNs)
+                throw std::runtime_error("timed out waiting for SGL scatter scheduler");
+        };
         if (mOptions.pipeline == PipelineMode::Off) {
             WaitDataUntil("all SGL chunks ready", deadlineNs, [this, generation] { return AllChunksReady(generation); });
-            for (uint16_t rail = 0; rail < mOptions.links; ++rail)
-                for (uint32_t chunk = 0; chunk < mChunksPerRail; ++chunk) {
-                    ScatterChunk(rail, chunk, generation);
-                    ++scattered;
-                }
+            if (!ScanReadySglChunks(mOptions.links, mChunksPerRail, scheduler, ready, scatter, checkpoint))
+                throw std::runtime_error("all-ready SGL scan made no progress");
         } else {
-            uint32_t spins = 0;
-            uint32_t cursor = 0;
-            while (scattered < totalChunks) {
-                bool progress = false;
-                for (uint32_t examined = 0; examined < totalChunks; ++examined) {
-                    const uint32_t linear = (cursor + examined) % totalChunks;
-                    const uint16_t rail = static_cast<uint16_t>(linear % mOptions.links);
-                    const uint32_t chunk = linear / mOptions.links;
-                    RailState &state = mRails[rail];
-                    if (state.chunkConsumedGeneration[chunk] != generation &&
-                        state.chunkReadyGeneration[chunk].load(std::memory_order_acquire) == generation) {
-                        ScatterChunk(rail, chunk, generation);
-                        ++scattered;
-                        cursor = (linear + 1) % totalChunks;
-                        progress = true;
-                    }
-                }
-                if (!progress) {
-                    CheckFatal("pipelined scatter"); CpuRelax();
-                    if ((++spins & (kDataDeadlineCheckInterval - 1)) == 0 && NowNs() >= deadlineNs)
-                        throw std::runtime_error("timed out waiting for pipelined scatter");
-                }
+            while (scheduler.scattered < totalChunks) {
+                const bool progress = ScanReadySglChunks(
+                    mOptions.links, mChunksPerRail, scheduler, ready, scatter, checkpoint);
+                if (!progress) CpuRelax();
             }
         }
-        if (scattered != totalChunks) throw std::runtime_error("scatter completed with wrong chunk count");
-        WaitDataUntil("COPY_REQ callback after scatter", deadlineNs, [this, expectedRequestSend] {
-            return mRails[0].callbackCounters.sendDoneCallbacks.load(std::memory_order_acquire) >= expectedRequestSend;
+        if (scheduler.scattered != totalChunks)
+            throw std::runtime_error("scatter completed with wrong chunk count");
+        WaitDataUntil("SGL completion gate", deadlineNs, [this, expectedRequestSend, &scheduler, totalChunks] {
+            return SglCompletionReached(scheduler.scattered, totalChunks,
+                mRails[0].callbackCounters.sendDoneCallbacks.load(std::memory_order_acquire) >= expectedRequestSend);
         });
     }
 

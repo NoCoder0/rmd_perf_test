@@ -7,14 +7,14 @@
 1. direct 与 SGL 统一升级 v5，保留每轮 600/600 真实地址和 9664B 请求。
 2. 增加 `--mode sgl --pipeline on|off`、严格 K 环境变量和每 rail 外部 QP cap 声明；当前依赖明确拒绝 K30。
 3. local/SGL 每 rail 注册连续 stage；remote 构造连续远端 iov，按 chunk 执行 PutV 后立即同 channel Send CHUNK_DONE。
-4. 增加 generation/CAS ready、乱序 chunk 接收、统一 scatter、on/off gate、请求 callback gate和单一绝对 deadline。
+4. 增加 generation ready 的原子占位→trace observer→release发布、乱序 chunk 接收、生产/自测共用 scatter scheduler 与 completion gate、on/off gate、请求 callback gate和单一绝对 deadline。
 5. 保留固定 rail 线程、pending/active、保守 callback drain；成功输出移到 teardown 之后。
 6. schema/trace/self-test/启动文档更新；未修改 ubs-comm，未恢复 Python。
 
 ## 本地完成条件
 
 - 使用当前 ubs-comm 公共头的全文件 `-fsyntax-only` 通过。
-- `RDMA_600_SELF_TEST_ONLY` 编译运行通过，覆盖 direct/SGL、单/双 rail、K1/8/16/30、尾 chunk、on/off、乱序/多代/错误通知/callback 延迟、wire 和 checked arithmetic。
+- `RDMA_600_SELF_TEST_ONLY` 编译运行通过，覆盖 direct/SGL、单/双 rail、K1/8/16/30、尾 chunk、on/off、固定起点完整扫描、乱序/多代/慢尾chunk/错误通知/callback 延迟、observer-before-ready、256B HELLO 边界和 checked arithmetic。
 - `git diff --check`、文档 JSON 解析和 main_reference 完整性复核通过。
 
 这些条件不等价于目标 Linux 链接或 RDMA 验收。

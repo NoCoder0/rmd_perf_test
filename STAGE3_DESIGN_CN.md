@@ -66,12 +66,12 @@ K1最坏每rail600个chunk，状态/通知数组按实际C预分配或容量600�
 统一升级为 `sparse-copy-v5-dual-rail-sgl`，version5及新magic，direct也使用v5以避免同版本异构消息。不能与旧v4或main v3混装。整数显式网络字节序编码，拒绝长度不符、尾随字节、保留位、未知mode/format。
 
 - Parameters由32B扩为40B，追加mode/u16、K/u16、pipeline/u16、source_format/u16；direct=(direct,0,off,direct-pairs)，sgl=(sgl,K,on|off,sparse-600)。所有消息携带/校验一致参数。
-- HELLO继承dst descriptor，追加stage区域ID/u32、stage基址/u64、stage长度/u64、完整80B key，总252B（旧144+参数8+stage100）。direct的stage字段必须全0，SGL stageID=3、长度R*1024。READY随params扩为64B，source key仍不导出。若实现增加能力字段，必须更新确切长度/自测/报告，不复用v4长度。
+- HELLO含magic4、Parameters40、rail/reserved4及两个完整region descriptor；每个descriptor为region ID/u32、reserved/u32、基址/u64、长度/u64、完整80B key，共104B，因此总长严格为 `4+40+4+104+104=256B`。direct的stage字段必须全0，SGL stageID=3、长度R*1024。编码和解码均核对最终cursor等于buffer end。READY随params扩为64B，source key仍不导出，不复用v4长度。
 - COPY_REQ保持64B头+600对(u64 src,u64 dst)，总9664B；复用头中已有mode/K/source_format/stageID字段，SGL填有效值，direct保留0。pipeline已在握手锁定；不占用地址正文、不减少请求成本。
 - 新增CHUNK_DONE opcode（现有700..706以外），40B：magic/u32、version/u16、rail/u16、generation/u64、chunk_id/u32、first_item/u32（rail内）、item_count/u32、payload_bytes/u32、chunk_count/u32、reserved/u32=0。接收rail来自handler注册绑定并与wire比较。
 - SGL每个PutV成功post后立即在**同channel、唯一真实QP** Send对应CHUNK_DONE；不等待该PutV本地callback后才发，也不等一rail全部数据再批发通知。SGL无需额外DATA_DONE；direct仍每rail一条DATA_DONE。
 - 每条真实QP上的WRITE→SEND顺序以及DMA可见性必须目标机验证。保留WORKER_POLL、linkCount=1、内部multirail=false、禁用split/RNDV、16384B消息容量；仅channel id/links数字不足以证明QP/NIC。
-- CHUNK_DONE必须校验当前generation、rail/c/count/first/bytes、当前模式、重复通知；当前代由local发送请求前release发布。过期/未来/重复/越界通知使run失败，合法跨rail或跨chunk交错可接受。ready槽以原子CAS防重复，并以release发布；app acquire后才读stage。
+- CHUNK_DONE必须校验当前generation、rail/c/count/first/bytes、当前模式、重复通知；当前代由local发送请求前release发布。过期/未来/重复/越界通知使run失败，合法跨rail或跨chunk交错可接受。ready槽先以原子哨兵独占，trace模式在可消费ready之前发布时间点，最后以release发布generation；重复通知不得进入observer或覆盖trace，app acquire后才读stage，measure不采逐chunk时间戳。
 
 ## 5. 线程、流水与生命周期
 
@@ -87,7 +87,7 @@ sparse_copy(g):
   rail0异步发送9664B COPY_REQ
   while 未scatter全部chunk 或 COPY_REQ本地callback尚未完成:
     检查fatal；周期性检查同一个absolute_deadline
-    on: 轮转rail和chunk，acquire读ready==g，有就绪即执行该chunk全部memcpy
+    on: 固定本轮scan起点完整遍历rail/chunk，acquire读ready==g，有就绪即执行该chunk全部memcpy；完整扫描后才轮转下轮起点
     off: 等所有chunk ready==g，之后用同一scatter函数遍历
     消费仅一次；无进展CpuRelax
   最后检查fatal/deadline；t1 = NowNs(); 记录t1-t0
@@ -97,7 +97,7 @@ ready与consumed状态独立，不清零上代原子来造成迟到通知被误�
 
 下一COPY_REQ就是上代stage/dst已消费的复用信用，成功路径没有chunk ACK/round ACK。remote上代callback尚未完成时允许下一请求进入pending，绝不能覆盖active；等待上代回收的时间自然计入下一次local调用。generation跨verify/warmup/measure连续且不回绕。
 
-保留CPU relax、每256次检查deadline、app私有attempted、callback原子完成、缓存行隔离、ActiveCallbackGuard。SGL各处理环节使用从t0派生的同一deadline，不在每个等待/scatter步骤重置超时；不能给on/off不同预算。direct若统一修正deadline，应记录变更并回归。
+保留CPU relax、按累计256个调度检查单元检查fatal/deadline（有scatter进展时同样累计）、app私有attempted、callback原子完成、缓存行隔离、ActiveCallbackGuard。SGL各处理环节使用从t0派生的同一deadline，不在每个等待/scatter步骤重置超时；不能给on/off不同预算。direct若统一修正deadline，应记录变更并回归。
 
 ## 6. 失败、退出与库限制
 
@@ -118,7 +118,7 @@ verify性能字段null。合格measure要求统计有限正值、全部正确性
 本地无需硬件的C++自测至少覆盖：
 
 1. B1/B2、S1/S2，K1/8/16/30布局及尾chunk，on/off参数和wire round-trip；坏env/模式/握手不一致、截断/尾随/坏key范围和地址溢出。
-2. 任意合法600对映射；手工模拟stage gather→按chunk ready乱序→scatter，比较direct参考结果；on/off完全一致，全部614400B和gap、重复source及重复dst拒绝。
+2. 任意合法600对映射；模拟stage gather→按chunk ready乱序，并调用与生产相同的scatter payload、固定起点scheduler及completion gate，比较direct参考结果；on/off完全一致，全部614400B和gap、重复source及重复dst拒绝。
 3. 就绪状态先收到慢rail之外的数据不提前完成；最后chunk、COPY_REQ callback延迟、错代/重复/越界通知不得提前返回；多代复用。
 4. 用当前真实公共头全文件受限语法检查和self-test-only运行，保存命令/结果，明确不是Linux真实库链接或硬件验证；不新增Python。
 
