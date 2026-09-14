@@ -2,9 +2,11 @@
 
 日期：2026-09-12
 
-说明：本文随 `main@38e6637` 同步，记录的是单链接阶段 1.5 A+B 的原始实施证据与内容标识。
-`duo_card` 在此基础上把同一 A+B 语义共同应用到阶段 2 的 B1/B2；当前双链接实现与待验证项以
-`README.md`、`PROGRESS.md` 和工作区 diff 为准，下文 A/AB diff SHA-1 不是当前阶段 2 diff 的标识。
+> 历史边界：本文记录的是旧 sender-driven、ROUND_READY/ROUND_ACK 协议，只保留阶段 1.5
+> A+B 的原始证据与内容标识。2026-09-14 起 duo_card 已迁为 requester-driven
+> `sparse-copy-v4-dual-rail`，成功路径 ACK=0。当前实现与待验证项以 `DESIGN_CN.md`、
+> `README.md`、`PROGRESS.md` 和 `STAGE2_SPARSE_COPY_REPORT_CN.md` 为准；下文旧时序和
+> diff SHA-1 不是当前代码的协议或内容标识。
 
 ## 1. 结论与状态
 

@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: MulanPSL-2.0
 //
-// Stage 2 direct B1/B2 benchmark for the 600 x 1 KiB ubs-comm RDMA
-// experiment. Each rail owns one service, one explicitly selected RDMA NIC,
-// one linkCount=1 worker-poll channel/QP, one MR, and independent protocol
-// state. Internal hcom multirail is disabled.
+// Requester-driven direct B1/B2 benchmark for the 600 x 1 KiB
+// ubs-comm RDMA experiment. Local owns the final destination and measures the
+// complete sparse_copy call. Remote owns the source and posts the RDMA writes.
+// In B2 each fixed application thread owns one service/NIC/QP for its complete
+// setup-to-drain lifetime; internal hcom multirail is disabled.
 
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
@@ -24,6 +25,9 @@
 #include <iostream>
 #include <limits>
 #include <map>
+#if defined(_WIN32)
+#include <malloc.h>
+#endif
 #include <mutex>
 #include <new>
 #include <numeric>
@@ -68,7 +72,9 @@ using ock::hcom::UBSHcomServiceProtocol;
 using ock::hcom::UBSHcomTlsOptions;
 using ock::hcom::UBSHcomTwoSideThreshold;
 
-constexpr uint16_t kProtocolVersion = 3;
+// Version 4 deliberately rejects the older sender-driven protocol, which also
+// used version 3 but had incompatible roles and per-round ACK semantics.
+constexpr uint16_t kProtocolVersion = 4;
 constexpr uint16_t kMaxLinks = 2;
 constexpr uint32_t kBlocks = 600;
 constexpr uint32_t kMaxBlocksPerRail = kBlocks;
@@ -79,6 +85,12 @@ constexpr uint32_t kDataDeadlineCheckInterval = 256;
 constexpr uint64_t kPayloadBytes = static_cast<uint64_t>(kBlocks) * kBlockBytes;
 constexpr uint8_t kDstGapSentinel = 0xa5;
 constexpr uint8_t kSourceGapSentinel = 0x5a;
+constexpr uint32_t kSourceRegionId = 1;
+constexpr uint32_t kDestinationRegionId = 2;
+constexpr uint16_t kModeDirect = 1;
+constexpr uint16_t kSourceFormatDirectPairs = 1;
+constexpr uint32_t kCopyErrorStageRemoteProcess = 1;
+constexpr uint32_t kCopyErrorCodeRequestFailed = 1;
 #if defined(__cpp_lib_hardware_interference_size)
 constexpr size_t kCounterAlignment = std::hardware_destructive_interference_size;
 #else
@@ -91,31 +103,43 @@ static_assert((kDataDeadlineCheckInterval & (kDataDeadlineCheckInterval - 1)) ==
 
 constexpr uint16_t kOpHello = 700;
 constexpr uint16_t kOpReady = 701;
-constexpr uint16_t kOpRoundReady = 702;
-constexpr uint16_t kOpRoundAck = 703;
-constexpr uint16_t kOpFinish = 704;
-constexpr uint16_t kOpFinishAck = 705;
+constexpr uint16_t kOpCopyReq = 702;
+constexpr uint16_t kOpDataDone = 703;
+constexpr uint16_t kOpCopyError = 704;
+constexpr uint16_t kOpFinish = 705;
+constexpr uint16_t kOpFinishAck = 706;
 
-constexpr uint32_t kHelloMagic = 0x52443630U;      // "RD60"
-constexpr uint32_t kReadyMagic = 0x52445259U;      // "RDRY"
-constexpr uint32_t kRoundReadyMagic = 0x52445244U; // "RDRD"
-constexpr uint32_t kAckMagic = 0x5244414bU;        // "RDAK"
-constexpr uint32_t kFinishMagic = 0x5244464eU;     // "RDFN"
-constexpr uint32_t kFinishAckMagic = 0x52444641U;  // "RDFA"
+constexpr uint32_t kHelloMagic = 0x53434834U;      // "SCH4"
+constexpr uint32_t kReadyMagic = 0x53435234U;      // "SCR4"
+constexpr uint32_t kCopyReqMagic = 0x53435034U;    // "SCP4"
+constexpr uint32_t kDataDoneMagic = 0x53434434U;   // "SCD4"
+constexpr uint32_t kCopyErrorMagic = 0x53434534U;  // "SCE4"
+constexpr uint32_t kFinishMagic = 0x53434634U;     // "SCF4"
+constexpr uint32_t kFinishAckMagic = 0x53434134U;  // "SCA4"
 
-// Params are 32 bytes in protocol v3. HELLO/READY also carry the rail id so
-// that a swapped OOB endpoint cannot silently become a valid dual-rail run.
+// Params are 32 bytes in protocol v4. HELLO carries this rail's local
+// destination registration; READY describes this rail's remote source region.
 constexpr size_t kParametersWireBytes = 32;
-constexpr size_t kHelloWireBytes = 4 + kParametersWireBytes + 4;
 constexpr size_t kMemoryKeyWireBytes = 80;
-constexpr size_t kReadyWireBytes = 4 + kParametersWireBytes + 4 + 16 + kMemoryKeyWireBytes;
-constexpr size_t kTokenWireBytes = 16;
+constexpr size_t kHelloWireBytes = 4 + kParametersWireBytes + 4 + 24 + kMemoryKeyWireBytes;
+constexpr size_t kReadyWireBytes = 4 + kParametersWireBytes + 4 + 16;
+constexpr size_t kCopyReqHeaderBytes = 64;
+constexpr size_t kCopyEntryWireBytes = 16;
+constexpr size_t kCopyReqDescriptorBytes = static_cast<size_t>(kBlocks) * kCopyEntryWireBytes;
+constexpr size_t kCopyReqWireBytes = kCopyReqHeaderBytes + kCopyReqDescriptorBytes;
+constexpr size_t kDataDoneWireBytes = 32;
+constexpr size_t kCopyErrorWireBytes = 32;
+constexpr size_t kTokenWireBytes = 24;
 
-enum class Role { Sender, Receiver };
+static_assert(kHelloWireBytes == 144, "HELLO wire size must include one destination key");
+static_assert(kReadyWireBytes == 56, "READY wire size is fixed");
+static_assert(kCopyReqWireBytes == 9664, "direct COPY_REQ must carry all 600 pairs");
+
+enum class Role { Local, Remote };
 enum class RunKind { Verify, Measure, Trace };
 
 struct Options {
-    Role role = Role::Sender;
+    Role role = Role::Local;
     RunKind kind = RunKind::Measure;
     uint16_t links = 1;
     std::vector<std::string> rdmaIps;
@@ -147,12 +171,26 @@ struct CaseParameters {
     }
 };
 
-struct ReadyInfo {
+struct HelloInfo {
     CaseParameters params;
     uint16_t rail = 0;
+    uint32_t destinationRegionId = 0;
     uint64_t destinationAddress = 0;
     uint64_t destinationBytes = 0;
     UBSHcomMemoryKey destinationKey{};
+};
+
+struct ReadyInfo {
+    CaseParameters params;
+    uint16_t rail = 0;
+    uint32_t sourceRegionId = 0;
+    uint32_t sourceAlignment = 0;
+    uint64_t sourceBytes = 0;
+};
+
+struct CopyEntry {
+    uint64_t remoteSourceOffset = 0;
+    uint64_t localDestinationOffset = 0;
 };
 
 class AlignedBuffer {
@@ -169,8 +207,13 @@ public:
     void Allocate(size_t size)
     {
         Reset();
+#if defined(_WIN32)
+        void *memory = _aligned_malloc(size, 4096);
+        const int rc = memory == nullptr ? errno : 0;
+#else
         void *memory = nullptr;
         const int rc = posix_memalign(&memory, 4096, size);
+#endif
         if (rc != 0 || memory == nullptr) {
             throw std::runtime_error("posix_memalign failed for " + std::to_string(size) + " bytes: " +
                 std::strerror(rc == 0 ? errno : rc));
@@ -182,7 +225,11 @@ public:
     void Reset()
     {
         if (mData != nullptr) {
+#if defined(_WIN32)
+            _aligned_free(mData);
+#else
             std::free(mData);
+#endif
             mData = nullptr;
             mSize = 0;
         }
@@ -204,7 +251,6 @@ uint64_t NowNs()
     }
     return static_cast<uint64_t>(ts.tv_sec) * 1000000000ULL + static_cast<uint64_t>(ts.tv_nsec);
 }
-
 bool TryNowNs(uint64_t &value) noexcept
 {
     timespec ts{};
@@ -324,18 +370,23 @@ UBSHcomMemoryKey DecodeMemoryKey(const uint8_t *&cursor)
     return key;
 }
 
-std::array<uint8_t, kHelloWireBytes> EncodeHello(const CaseParameters &params, uint16_t rail)
+std::array<uint8_t, kHelloWireBytes> EncodeHello(const HelloInfo &info)
 {
     std::array<uint8_t, kHelloWireBytes> payload{};
     uint8_t *cursor = payload.data();
     PutU32(cursor, kHelloMagic);
-    EncodeParams(cursor, params);
-    PutU16(cursor, rail);
+    EncodeParams(cursor, info.params);
+    PutU16(cursor, info.rail);
     PutU16(cursor, 0);
+    PutU32(cursor, info.destinationRegionId);
+    PutU32(cursor, 0);
+    PutU64(cursor, info.destinationAddress);
+    PutU64(cursor, info.destinationBytes);
+    EncodeMemoryKey(cursor, info.destinationKey);
     return payload;
 }
 
-bool DecodeHello(const void *data, uint32_t size, CaseParameters &params, uint16_t &rail)
+bool DecodeHello(const void *data, uint32_t size, HelloInfo &info)
 {
     if (data == nullptr || size != kHelloWireBytes) {
         return false;
@@ -344,9 +395,19 @@ bool DecodeHello(const void *data, uint32_t size, CaseParameters &params, uint16
     if (GetU32(cursor) != kHelloMagic) {
         return false;
     }
-    params = DecodeParams(cursor);
-    rail = GetU16(cursor);
-    return GetU16(cursor) == 0;
+    info.params = DecodeParams(cursor);
+    info.rail = GetU16(cursor);
+    if (GetU16(cursor) != 0) {
+        return false;
+    }
+    info.destinationRegionId = GetU32(cursor);
+    if (GetU32(cursor) != 0) {
+        return false;
+    }
+    info.destinationAddress = GetU64(cursor);
+    info.destinationBytes = GetU64(cursor);
+    info.destinationKey = DecodeMemoryKey(cursor);
+    return true;
 }
 
 std::array<uint8_t, kReadyWireBytes> EncodeReady(const ReadyInfo &info)
@@ -357,9 +418,9 @@ std::array<uint8_t, kReadyWireBytes> EncodeReady(const ReadyInfo &info)
     EncodeParams(cursor, info.params);
     PutU16(cursor, info.rail);
     PutU16(cursor, 0);
-    PutU64(cursor, info.destinationAddress);
-    PutU64(cursor, info.destinationBytes);
-    EncodeMemoryKey(cursor, info.destinationKey);
+    PutU32(cursor, info.sourceRegionId);
+    PutU32(cursor, info.sourceAlignment);
+    PutU64(cursor, info.sourceBytes);
     return payload;
 }
 
@@ -377,35 +438,221 @@ bool DecodeReady(const void *data, uint32_t size, ReadyInfo &info)
     if (GetU16(cursor) != 0) {
         return false;
     }
-    info.destinationAddress = GetU64(cursor);
-    info.destinationBytes = GetU64(cursor);
-    info.destinationKey = DecodeMemoryKey(cursor);
+    info.sourceRegionId = GetU32(cursor);
+    info.sourceAlignment = GetU32(cursor);
+    info.sourceBytes = GetU64(cursor);
     return true;
 }
 
-std::array<uint8_t, kTokenWireBytes> EncodeToken(uint32_t magic, uint64_t generation, uint16_t rail)
+uint16_t RailForRequestIndex(uint32_t index, uint16_t links)
+{
+    return static_cast<uint16_t>(index / (kBlocks / links));
+}
+
+uint32_t LocalIndexForRequest(uint32_t index, uint16_t links)
+{
+    return index % (kBlocks / links);
+}
+
+std::array<CopyEntry, kBlocks> MakeCopyEntries(uint64_t seed, uint16_t links)
+{
+    std::array<CopyEntry, kBlocks> entries{};
+    const uint32_t blocksPerRail = kBlocks / links;
+    const uint32_t shift = static_cast<uint32_t>(seed % blocksPerRail);
+    for (uint32_t index = 0; index < kBlocks; ++index) {
+        const uint32_t localIndex = LocalIndexForRequest(index, links);
+        const uint32_t sourceSlot = (localIndex * 7U + shift * 13U) % blocksPerRail;
+        const uint32_t destinationSlot = (localIndex * 11U + shift * 17U) % blocksPerRail;
+        entries[index].remoteSourceOffset = static_cast<uint64_t>(sourceSlot) * kStrideBytes;
+        entries[index].localDestinationOffset = static_cast<uint64_t>(destinationSlot) * kStrideBytes;
+    }
+    return entries;
+}
+
+bool ValidateCopyEntries(const std::array<CopyEntry, kBlocks> &entries, uint16_t links,
+    uint64_t sourceBytesPerRail, uint64_t destinationBytesPerRail, std::string &error)
+{
+    const uint32_t blocksPerRail = kBlocks / links;
+    std::array<std::array<bool, kMaxBlocksPerRail>, kMaxLinks> destinationsSeen{};
+    for (uint32_t index = 0; index < kBlocks; ++index) {
+        const uint16_t rail = RailForRequestIndex(index, links);
+        const CopyEntry &entry = entries[index];
+        if (entry.remoteSourceOffset % kStrideBytes != 0 || sourceBytesPerRail < kBlockBytes ||
+            entry.remoteSourceOffset > sourceBytesPerRail - kBlockBytes) {
+            error = "source offset is unaligned or out of range at request " + std::to_string(index) +
+                " rail " + std::to_string(rail);
+            return false;
+        }
+        if (entry.localDestinationOffset % kStrideBytes != 0 || destinationBytesPerRail < kBlockBytes ||
+            entry.localDestinationOffset > destinationBytesPerRail - kBlockBytes) {
+            error = "destination offset is unaligned or out of range at request " + std::to_string(index) +
+                " rail " + std::to_string(rail);
+            return false;
+        }
+        const uint64_t destinationSlot = entry.localDestinationOffset / kStrideBytes;
+        if (destinationSlot >= blocksPerRail || destinationsSeen[rail][static_cast<size_t>(destinationSlot)]) {
+            error = "destination slots must be unique within each request-index rail at request " +
+                std::to_string(index);
+            return false;
+        }
+        destinationsSeen[rail][static_cast<size_t>(destinationSlot)] = true;
+    }
+    return true;
+}
+
+std::array<uint8_t, kCopyReqWireBytes> EncodeCopyRequest(
+    uint64_t generation, uint16_t links, const std::array<CopyEntry, kBlocks> &entries)
+{
+    std::array<uint8_t, kCopyReqWireBytes> payload{};
+    uint8_t *cursor = payload.data();
+    PutU32(cursor, kCopyReqMagic);
+    PutU16(cursor, kProtocolVersion);
+    PutU16(cursor, kOpCopyReq);
+    PutU64(cursor, generation);
+    PutU32(cursor, kBlocks);
+    PutU32(cursor, kBlocks);
+    PutU32(cursor, kBlockBytes);
+    PutU16(cursor, kModeDirect);
+    PutU16(cursor, links);
+    PutU16(cursor, 0);
+    PutU16(cursor, kSourceFormatDirectPairs);
+    PutU32(cursor, kSourceRegionId);
+    PutU32(cursor, kDestinationRegionId);
+    PutU32(cursor, 0);
+    PutU32(cursor, kCopyReqHeaderBytes);
+    PutU32(cursor, kCopyReqDescriptorBytes);
+    PutU32(cursor, static_cast<uint32_t>(kPayloadBytes));
+    PutU32(cursor, 0);
+    for (const CopyEntry &entry : entries) {
+        PutU64(cursor, entry.remoteSourceOffset);
+        PutU64(cursor, entry.localDestinationOffset);
+    }
+    return payload;
+}
+
+bool DecodeCopyRequest(const void *data, uint32_t size, uint64_t expectedGeneration, uint16_t expectedLinks,
+    uint64_t sourceBytesPerRail, uint64_t destinationBytesPerRail,
+    std::array<CopyEntry, kBlocks> &entries, std::string &error)
+{
+    const auto fail = [&error](const std::string &message) { error = message; return false; };
+    if (data == nullptr || size != kCopyReqWireBytes) {
+        return fail("COPY_REQ size is not exactly 9664 bytes");
+    }
+    const uint8_t *cursor = static_cast<const uint8_t *>(data);
+    if (GetU32(cursor) != kCopyReqMagic || GetU16(cursor) != kProtocolVersion ||
+        GetU16(cursor) != kOpCopyReq) {
+        return fail("COPY_REQ magic/version/opcode mismatch");
+    }
+    if (GetU64(cursor) != expectedGeneration || GetU32(cursor) != kBlocks ||
+        GetU32(cursor) != kBlocks || GetU32(cursor) != kBlockBytes ||
+        GetU16(cursor) != kModeDirect || GetU16(cursor) != expectedLinks ||
+        GetU16(cursor) != 0 || GetU16(cursor) != kSourceFormatDirectPairs ||
+        GetU32(cursor) != kSourceRegionId || GetU32(cursor) != kDestinationRegionId ||
+        GetU32(cursor) != 0 || GetU32(cursor) != kCopyReqHeaderBytes ||
+        GetU32(cursor) != kCopyReqDescriptorBytes || GetU32(cursor) != kPayloadBytes ||
+        GetU32(cursor) != 0) {
+        return fail("COPY_REQ header fields do not match direct case");
+    }
+    for (CopyEntry &entry : entries) {
+        entry.remoteSourceOffset = GetU64(cursor);
+        entry.localDestinationOffset = GetU64(cursor);
+    }
+    return ValidateCopyEntries(entries, expectedLinks, sourceBytesPerRail, destinationBytesPerRail, error);
+}
+
+std::array<uint8_t, kDataDoneWireBytes> EncodeDataDone(uint64_t generation, uint16_t rail,
+    uint32_t blocksOnRail)
+{
+    std::array<uint8_t, kDataDoneWireBytes> payload{};
+    uint8_t *cursor = payload.data();
+    PutU32(cursor, kDataDoneMagic);
+    PutU16(cursor, kProtocolVersion);
+    PutU16(cursor, kOpDataDone);
+    PutU64(cursor, generation);
+    PutU16(cursor, rail);
+    PutU16(cursor, 0);
+    PutU32(cursor, blocksOnRail);
+    PutU32(cursor, blocksOnRail * kBlockBytes);
+    PutU32(cursor, 0);
+    return payload;
+}
+
+bool DecodeDataDone(const void *data, uint32_t size, uint16_t expectedRail, uint32_t expectedBlocks,
+    uint64_t &generation)
+{
+    if (data == nullptr || size != kDataDoneWireBytes) {
+        return false;
+    }
+    const uint8_t *cursor = static_cast<const uint8_t *>(data);
+    return GetU32(cursor) == kDataDoneMagic && GetU16(cursor) == kProtocolVersion &&
+        GetU16(cursor) == kOpDataDone && (generation = GetU64(cursor)) != 0 &&
+        GetU16(cursor) == expectedRail && GetU16(cursor) == 0 &&
+        GetU32(cursor) == expectedBlocks && GetU32(cursor) == expectedBlocks * kBlockBytes &&
+        GetU32(cursor) == 0;
+}
+
+std::array<uint8_t, kCopyErrorWireBytes> EncodeCopyError(
+    uint64_t generation, uint32_t stage, uint32_t errorCode, uint32_t detail)
+{
+    std::array<uint8_t, kCopyErrorWireBytes> payload{};
+    uint8_t *cursor = payload.data();
+    PutU32(cursor, kCopyErrorMagic);
+    PutU16(cursor, kProtocolVersion);
+    PutU16(cursor, kOpCopyError);
+    PutU64(cursor, generation);
+    PutU32(cursor, stage);
+    PutU32(cursor, errorCode);
+    PutU32(cursor, detail);
+    PutU32(cursor, 0);
+    return payload;
+}
+
+bool DecodeCopyError(const void *data, uint32_t size, uint64_t &generation,
+    uint32_t &stage, uint32_t &errorCode, uint32_t &detail)
+{
+    if (data == nullptr || size != kCopyErrorWireBytes) {
+        return false;
+    }
+    const uint8_t *cursor = static_cast<const uint8_t *>(data);
+    if (GetU32(cursor) != kCopyErrorMagic || GetU16(cursor) != kProtocolVersion ||
+        GetU16(cursor) != kOpCopyError) {
+        return false;
+    }
+    generation = GetU64(cursor);
+    stage = GetU32(cursor);
+    errorCode = GetU32(cursor);
+    detail = GetU32(cursor);
+    return GetU32(cursor) == 0;
+}
+
+std::array<uint8_t, kTokenWireBytes> EncodeToken(
+    uint32_t magic, uint16_t opcode, uint64_t generation, uint16_t rail)
 {
     std::array<uint8_t, kTokenWireBytes> payload{};
     uint8_t *cursor = payload.data();
     PutU32(cursor, magic);
+    PutU16(cursor, kProtocolVersion);
+    PutU16(cursor, opcode);
     PutU64(cursor, generation);
     PutU16(cursor, rail);
     PutU16(cursor, 0);
+    PutU32(cursor, 0);
     return payload;
 }
 
-bool DecodeToken(const void *data, uint32_t size, uint32_t magic, uint64_t &generation, uint16_t &rail)
+bool DecodeToken(const void *data, uint32_t size, uint32_t magic, uint16_t opcode,
+    uint64_t &generation, uint16_t &rail)
 {
     if (data == nullptr || size != kTokenWireBytes) {
         return false;
     }
     const uint8_t *cursor = static_cast<const uint8_t *>(data);
-    if (GetU32(cursor) != magic) {
+    if (GetU32(cursor) != magic || GetU16(cursor) != kProtocolVersion || GetU16(cursor) != opcode) {
         return false;
     }
     generation = GetU64(cursor);
     rail = GetU16(cursor);
-    return GetU16(cursor) == 0;
+    return GetU16(cursor) == 0 && GetU32(cursor) == 0;
 }
 
 uint64_t PatternWord(uint64_t generation, uint32_t globalBlock, uint32_t wordIndex)
@@ -451,7 +698,7 @@ bool VerifyGap(const uint8_t *address, std::string &error)
 
 std::string RoleName(Role role)
 {
-    return role == Role::Sender ? "sender" : "receiver";
+    return role == Role::Local ? "local" : "remote";
 }
 
 std::string KindName(RunKind kind)
@@ -525,10 +772,10 @@ std::vector<int> ParseCpuCsv(const std::string &name, const std::string &value)
 void PrintUsage(std::ostream &stream)
 {
     stream << "Usage:\n"
-           << "  rdma_600 --role receiver --rdma-ips <ip0[,ip1]> --listen <ep0[,ep1]> [options]\n"
-           << "  rdma_600 --role sender --rdma-ips <ip0[,ip1]> --peer <ep0[,ep1]> [options]\n"
+           << "  rdma_600 --role remote --rdma-ips <ip0[,ip1]> --listen <ep0[,ep1]> [options]\n"
+           << "  rdma_600 --role local --rdma-ips <ip0[,ip1]> --peer <ep0[,ep1]> [options]\n"
            << "  rdma_600 --self-test\n\n"
-           << "Stage 2 direct cases: --links 1 (B1) or --links 2 (B2), --mode plain.\n"
+           << "Requester-driven direct cases: --links 1 (B1) or --links 2 (B2), --mode direct.\n"
            << "Singular --rdma-ip/--app-cpu/--worker-cpu remain aliases for links=1.\n"
            << "Options: --kind verify|measure|trace --verify-rounds N --warmup N --rounds N\n"
            << "         --trace-rounds N (1..64 for trace) --timeout-sec N\n"
@@ -594,25 +841,25 @@ Options ParseOptions(int argc, char **argv)
     if (options.links == 0 || kBlocks % options.links != 0) {
         throw std::runtime_error("--links must be 1 or 2 and evenly divide 600");
     }
-    if (optional("--mode", "plain") != "plain") {
-        throw std::runtime_error("stage 2 supports only plain direct Put; no SGL/staging/scatter mode is available");
+    if (optional("--mode", "direct") != "direct") {
+        throw std::runtime_error("this binary supports only direct Put; no SGL/staging/scatter mode is available");
     }
 
     const std::string role = required("--role");
-    if (role == "sender") {
-        options.role = Role::Sender;
+    if (role == "local") {
+        options.role = Role::Local;
         options.endpoints = SplitCsv("--peer", required("--peer"));
         if (values.count("--listen") != 0) {
-            throw std::runtime_error("--listen is only valid for receiver");
+            throw std::runtime_error("--listen is only valid for remote");
         }
-    } else if (role == "receiver") {
-        options.role = Role::Receiver;
+    } else if (role == "remote") {
+        options.role = Role::Remote;
         options.endpoints = SplitCsv("--listen", required("--listen"));
         if (values.count("--peer") != 0) {
-            throw std::runtime_error("--peer is only valid for sender");
+            throw std::runtime_error("--peer is only valid for local");
         }
     } else {
-        throw std::runtime_error("--role must be sender or receiver");
+        throw std::runtime_error("--role must be local or remote");
     }
 
     if (values.count("--rdma-ip") != 0 && values.count("--rdma-ips") != 0) {
@@ -711,7 +958,7 @@ Options ParseOptions(int argc, char **argv)
         (std::any_of(options.appCpus.begin(), options.appCpus.end(), [](int cpu) { return cpu < 0; }) ||
             std::any_of(options.workerCpus.begin(), options.workerCpus.end(), [](int cpu) { return cpu < 0; }))) {
         throw std::runtime_error(
-            "stage-1.5 measure requires explicit app and per-rail worker CPUs for pinned busy polling");
+            "measure requires explicit app and per-rail worker CPUs for pinned busy polling");
     }
     return options;
 }
@@ -793,14 +1040,14 @@ struct TracePoint {
 
 struct TraceRound {
     uint64_t generation = 0;
-    TracePoint s0;
-    std::array<TracePoint, kMaxLinks> sPost;
-    TracePoint s1;
-    std::array<TracePoint, kMaxLinks> sData;
-    std::array<TracePoint, kMaxLinks> sAck;
-    TracePoint s2;
-    std::array<TracePoint, kMaxLinks> rReady;
-    std::array<TracePoint, kMaxLinks> rAck;
+    TracePoint localBegin;
+    TracePoint localRequestPosted;
+    std::array<TracePoint, kMaxLinks> localDataDone;
+    TracePoint localEnd;
+    TracePoint remoteRequestReceived;
+    std::array<TracePoint, kMaxLinks> remotePosted;
+    std::array<TracePoint, kMaxLinks> remoteDataCallbacksDone;
+    std::array<TracePoint, kMaxLinks> remoteDonePosted;
 };
 
 bool RunSelfTest()
@@ -811,15 +1058,8 @@ bool RunSelfTest()
             parameters.links = links;
             parameters.verifyRounds = 20;
             parameters.traceRounds = 3;
+            const uint64_t railBytes = static_cast<uint64_t>(kBlocks / links) * kStrideBytes;
             for (uint16_t rail = 0; rail < links; ++rail) {
-                const auto hello = EncodeHello(parameters, rail);
-                CaseParameters decoded{};
-                uint16_t decodedRail = kMaxLinks;
-                if (!DecodeHello(hello.data(), static_cast<uint32_t>(hello.size()), decoded, decodedRail) ||
-                    !SameParams(parameters, decoded) || decodedRail != rail) {
-                    throw std::runtime_error("HELLO wire round trip failed");
-                }
-
                 UBSHcomMemoryKey key{};
                 for (size_t index = 0; index < std::size(key.keys); ++index) {
                     key.keys[index] = 0x1000U + index + rail;
@@ -828,30 +1068,68 @@ bool RunSelfTest()
                 for (size_t index = 0; index < std::size(key.eid); ++index) {
                     key.eid[index] = static_cast<uint8_t>(index + rail);
                 }
-                ReadyInfo ready{parameters, rail, 0x12345000U, (kBlocks / links) * kStrideBytes, key};
+
+                HelloInfo helloInfo{parameters, rail, kDestinationRegionId, 0x12345000U + railBytes * rail,
+                    railBytes, key};
+                const auto hello = EncodeHello(helloInfo);
+                HelloInfo decodedHello{};
+                if (!DecodeHello(hello.data(), static_cast<uint32_t>(hello.size()), decodedHello) ||
+                    !SameParams(parameters, decodedHello.params) || decodedHello.rail != rail ||
+                    decodedHello.destinationRegionId != kDestinationRegionId ||
+                    decodedHello.destinationAddress != helloInfo.destinationAddress ||
+                    decodedHello.destinationBytes != railBytes ||
+                    std::memcmp(&decodedHello.destinationKey, &key, sizeof(key)) != 0) {
+                    throw std::runtime_error("HELLO wire round trip failed");
+                }
+
+                ReadyInfo ready{parameters, rail, kSourceRegionId, kStrideBytes, railBytes};
                 const auto readyWire = EncodeReady(ready);
                 ReadyInfo decodedReady{};
                 if (!DecodeReady(readyWire.data(), static_cast<uint32_t>(readyWire.size()), decodedReady) ||
                     !SameParams(ready.params, decodedReady.params) || decodedReady.rail != rail ||
-                    ready.destinationAddress != decodedReady.destinationAddress ||
-                    ready.destinationBytes != decodedReady.destinationBytes ||
-                    std::memcmp(&ready.destinationKey, &decodedReady.destinationKey, sizeof(key)) != 0) {
+                    decodedReady.sourceRegionId != kSourceRegionId ||
+                    decodedReady.sourceAlignment != kStrideBytes || decodedReady.sourceBytes != railBytes) {
                     throw std::runtime_error("READY wire round trip failed");
                 }
 
-                const auto token = EncodeToken(kRoundReadyMagic, 7, rail);
+                const auto token = EncodeToken(kFinishMagic, kOpFinish, 7, rail);
                 uint64_t decodedGeneration = 0;
-                decodedRail = kMaxLinks;
-                if (!DecodeToken(token.data(), static_cast<uint32_t>(token.size()), kRoundReadyMagic,
+                uint16_t decodedRail = kMaxLinks;
+                if (!DecodeToken(token.data(), static_cast<uint32_t>(token.size()), kFinishMagic, kOpFinish,
                         decodedGeneration, decodedRail) || decodedGeneration != 7 || decodedRail != rail) {
-                    throw std::runtime_error("ROUND_READY wire round trip failed");
+                    throw std::runtime_error("FINISH wire round trip failed");
                 }
             }
 
             const uint32_t blocksPerRail = kBlocks / links;
+            constexpr uint64_t generation = 7;
+            const auto entries = MakeCopyEntries(generation, links);
+            std::string validationError;
+            if (!ValidateCopyEntries(entries, links, railBytes, railBytes, validationError)) {
+                throw std::runtime_error("generated sparse mapping failed validation: " + validationError);
+            }
+            const auto request = EncodeCopyRequest(generation, links, entries);
+            std::array<CopyEntry, kBlocks> decodedEntries{};
+            if (!DecodeCopyRequest(request.data(), static_cast<uint32_t>(request.size()), generation, links,
+                    railBytes, railBytes, decodedEntries, validationError) ||
+                std::memcmp(entries.data(), decodedEntries.data(), sizeof(entries)) != 0) {
+                throw std::runtime_error("COPY_REQ wire round trip failed: " + validationError);
+            }
+            if (DecodeCopyRequest(request.data(), static_cast<uint32_t>(request.size() - 1), generation, links,
+                    railBytes, railBytes, decodedEntries, validationError)) {
+                throw std::runtime_error("truncated COPY_REQ was accepted");
+            }
+            auto duplicateRequest = request;
+            const uint32_t duplicateIndex = blocksPerRail > 1 ? 1 : 0;
+            std::copy_n(duplicateRequest.data() + kCopyReqHeaderBytes + 8, 8,
+                duplicateRequest.data() + kCopyReqHeaderBytes + duplicateIndex * kCopyEntryWireBytes + 8);
+            if (DecodeCopyRequest(duplicateRequest.data(), static_cast<uint32_t>(duplicateRequest.size()),
+                    generation, links, railBytes, railBytes, decodedEntries, validationError)) {
+                throw std::runtime_error("duplicate destination within one rail was accepted");
+            }
+
             std::array<AlignedBuffer, kMaxLinks> source;
             std::array<AlignedBuffer, kMaxLinks> destination;
-            constexpr uint64_t generation = 7;
             for (uint16_t rail = 0; rail < links; ++rail) {
                 const size_t bytes = static_cast<size_t>(blocksPerRail) * kStrideBytes;
                 source[rail].Allocate(bytes);
@@ -862,20 +1140,34 @@ bool RunSelfTest()
                     const uint32_t globalBlock = rail * blocksPerRail + localBlock;
                     FillBlock(source[rail].Data() + static_cast<size_t>(localBlock) * kStrideBytes,
                         generation, globalBlock);
-                    std::memcpy(destination[rail].Data() + static_cast<size_t>(localBlock) * kStrideBytes,
-                        source[rail].Data() + static_cast<size_t>(localBlock) * kStrideBytes, kBlockBytes);
                 }
-                for (uint32_t localBlock = 0; localBlock < blocksPerRail; ++localBlock) {
-                    const uint32_t globalBlock = rail * blocksPerRail + localBlock;
-                    const uint8_t *address = destination[rail].Data() + static_cast<size_t>(localBlock) * kStrideBytes;
+            }
+            for (uint32_t index = 0; index < kBlocks; ++index) {
+                const uint16_t rail = RailForRequestIndex(index, links);
+                std::memcpy(destination[rail].Data() + entries[index].localDestinationOffset,
+                    source[rail].Data() + entries[index].remoteSourceOffset, kBlockBytes);
+            }
+            for (uint32_t index = 0; index < kBlocks; ++index) {
+                    const uint16_t rail = RailForRequestIndex(index, links);
+                    const uint32_t sourceSlot = static_cast<uint32_t>(entries[index].remoteSourceOffset / kStrideBytes);
+                    const uint32_t globalBlock = rail * blocksPerRail + sourceSlot;
+                    const uint8_t *address = destination[rail].Data() + entries[index].localDestinationOffset;
                     std::string error;
                     if (!VerifyBlock(address, generation, globalBlock, error) || !VerifyGap(address, error)) {
                         throw std::runtime_error(error);
                     }
+            }
+
+            for (uint16_t rail = 0; rail < links; ++rail) {
+                const auto done = EncodeDataDone(generation, rail, blocksPerRail);
+                uint64_t decodedGeneration = 0;
+                if (!DecodeDataDone(done.data(), static_cast<uint32_t>(done.size()), rail, blocksPerRail,
+                        decodedGeneration) || decodedGeneration != generation) {
+                    throw std::runtime_error("DATA_DONE wire round trip failed");
                 }
             }
         }
-        std::cout << "SELF_TEST: PASS (B1/B2 direct partition, 600 blocks, 614400 bytes, stride 4096, wire v3)"
+        std::cout << "SELF_TEST: PASS (sparse-copy-v4, B1/B2, 9664-byte request, 600 direct blocks)"
                   << std::endl;
         return true;
     } catch (const std::exception &error) {
@@ -883,6 +1175,8 @@ bool RunSelfTest()
         return false;
     }
 }
+
+#ifndef RDMA_600_SELF_TEST_ONLY
 
 class ActiveCallbackGuard {
 public:
@@ -925,17 +1219,18 @@ struct RailState {
     UBSHcomMemoryKey memoryKey{};
     UBSHcomMemoryKey peerDestinationKey{};
     uintptr_t peerDestinationAddress = 0;
+    uint64_t peerDestinationBytes = 0;
+    uint64_t peerSourceBytes = 0;
     std::array<UBSHcomOneSideRequest, kMaxBlocksPerRail> putRequests{};
     std::array<uint8_t, kHelloWireBytes> helloPayload{};
     std::array<uint8_t, kReadyWireBytes> readyPayload{};
     std::array<uint8_t, kReadyWireBytes> readyResponse{};
-    std::array<uint8_t, kTokenWireBytes> roundReadyPayload{};
-    std::array<uint8_t, kTokenWireBytes> ackPayload{};
+    std::array<uint8_t, kDataDoneWireBytes> dataDonePayload{};
     std::array<uint8_t, kTokenWireBytes> finishPayload{};
     std::array<uint8_t, kTokenWireBytes> finishAckPayload{};
+    std::atomic<bool> helloClaimed{false};
     std::atomic<bool> helloSeen{false};
-    std::atomic<uint64_t> roundReadyGeneration{0};
-    std::atomic<uint64_t> ackGeneration{0};
+    std::atomic<uint64_t> dataDoneGeneration{0};
     std::atomic<uint64_t> finishGeneration{0};
     std::atomic<uint64_t> finishAckGeneration{0};
     AppOwnedCounters appCounters;
@@ -944,10 +1239,11 @@ struct RailState {
 
 enum class RailCommand : uint8_t {
     None,
+    Setup,
     ConnectAndHandshake,
-    SubmitRound,
-    RunReceiver,
-    SendFinish,
+    ProcessRemoteRound,
+    Finish,
+    Teardown,
 };
 
 // B2 keeps rail 0 on the original application thread and gives rail 1 one
@@ -963,12 +1259,11 @@ struct alignas(kCounterAlignment) SecondaryRailExecutor {
     std::atomic<uint64_t> completed{0};
     std::atomic<RailCommand> command{RailCommand::None};
     std::atomic<uint64_t> generation{0};
-    std::atomic<uint64_t> submitEndNs{0};
 };
 
-class DirectBenchmark {
+class SparseCopyBenchmark {
 public:
-    explicit DirectBenchmark(Options options) : mOptions(std::move(options))
+    explicit SparseCopyBenchmark(Options options) : mOptions(std::move(options))
     {
         mParams.links = mOptions.links;
         mParams.verifyRounds = mOptions.verifyRounds;
@@ -977,10 +1272,8 @@ public:
         mParams.traceRounds = mOptions.traceRounds;
         mBlocksPerRail = kBlocks / mOptions.links;
         if (TraceEnabled()) {
-            const uint64_t firstGeneration = static_cast<uint64_t>(mParams.verifyRounds) + 1;
-            for (uint32_t index = 0; index < mParams.traceRounds; ++index) {
-                mTrace[index].generation = firstGeneration + index;
-            }
+            const uint64_t first = static_cast<uint64_t>(mParams.verifyRounds) + 1;
+            for (uint32_t i = 0; i < mParams.traceRounds; ++i) mTrace[i].generation = first + i;
         }
     }
 
@@ -988,62 +1281,50 @@ public:
     {
         try {
             PinCurrentThread(mOptions.appCpus[0]);
-            SetupServices();
-            SetupMemory();
             StartSecondaryRailThread();
-            if (mOptions.role == Role::Receiver) {
-                mReceiverReady.store(true, std::memory_order_release);
+            SetupFixedRails();
+            if (mOptions.role == Role::Remote) {
+                mRemoteReady.store(true, std::memory_order_release);
                 PrintListening();
                 WaitForChannels();
-                RunReceiver();
+                RunRemote();
+                PrintRemoteStatus();
             } else {
-                ConnectSender();
-                Handshake();
-                BuildPutRequests();
-                RunSender();
+                ConnectLocal();
+                RunLocal();
+                PrintLocalResult();
             }
             CheckFatal("normal completion");
-            if (!DrainUntilComplete()) {
-                throw std::runtime_error("completion counters did not drain before teardown");
-            }
+            if (!DrainUntilComplete()) throw std::runtime_error("callbacks did not drain before teardown");
+            TeardownFixedRails();
             StopSecondaryRailThread();
-            if (TraceEnabled()) {
-                EmitTrace();
-            }
-            if (mOptions.role == Role::Sender) {
-                PrintSenderResult();
-            }
-            Teardown();
+            if (TraceEnabled()) EmitTrace();
             return 0;
         } catch (const std::exception &error) {
             RecordFailure(error.what());
             std::cerr << "ERROR: " << error.what() << std::endl;
-            StopSecondaryRailThread();
-            if (!DrainUntilComplete()) {
-                std::cerr << "FATAL: callbacks did not drain before the deadline; exiting without unsafe teardown"
-                          << std::endl;
+            if (!QuiesceSecondaryNoThrow()) {
+                std::cerr << "FATAL: rail 1 did not quiesce; exiting without racing its counters" << std::endl;
                 std::_Exit(2);
             }
-            Teardown();
+            if (!DrainUntilComplete()) {
+                std::cerr << "FATAL: callbacks did not drain; exiting without unsafe teardown" << std::endl;
+                std::_Exit(2);
+            }
+            TryTeardownFixedRails();
+            StopSecondaryRailThread();
             return 1;
         }
     }
 
 private:
-    bool TraceEnabled() const
-    {
-        return mOptions.kind == RunKind::Trace;
-    }
+    bool TraceEnabled() const { return mOptions.kind == RunKind::Trace; }
 
     bool TraceIndex(uint64_t generation, size_t &index) const noexcept
     {
-        if (!TraceEnabled()) {
-            return false;
-        }
+        if (!TraceEnabled()) return false;
         const uint64_t first = static_cast<uint64_t>(mParams.verifyRounds) + 1;
-        if (generation < first || generation >= first + mParams.traceRounds) {
-            return false;
-        }
+        if (generation < first || generation >= first + mParams.traceRounds) return false;
         index = static_cast<size_t>(generation - first);
         return true;
     }
@@ -1051,9 +1332,7 @@ private:
     void PublishCallbackTrace(uint64_t generation, TracePoint &point, const char *event) noexcept
     {
         size_t index = 0;
-        if (!TraceIndex(generation, index)) {
-            return;
-        }
+        if (!TraceIndex(generation, index)) return;
         uint64_t timestamp = 0;
         if (!TryNowNs(timestamp)) {
             RecordFailure(std::string("clock_gettime failed while recording ") + event);
@@ -1064,13 +1343,10 @@ private:
 
     void StartSecondaryRailThread()
     {
-        if (mOptions.links != 2) {
-            return;
-        }
+        if (mOptions.links != 2) return;
         mSecondary.thread = std::thread([this] { SecondaryRailThreadMain(); });
-        WaitControl("secondary rail application thread startup", [this] {
-            return mSecondary.started.load(std::memory_order_acquire);
-        });
+        WaitControl("secondary rail thread startup",
+            [this] { return mSecondary.started.load(std::memory_order_acquire); });
     }
 
     void SecondaryRailThreadMain() noexcept
@@ -1081,54 +1357,43 @@ private:
             uint64_t seen = 0;
             while (!mSecondary.stop.load(std::memory_order_acquire)) {
                 const uint64_t issued = mSecondary.issued.load(std::memory_order_acquire);
-                if (issued == seen) {
-                    CpuRelax();
-                    continue;
-                }
+                if (issued == seen) { CpuRelax(); continue; }
                 const RailCommand command = mSecondary.command.load(std::memory_order_relaxed);
                 const uint64_t generation = mSecondary.generation.load(std::memory_order_relaxed);
-                switch (command) {
-                    case RailCommand::ConnectAndHandshake:
-                        ConnectAndHandshakeRail(1);
-                        break;
-                    case RailCommand::SubmitRound:
-                        mSecondary.submitEndNs.store(SubmitRailRound(1, generation), std::memory_order_relaxed);
-                        break;
-                    case RailCommand::RunReceiver:
-                        RunReceiverRail(1);
-                        break;
-                    case RailCommand::SendFinish:
-                        SendFinishRail(1);
-                        break;
-                    case RailCommand::None:
-                        throw std::runtime_error("secondary rail received an empty command");
+                try {
+                    switch (command) {
+                        case RailCommand::Setup: SetupRail(1); break;
+                        case RailCommand::ConnectAndHandshake: ConnectAndHandshakeRail(1); break;
+                        case RailCommand::ProcessRemoteRound: ProcessRemoteRail(1, generation); break;
+                        case RailCommand::Finish: FinishRail(1); break;
+                        case RailCommand::Teardown: TeardownRail(1); break;
+                        case RailCommand::None: throw std::runtime_error("empty secondary rail command");
+                    }
+                } catch (const std::exception &error) {
+                    RecordFailure(std::string("rail 1 application thread: ") + error.what());
+                } catch (...) {
+                    RecordFailure("rail 1 application thread: unknown exception");
                 }
                 seen = issued;
                 mSecondary.completed.store(seen, std::memory_order_release);
             }
         } catch (const std::exception &error) {
             mSecondary.started.store(true, std::memory_order_release);
-            RecordFailure(std::string("rail 1 application thread: ") + error.what());
-        } catch (...) {
-            mSecondary.started.store(true, std::memory_order_release);
-            RecordFailure("rail 1 application thread: unknown exception");
+            RecordFailure(std::string("rail 1 startup: ") + error.what());
         }
     }
 
     uint64_t IssueSecondaryRailCommand(RailCommand command, uint64_t generation = 0)
     {
-        if (mOptions.links != 2 || !mSecondary.thread.joinable()) {
-            throw std::runtime_error("secondary rail command issued without its persistent thread");
-        }
+        if (mOptions.links != 2 || !mSecondary.thread.joinable())
+            throw std::runtime_error("secondary rail thread is unavailable");
         const uint64_t previous = mSecondary.issued.load(std::memory_order_relaxed);
-        if (mSecondary.completed.load(std::memory_order_acquire) != previous) {
+        if (mSecondary.completed.load(std::memory_order_acquire) != previous)
             throw std::runtime_error("secondary rail already has an outstanding command");
-        }
         mSecondary.generation.store(generation, std::memory_order_relaxed);
         mSecondary.command.store(command, std::memory_order_relaxed);
-        const uint64_t sequence = previous + 1;
-        mSecondary.issued.store(sequence, std::memory_order_release);
-        return sequence;
+        mSecondary.issued.store(previous + 1, std::memory_order_release);
+        return previous + 1;
     }
 
     void WaitSecondaryRailCommand(uint64_t sequence, const char *what)
@@ -1138,28 +1403,42 @@ private:
         });
     }
 
+    bool WaitSecondaryNoThrow(uint64_t sequence) noexcept
+    {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(mOptions.timeoutSec);
+        while (mSecondary.completed.load(std::memory_order_acquire) < sequence &&
+            std::chrono::steady_clock::now() < deadline) CpuRelax();
+        return mSecondary.completed.load(std::memory_order_acquire) >= sequence;
+    }
+
+    bool QuiesceSecondaryNoThrow() noexcept
+    {
+        if (mOptions.links != 2 || !mSecondary.thread.joinable()) return true;
+        return WaitSecondaryNoThrow(mSecondary.issued.load(std::memory_order_acquire));
+    }
+
     void StopSecondaryRailThread() noexcept
     {
-        if (!mSecondary.thread.joinable()) {
-            return;
-        }
+        if (!mSecondary.thread.joinable()) return;
         mSecondary.stop.store(true, std::memory_order_release);
         mSecondary.thread.join();
     }
 
-    void SetupServices()
+    void SetupFixedRails()
     {
-        for (uint16_t rail = 0; rail < mOptions.links; ++rail) {
-            SetupService(rail);
+        if (mOptions.links == 2) {
+            const uint64_t sequence = IssueSecondaryRailCommand(RailCommand::Setup);
+            WaitSecondaryRailCommand(sequence, "rail 1 setup");
         }
+        SetupRail(0);
     }
 
-    void SetupService(uint16_t rail)
+    void SetupRail(uint16_t rail)
     {
         RailState &state = mRails[rail];
         state.serviceName = "rdma600_" + RoleName(mOptions.role) + "_" + std::to_string(rail);
         UBSHcomServiceOptions options{};
-        options.maxSendRecvDataSize = 1024;
+        options.maxSendRecvDataSize = 16384;
         options.workerGroupThreadCount = 1;
         options.workerGroupMode = ock::hcom::NET_BUSY_POLLING;
         if (mOptions.workerCpus[rail] >= 0) {
@@ -1167,12 +1446,11 @@ private:
             options.workerGroupCpuIdsRange = {cpu, cpu};
         }
         state.service = UBSHcomService::Create(UBSHcomServiceProtocol::RDMA, state.serviceName, options);
-        if (state.service == nullptr) {
-            throw std::runtime_error("UBSHcomService::Create(RDMA) returned null for rail " + std::to_string(rail));
-        }
-        UBSHcomTlsOptions tlsOptions{};
-        tlsOptions.enableTls = false;
-        state.service->SetTlsOptions(tlsOptions);
+        if (state.service == nullptr)
+            throw std::runtime_error("Create RDMA service failed on rail " + std::to_string(rail));
+        UBSHcomTlsOptions tls{};
+        tls.enableTls = false;
+        state.service->SetTlsOptions(tls);
         state.service->SetDeviceIpMask({mOptions.rdmaIps[rail] + "/32"});
         UBSHcomMultiRailOptions multiRail{};
         multiRail.enable = false;
@@ -1186,23 +1464,17 @@ private:
         state.service->RegisterRecvHandler(
             [this, rail](UBSHcomServiceContext &context) { return OnIncoming(rail, context); });
         state.service->RegisterSendHandler([this](const UBSHcomServiceContext &) {
-            ActiveCallbackGuard guard(mActiveCallbacks);
-            return 0;
+            ActiveCallbackGuard guard(mActiveCallbacks); return 0;
         });
         state.service->RegisterOneSideHandler([this](const UBSHcomServiceContext &) {
-            ActiveCallbackGuard guard(mActiveCallbacks);
-            return 0;
+            ActiveCallbackGuard guard(mActiveCallbacks); return 0;
         });
-        state.service->RegisterChannelBrokenHandler(
-            [this, rail](const UBSHcomChannelPtr &) {
-                ActiveCallbackGuard guard(mActiveCallbacks);
-                if (!mTearingDown.load(std::memory_order_acquire)) {
-                    RecordFailure("hcom channel broken on rail " + std::to_string(rail));
-                }
-            },
-            UBSHcomChannelBrokenPolicy::BROKEN_ALL);
-
-        if (mOptions.role == Role::Receiver) {
+        state.service->RegisterChannelBrokenHandler([this, rail](const UBSHcomChannelPtr &) {
+            ActiveCallbackGuard guard(mActiveCallbacks);
+            if (!mTearingDown.load(std::memory_order_acquire))
+                RecordFailure("hcom channel broken on rail " + std::to_string(rail));
+        }, UBSHcomChannelBrokenPolicy::BROKEN_ALL);
+        if (mOptions.role == Role::Remote) {
             const int rc = state.service->Bind("tcp://" + mOptions.endpoints[rail],
                 [this, rail](const std::string &, const UBSHcomChannelPtr &channel, const std::string &) {
                     return OnNewChannel(rail, channel);
@@ -1210,61 +1482,46 @@ private:
             RequireOk(rc, ("Bind rail " + std::to_string(rail)).c_str());
         }
         RequireOk(state.service->Start(), ("Start rail " + std::to_string(rail)).c_str());
-    }
 
-    void SetupMemory()
-    {
         const size_t railBytes = static_cast<size_t>(mBlocksPerRail) * kStrideBytes;
-        for (uint16_t rail = 0; rail < mOptions.links; ++rail) {
-            RailState &state = mRails[rail];
-            state.buffer.Allocate(railBytes);
-            std::memset(state.buffer.Data(),
-                mOptions.role == Role::Sender ? kSourceGapSentinel : kDstGapSentinel, state.buffer.Size());
-            RequireOk(state.service->RegisterMemoryRegion(
-                          reinterpret_cast<uintptr_t>(state.buffer.Data()), state.buffer.Size(), state.memoryRegion),
-                ("RegisterMemoryRegion rail " + std::to_string(rail)).c_str());
-            state.memoryRegistered = true;
-            state.memoryKey = {};
-            state.memoryRegion.GetMemoryKey(state.memoryKey);
-            if (state.memoryRegion.GetAddress() != reinterpret_cast<uintptr_t>(state.buffer.Data()) ||
-                state.memoryRegion.GetSize() < state.buffer.Size()) {
-                throw std::runtime_error("MR does not cover rail " + std::to_string(rail) + " allocation");
-            }
-        }
-        if (mOptions.role == Role::Sender) {
-            FillSenderPattern(0);
-        }
+        state.buffer.Allocate(railBytes);
+        std::memset(state.buffer.Data(),
+            mOptions.role == Role::Remote ? kSourceGapSentinel : kDstGapSentinel, state.buffer.Size());
+        RequireOk(state.service->RegisterMemoryRegion(
+            reinterpret_cast<uintptr_t>(state.buffer.Data()), state.buffer.Size(), state.memoryRegion),
+            ("RegisterMemoryRegion rail " + std::to_string(rail)).c_str());
+        state.memoryRegistered = true;
+        state.memoryKey = {};
+        state.memoryRegion.GetMemoryKey(state.memoryKey);
+        if (state.memoryRegion.GetAddress() != reinterpret_cast<uintptr_t>(state.buffer.Data()) ||
+            state.memoryRegion.GetSize() < state.buffer.Size())
+            throw std::runtime_error("MR does not cover rail " + std::to_string(rail));
+        if (mOptions.role == Role::Remote) FillRemoteSourceRail(rail, 0);
     }
 
     void PrintListening() const
     {
-        std::ostringstream output;
-        output << "LISTENING role=receiver links=" << mOptions.links;
-        for (uint16_t rail = 0; rail < mOptions.links; ++rail) {
-            output << " rail" << rail << "=" << mOptions.endpoints[rail] << "/" << mOptions.rdmaIps[rail];
-        }
-        std::cout << output.str() << std::endl;
+        std::ostringstream out;
+        out << "LISTENING role=remote links=" << mOptions.links;
+        for (uint16_t rail = 0; rail < mOptions.links; ++rail)
+            out << " rail" << rail << "=" << mOptions.endpoints[rail] << "/" << mOptions.rdmaIps[rail];
+        std::cout << out.str() << std::endl;
         std::cout.flush();
     }
 
     int OnNewChannel(uint16_t rail, const UBSHcomChannelPtr &channel) noexcept
     {
         ActiveCallbackGuard guard(mActiveCallbacks);
-        if (mOptions.role != Role::Receiver || rail >= mOptions.links || channel == nullptr) {
-            RecordFailure("unexpected new channel");
-            return -1;
+        if (mOptions.role != Role::Remote || rail >= mOptions.links || channel == nullptr) {
+            RecordFailure("unexpected new channel"); return -1;
         }
-        if (!ConfigureChannel(rail, channel)) {
-            return -1;
-        }
-        RailState &state = mRails[rail];
+        if (!ConfigureChannel(rail, channel)) return -1;
         {
             std::lock_guard<std::mutex> lock(mChannelsMutex);
-            if (state.channel != nullptr) {
-                RecordFailure("receiver accepted more than one channel on rail " + std::to_string(rail));
-                return -1;
+            if (mRails[rail].channel != nullptr) {
+                RecordFailure("duplicate channel on rail " + std::to_string(rail)); return -1;
             }
-            state.channel = channel;
+            mRails[rail].channel = channel;
         }
         mChannelCv.notify_all();
         return 0;
@@ -1280,8 +1537,8 @@ private:
             thresholds.rndvThreshold = UINT32_MAX;
             const int rc = channel->SetTwoSideThreshold(thresholds);
             if (rc != 0) {
-                RecordFailure("SetTwoSideThreshold failed on rail " + std::to_string(rail) + ": " +
-                    std::to_string(rc));
+                RecordFailure("SetTwoSideThreshold failed on rail " + std::to_string(rail) +
+                    ": " + std::to_string(rc));
                 return false;
             }
             return true;
@@ -1291,31 +1548,15 @@ private:
         }
     }
 
-    void ConnectSender()
+    void ConnectLocal()
     {
-        if (mOptions.links == 1) {
-            ConnectRail(0);
-            return;
-        }
+        if (mOptions.links == 1) { ConnectAndHandshakeRail(0); return; }
         const uint64_t sequence = IssueSecondaryRailCommand(RailCommand::ConnectAndHandshake);
-        ConnectRail(0);
-        HandshakeRail(0);
-        WaitSecondaryRailCommand(sequence, "rail 1 connect and HELLO handshake");
-        mChannelCv.notify_all();
+        ConnectAndHandshakeRail(0);
+        WaitSecondaryRailCommand(sequence, "rail 1 connect and handshake");
     }
 
-    void Handshake()
-    {
-        if (mOptions.links == 2) {
-            // B2 handshakes were completed by their fixed rail threads in
-            // ConnectSender(). Keeping this call makes the B1/B2 outer flow
-            // identical without letting rail 0 touch service 1.
-            return;
-        }
-        HandshakeRail(0);
-    }
-
-    void ConnectRail(uint16_t rail)
+    void ConnectAndHandshakeRail(uint16_t rail)
     {
         UBSHcomConnectOptions options{};
         options.linkCount = 1;
@@ -1324,542 +1565,455 @@ private:
         UBSHcomChannelPtr channel;
         RequireOk(mRails[rail].service->Connect("tcp://" + mOptions.endpoints[rail], channel, options),
             ("Connect rail " + std::to_string(rail)).c_str());
-        if (channel == nullptr) {
-            throw std::runtime_error("Connect succeeded without a channel on rail " + std::to_string(rail));
-        }
-        if (!ConfigureChannel(rail, channel)) {
-            CheckFatal("ConfigureChannel after Connect");
-            throw std::runtime_error("ConfigureChannel failed after Connect");
-        }
+        if (channel == nullptr) throw std::runtime_error("Connect returned null channel");
+        if (!ConfigureChannel(rail, channel)) throw std::runtime_error("ConfigureChannel after Connect failed");
         {
             std::lock_guard<std::mutex> lock(mChannelsMutex);
             mRails[rail].channel = channel;
         }
-    }
-
-    void ConnectAndHandshakeRail(uint16_t rail)
-    {
-        ConnectRail(rail);
-        HandshakeRail(rail);
-    }
-
-    void HandshakeRail(uint16_t rail)
-    {
-        const uint64_t expectedBytes = static_cast<uint64_t>(mBlocksPerRail) * kStrideBytes;
         RailState &state = mRails[rail];
-        const UBSHcomChannelPtr channel = ChannelCopy(rail);
-        if (channel == nullptr) {
-            throw std::runtime_error("HELLO without a connected channel on rail " + std::to_string(rail));
-        }
-        state.helloPayload = EncodeHello(mParams, rail);
+        HelloInfo hello{mParams, rail, kDestinationRegionId,
+            reinterpret_cast<uintptr_t>(state.buffer.Data()), state.buffer.Size(), state.memoryKey};
+        state.helloPayload = EncodeHello(hello);
         UBSHcomRequest request(state.helloPayload.data(), static_cast<uint32_t>(state.helloPayload.size()), kOpHello);
         UBSHcomResponse response(state.readyResponse.data(), static_cast<uint32_t>(state.readyResponse.size()));
-        RequireOk(channel->Call(request, response, nullptr), ("HELLO Call rail " + std::to_string(rail)).c_str());
+        RequireOk(channel->Call(request, response, nullptr), ("HELLO rail " + std::to_string(rail)).c_str());
         ReadyInfo ready{};
+        const uint64_t railBytes = static_cast<uint64_t>(mBlocksPerRail) * kStrideBytes;
         if (!DecodeReady(response.address, response.size, ready) || !SameParams(mParams, ready.params) ||
-            ready.rail != rail || ready.destinationAddress == 0 || ready.destinationBytes != expectedBytes) {
-            throw std::runtime_error("invalid READY response on rail " + std::to_string(rail));
-        }
-        state.peerDestinationAddress = static_cast<uintptr_t>(ready.destinationAddress);
-        state.peerDestinationKey = ready.destinationKey;
-    }
-
-    void BuildPutRequests()
-    {
-        for (uint16_t rail = 0; rail < mOptions.links; ++rail) {
-            RailState &state = mRails[rail];
-            if (state.peerDestinationAddress == 0) {
-                throw std::runtime_error("cannot prepare Put descriptors without READY on rail " +
-                    std::to_string(rail));
-            }
-            for (uint32_t localBlock = 0; localBlock < mBlocksPerRail; ++localBlock) {
-                UBSHcomOneSideRequest &request = state.putRequests[localBlock];
-                request.lAddress = reinterpret_cast<uintptr_t>(state.buffer.Data()) +
-                    static_cast<uintptr_t>(localBlock) * kStrideBytes;
-                request.rAddress = state.peerDestinationAddress + static_cast<uintptr_t>(localBlock) * kStrideBytes;
-                request.lKey = state.memoryKey;
-                request.rKey = state.peerDestinationKey;
-                request.size = kBlockBytes;
-            }
-        }
+            ready.rail != rail || ready.sourceRegionId != kSourceRegionId ||
+            ready.sourceAlignment != kStrideBytes || ready.sourceBytes != railBytes)
+            throw std::runtime_error("invalid READY on rail " + std::to_string(rail));
+        state.peerSourceBytes = ready.sourceBytes;
     }
 
     int OnIncoming(uint16_t rail, UBSHcomServiceContext &context) noexcept
     {
         ActiveCallbackGuard guard(mActiveCallbacks);
-        const UBSHcomChannelPtr expectedChannel = ChannelCopy(rail);
-        if (expectedChannel == nullptr || context.Channel() != expectedChannel) {
-            RecordFailure("incoming message arrived on an unexpected channel for rail " + std::to_string(rail));
-            return -1;
+        const UBSHcomChannelPtr expected = ChannelCopy(rail);
+        if (expected == nullptr || context.Channel() != expected) {
+            RecordFailure("message on unexpected channel rail " + std::to_string(rail)); return -1;
         }
         if (context.Result() != 0) {
-            RecordFailure("incoming hcom context failed on rail " + std::to_string(rail) + ": " +
-                std::to_string(context.Result()));
-            return context.Result();
+            RecordFailure("incoming context failed: " + std::to_string(context.Result())); return context.Result();
         }
         switch (context.OpCode()) {
-            case kOpHello:
-                return OnHello(rail, context);
-            case kOpRoundReady:
-                return OnRoundReady(rail, context);
-            case kOpRoundAck:
-                return OnRoundAck(rail, context);
-            case kOpFinish:
-                return OnFinish(rail, context);
-            case kOpFinishAck:
-                return OnFinishAck(rail, context);
-            default:
-                RecordFailure("unexpected hcom opcode " + std::to_string(context.OpCode()) + " on rail " +
-                    std::to_string(rail));
-                return -1;
+            case kOpHello: return OnHello(rail, context);
+            case kOpCopyReq: return OnCopyReq(rail, context);
+            case kOpDataDone: return OnDataDone(rail, context);
+            case kOpCopyError: return OnCopyError(rail, context);
+            case kOpFinish: return OnFinish(rail, context);
+            case kOpFinishAck: return OnFinishAck(rail, context);
+            default: RecordFailure("unexpected opcode on rail " + std::to_string(rail)); return -1;
         }
     }
 
     int OnHello(uint16_t rail, UBSHcomServiceContext &context) noexcept
     {
-        if (mOptions.role != Role::Receiver || !mReceiverReady.load(std::memory_order_acquire)) {
-            RecordFailure("HELLO received before receiver initialization");
-            return -1;
+        if (mOptions.role != Role::Remote || !mRemoteReady.load(std::memory_order_acquire)) {
+            RecordFailure("HELLO before remote setup"); return -1;
         }
-        CaseParameters peer{};
-        uint16_t wireRail = kMaxLinks;
-        if (!DecodeHello(context.MessageData(), context.MessageDataLen(), peer, wireRail) ||
-            !SameParams(peer, mParams) || wireRail != rail) {
-            RecordFailure("HELLO parameters/rail do not match local configuration on rail " + std::to_string(rail));
-            return -1;
-        }
-        bool expected = false;
-        if (!mRails[rail].helloSeen.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
-            RecordFailure("duplicate HELLO on rail " + std::to_string(rail));
-            return -1;
+        HelloInfo hello{};
+        const uint64_t railBytes = static_cast<uint64_t>(mBlocksPerRail) * kStrideBytes;
+        if (!DecodeHello(context.MessageData(), context.MessageDataLen(), hello) ||
+            !SameParams(hello.params, mParams) || hello.rail != rail ||
+            hello.destinationRegionId != kDestinationRegionId || hello.destinationAddress == 0 ||
+            hello.destinationBytes != railBytes) {
+            RecordFailure("invalid HELLO on rail " + std::to_string(rail)); return -1;
         }
         RailState &state = mRails[rail];
-        ReadyInfo ready{};
-        ready.params = mParams;
-        ready.rail = rail;
-        ready.destinationAddress = reinterpret_cast<uintptr_t>(state.buffer.Data());
-        ready.destinationBytes = state.buffer.Size();
-        ready.destinationKey = state.memoryKey;
+        bool expected = false;
+        if (!state.helloClaimed.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
+            RecordFailure("duplicate HELLO"); return -1;
+        }
+        state.peerDestinationAddress = static_cast<uintptr_t>(hello.destinationAddress);
+        state.peerDestinationBytes = hello.destinationBytes;
+        state.peerDestinationKey = hello.destinationKey;
+        ReadyInfo ready{mParams, rail, kSourceRegionId, kStrideBytes, state.buffer.Size()};
         state.readyPayload = EncodeReady(ready);
         Callback *callback = NewSendCallback(rail);
-        if (callback == nullptr) {
-            RecordFailure("unable to allocate READY callback");
-            return -1;
-        }
-        state.callbackCounters.workerAttemptedSendCallbacks.fetch_add(1, std::memory_order_relaxed);
+        if (callback == nullptr) { RecordFailure("READY callback allocation failed"); return -1; }
+        state.callbackCounters.workerAttemptedSendCallbacks.fetch_add(1, std::memory_order_release);
+        // One release publishes peer destination metadata, READY storage, and
+        // callback accounting to the remote app before it can process COPY_REQ.
+        state.helloSeen.store(true, std::memory_order_release);
         const UBSHcomRequest reply(state.readyPayload.data(), static_cast<uint32_t>(state.readyPayload.size()), kOpReady);
-        const UBSHcomReplyContext replyContext(context.RspCtx(), 0);
-        const int rc = context.Channel()->Reply(replyContext, reply, callback);
-        if (rc != 0) {
-            RecordFailure("READY Reply failed on rail " + std::to_string(rail) + ": " + std::to_string(rc));
-            return rc;
+        const int rc = context.Channel()->Reply(UBSHcomReplyContext(context.RspCtx(), 0), reply, callback);
+        if (rc != 0) RecordFailure("READY Reply failed: " + std::to_string(rc));
+        return rc;
+    }
+
+    int OnCopyReq(uint16_t rail, UBSHcomServiceContext &context) noexcept
+    {
+        if (mOptions.role != Role::Remote || rail != 0 || !AllHellosSeen()) {
+            RecordFailure("COPY_REQ must use remote rail 0 after all HELLO"); return -1;
         }
+        bool expected = false;
+        if (!mPendingCopyReqOccupied.compare_exchange_strong(
+            expected, true, std::memory_order_acq_rel, std::memory_order_acquire)) {
+            RecordFailure("pending COPY_REQ slot occupied"); return -1;
+        }
+        mPendingCopyReqBytes = context.MessageDataLen();
+        if (context.MessageData() != nullptr && mPendingCopyReqBytes <= mPendingCopyReqPayload.size())
+            std::memcpy(mPendingCopyReqPayload.data(), context.MessageData(), mPendingCopyReqBytes);
+        if (mPendingCopyReqBytes == kCopyReqWireBytes && context.MessageData() != nullptr) {
+            const uint8_t *cursor = static_cast<const uint8_t *>(context.MessageData());
+            if (GetU32(cursor) == kCopyReqMagic && GetU16(cursor) == kProtocolVersion &&
+                GetU16(cursor) == kOpCopyReq) {
+                const uint64_t generation = GetU64(cursor);
+                size_t i = 0;
+                if (TraceIndex(generation, i))
+                    PublishCallbackTrace(generation, mTrace[i].remoteRequestReceived, "remote_request_received");
+            }
+        }
+        mPendingCopyReqPublished.store(true, std::memory_order_release);
         return 0;
     }
 
-    bool DecodeAndValidateToken(uint16_t rail, UBSHcomServiceContext &context, uint32_t magic,
-        const char *name, uint64_t &generation) noexcept
+    int OnDataDone(uint16_t rail, UBSHcomServiceContext &context) noexcept
+    {
+        if (mOptions.role != Role::Local) { RecordFailure("remote received DATA_DONE"); return -1; }
+        uint64_t generation = 0;
+        if (!DecodeDataDone(context.MessageData(), context.MessageDataLen(), rail, mBlocksPerRail, generation)) {
+            RecordFailure("invalid DATA_DONE rail " + std::to_string(rail)); return -1;
+        }
+        RailState &state = mRails[rail];
+        const uint64_t previous = state.dataDoneGeneration.load(std::memory_order_relaxed);
+        if (generation != previous + 1) {
+            RecordFailure("non-increasing DATA_DONE rail " + std::to_string(rail)); return -1;
+        }
+        size_t i = 0;
+        if (TraceIndex(generation, i))
+            PublishCallbackTrace(generation, mTrace[i].localDataDone[rail], "local_data_done");
+        state.dataDoneGeneration.store(generation, std::memory_order_release);
+        return 0;
+    }
+
+    int OnCopyError(uint16_t rail, UBSHcomServiceContext &context) noexcept
+    {
+        if (mOptions.role != Role::Local || rail != 0) {
+            RecordFailure("COPY_ERROR on wrong role/rail"); return -1;
+        }
+        uint64_t generation = 0; uint32_t stage = 0, code = 0, detail = 0;
+        if (!DecodeCopyError(context.MessageData(), context.MessageDataLen(), generation, stage, code, detail)) {
+            RecordFailure("invalid COPY_ERROR"); return -1;
+        }
+        RecordFailure("remote COPY_ERROR generation=" + std::to_string(generation) +
+            " stage=" + std::to_string(stage) + " code=" + std::to_string(code) +
+            " detail=" + std::to_string(detail));
+        return 0;
+    }
+
+    bool DecodeTokenForRail(uint16_t rail, UBSHcomServiceContext &context, uint32_t magic,
+        uint16_t opcode, uint64_t &generation) noexcept
     {
         uint16_t wireRail = kMaxLinks;
-        if (!DecodeToken(context.MessageData(), context.MessageDataLen(), magic, generation, wireRail) ||
-            generation == 0 || wireRail != rail) {
-            RecordFailure(std::string("invalid ") + name + " payload/rail on rail " + std::to_string(rail));
-            return false;
-        }
-        return true;
-    }
-
-    int OnRoundReady(uint16_t rail, UBSHcomServiceContext &context) noexcept
-    {
-        if (mOptions.role != Role::Receiver) {
-            RecordFailure("sender received ROUND_READY");
-            return -1;
-        }
-        uint64_t generation = 0;
-        if (!DecodeAndValidateToken(rail, context, kRoundReadyMagic, "ROUND_READY", generation)) {
-            return -1;
-        }
-        RailState &state = mRails[rail];
-        const uint64_t previous = state.roundReadyGeneration.load(std::memory_order_relaxed);
-        if (generation != previous + 1) {
-            RecordFailure("ROUND_READY generation is not strictly increasing on rail " + std::to_string(rail));
-            return -1;
-        }
-        size_t traceIndex = 0;
-        if (TraceIndex(generation, traceIndex)) {
-            PublishCallbackTrace(generation, mTrace[traceIndex].rReady[rail], "R_ready");
-        }
-        // This release publishes both DMA-complete data and R_ready to the app
-        // thread. It relies on ordered WRITE then SEND on this rail's real QP.
-        state.roundReadyGeneration.store(generation, std::memory_order_release);
-        return 0;
-    }
-
-    int OnRoundAck(uint16_t rail, UBSHcomServiceContext &context) noexcept
-    {
-        if (mOptions.role != Role::Sender) {
-            RecordFailure("receiver received ROUND_ACK");
-            return -1;
-        }
-        uint64_t generation = 0;
-        if (!DecodeAndValidateToken(rail, context, kAckMagic, "ROUND_ACK", generation)) {
-            return -1;
-        }
-        RailState &state = mRails[rail];
-        const uint64_t previous = state.ackGeneration.load(std::memory_order_relaxed);
-        if (generation != previous + 1) {
-            RecordFailure("ROUND_ACK generation is not strictly increasing on rail " + std::to_string(rail));
-            return -1;
-        }
-        size_t traceIndex = 0;
-        if (TraceIndex(generation, traceIndex)) {
-            PublishCallbackTrace(generation, mTrace[traceIndex].sAck[rail], "S_ack");
-        }
-        state.ackGeneration.store(generation, std::memory_order_release);
-        return 0;
+        return DecodeToken(context.MessageData(), context.MessageDataLen(), magic, opcode, generation, wireRail) &&
+            generation != 0 && wireRail == rail;
     }
 
     int OnFinish(uint16_t rail, UBSHcomServiceContext &context) noexcept
     {
-        if (mOptions.role != Role::Receiver) {
-            RecordFailure("sender received FINISH");
-            return -1;
-        }
         uint64_t generation = 0;
-        if (!DecodeAndValidateToken(rail, context, kFinishMagic, "FINISH", generation) ||
+        if (mOptions.role != Role::Remote ||
+            !DecodeTokenForRail(rail, context, kFinishMagic, kOpFinish, generation) ||
             generation != mParams.TotalRounds()) {
-            RecordFailure("invalid FINISH generation on rail " + std::to_string(rail));
-            return -1;
+            RecordFailure("invalid FINISH"); return -1;
         }
         uint64_t expected = 0;
         if (!mRails[rail].finishGeneration.compare_exchange_strong(
-                expected, generation, std::memory_order_release, std::memory_order_relaxed)) {
-            RecordFailure("duplicate FINISH on rail " + std::to_string(rail));
-            return -1;
+            expected, generation, std::memory_order_release, std::memory_order_relaxed)) {
+            RecordFailure("duplicate FINISH"); return -1;
         }
         return 0;
     }
 
     int OnFinishAck(uint16_t rail, UBSHcomServiceContext &context) noexcept
     {
-        if (mOptions.role != Role::Sender) {
-            RecordFailure("receiver received FINISH_ACK");
-            return -1;
-        }
         uint64_t generation = 0;
-        if (!DecodeAndValidateToken(rail, context, kFinishAckMagic, "FINISH_ACK", generation) ||
+        if (mOptions.role != Role::Local ||
+            !DecodeTokenForRail(rail, context, kFinishAckMagic, kOpFinishAck, generation) ||
             generation != mParams.TotalRounds()) {
-            RecordFailure("invalid FINISH_ACK generation on rail " + std::to_string(rail));
-            return -1;
+            RecordFailure("invalid FINISH_ACK"); return -1;
         }
         uint64_t expected = 0;
         if (!mRails[rail].finishAckGeneration.compare_exchange_strong(
-                expected, generation, std::memory_order_release, std::memory_order_relaxed)) {
-            RecordFailure("duplicate FINISH_ACK on rail " + std::to_string(rail));
-            return -1;
+            expected, generation, std::memory_order_release, std::memory_order_relaxed)) {
+            RecordFailure("duplicate FINISH_ACK"); return -1;
         }
         return 0;
     }
 
-    Callback *NewDataCallback(uint16_t rail, uint64_t generation, bool lastDataApi)
+    Callback *NewDataCallback(uint16_t rail, uint64_t generation, bool last)
     {
-        return UBSHcomNewCallback(
-            [this, rail, generation, lastDataApi](UBSHcomServiceContext &context) {
-                ActiveCallbackGuard guard(mActiveCallbacks);
-                if (context.Result() != 0) {
-                    RecordFailure("Put callback failed on rail " + std::to_string(rail) + ": " +
-                        std::to_string(context.Result()));
-                    return;
-                }
-                if (lastDataApi) {
-                    size_t traceIndex = 0;
-                    if (TraceIndex(generation, traceIndex)) {
-                        PublishCallbackTrace(generation, mTrace[traceIndex].sData[rail], "S_data");
-                    }
-                }
-                mRails[rail].callbackCounters.dataDoneCallbacks.fetch_add(1, std::memory_order_release);
-            },
-            std::placeholders::_1);
+        return UBSHcomNewCallback([this, rail, generation, last](UBSHcomServiceContext &context) {
+            ActiveCallbackGuard guard(mActiveCallbacks);
+            if (context.Result() != 0)
+                RecordFailure("Put callback failed rail " + std::to_string(rail) + ": " +
+                    std::to_string(context.Result()));
+            if (last) {
+                size_t i = 0;
+                if (TraceIndex(generation, i))
+                    PublishCallbackTrace(generation, mTrace[i].remoteDataCallbacksDone[rail],
+                        "remote_data_callbacks_done");
+            }
+            mRails[rail].callbackCounters.dataDoneCallbacks.fetch_add(1, std::memory_order_release);
+        }, std::placeholders::_1);
     }
 
     Callback *NewSendCallback(uint16_t rail)
     {
-        return UBSHcomNewCallback(
-            [this, rail](UBSHcomServiceContext &context) {
-                ActiveCallbackGuard guard(mActiveCallbacks);
-                if (context.Result() != 0) {
-                    RecordFailure("Send/Reply callback failed on rail " + std::to_string(rail) + ": " +
-                        std::to_string(context.Result()));
-                    return;
-                }
-                mRails[rail].callbackCounters.sendDoneCallbacks.fetch_add(1, std::memory_order_release);
-            },
-            std::placeholders::_1);
+        return UBSHcomNewCallback([this, rail](UBSHcomServiceContext &context) {
+            ActiveCallbackGuard guard(mActiveCallbacks);
+            if (context.Result() != 0)
+                RecordFailure("Send callback failed rail " + std::to_string(rail) + ": " +
+                    std::to_string(context.Result()));
+            mRails[rail].callbackCounters.sendDoneCallbacks.fetch_add(1, std::memory_order_release);
+        }, std::placeholders::_1);
     }
 
-    void RunSender()
+    void RunLocal()
     {
         uint64_t generation = 1;
-        for (uint32_t round = 0; round < mParams.verifyRounds; ++round, ++generation) {
-            FillSenderPattern(generation);
-            RunSenderRound(generation, false);
+        for (uint32_t i = 0; i < mParams.verifyRounds; ++i, ++generation) {
+            SparseCopy(generation, false); VerifyLocalDestination(mCopyEntries, generation);
         }
-        FillSenderPattern(0);
-        for (uint32_t round = 0; round < mParams.warmupRounds; ++round, ++generation) {
-            RunSenderRound(generation, false);
-        }
+        for (uint32_t i = 0; i < mParams.warmupRounds; ++i, ++generation) SparseCopy(generation, false);
         if (mParams.measureRounds != 0) {
-            mSubmitNs.reserve(mParams.measureRounds);
-            mE2eNs.reserve(mParams.measureRounds);
+            mSparseCopyNs.reserve(mParams.measureRounds);
             mMeasureWallStartNs = NowNs();
-            for (uint32_t round = 0; round < mParams.measureRounds; ++round, ++generation) {
-                RunSenderRound(generation, true);
-            }
+            for (uint32_t i = 0; i < mParams.measureRounds; ++i, ++generation) SparseCopy(generation, true);
             mMeasureWallEndNs = NowNs();
+            VerifyLocalDestination(MakeCopyEntries(mParams.verifyRounds, mOptions.links), mParams.verifyRounds);
         }
-        for (uint32_t round = 0; round < mParams.traceRounds; ++round, ++generation) {
-            RunSenderRound(generation, false);
-        }
-        SendFinish();
+        for (uint32_t i = 0; i < mParams.traceRounds; ++i, ++generation) SparseCopy(generation, false);
+        if (mParams.traceRounds != 0)
+            VerifyLocalDestination(MakeCopyEntries(mParams.verifyRounds, mOptions.links), mParams.verifyRounds);
+        FinishAllRails();
     }
 
-    void RunSenderRound(uint64_t generation, bool measure)
+    void SparseCopy(uint64_t generation, bool measure)
     {
-        std::array<uint64_t, kMaxLinks> expectedData{};
-        std::array<uint64_t, kMaxLinks> expectedSend{};
-        for (uint16_t rail = 0; rail < mOptions.links; ++rail) {
-            if (ChannelCopy(rail) == nullptr) {
-                throw std::runtime_error("sender lost channel before round on rail " + std::to_string(rail));
-            }
-            expectedData[rail] = mRails[rail].appCounters.attemptedDataCallbacks + mBlocksPerRail;
-            expectedSend[rail] = ExpectedSendCallbacks(rail) + 1;
-        }
-
-        const uint64_t startNs = NowNs();
-        size_t traceIndex = 0;
-        if (TraceIndex(generation, traceIndex)) {
-            mTrace[traceIndex].s0.Publish(startNs);
-        }
-
-        uint64_t secondarySequence = 0;
-        if (mOptions.links == 2) {
-            secondarySequence = IssueSecondaryRailCommand(RailCommand::SubmitRound, generation);
-        }
-        const uint64_t rail0SubmitEndNs = SubmitRailRound(0, generation);
-        uint64_t submitNs = rail0SubmitEndNs;
-        if (mOptions.links == 2) {
-            WaitSecondaryRailCommand(secondarySequence, "rail 1 round submission");
-            submitNs = std::max(submitNs, mSecondary.submitEndNs.load(std::memory_order_relaxed));
-        }
-        if (TraceIndex(generation, traceIndex)) {
-            mTrace[traceIndex].s1.Publish(submitNs);
-        }
-
-        WaitData("round completion", [this, generation, &expectedData, &expectedSend] {
-            for (uint16_t rail = 0; rail < mOptions.links; ++rail) {
-                if (mRails[rail].ackGeneration.load(std::memory_order_acquire) < generation ||
-                    mRails[rail].callbackCounters.dataDoneCallbacks.load(std::memory_order_acquire) <
-                        expectedData[rail] ||
-                    mRails[rail].callbackCounters.sendDoneCallbacks.load(std::memory_order_acquire) <
-                        expectedSend[rail]) {
-                    return false;
-                }
-            }
+        const uint64_t start = NowNs();
+        size_t trace = 0;
+        if (TraceIndex(generation, trace)) mTrace[trace].localBegin.Publish(start);
+        const uint64_t seed = generation <= mParams.verifyRounds ? generation : mParams.verifyRounds;
+        mCopyEntries = MakeCopyEntries(seed, mOptions.links);
+        const uint64_t railBytes = static_cast<uint64_t>(mBlocksPerRail) * kStrideBytes;
+        std::string error;
+        if (!ValidateCopyEntries(mCopyEntries, mOptions.links, railBytes, railBytes, error))
+            throw std::runtime_error("local input validation: " + error);
+        for (uint16_t rail = 0; rail < mOptions.links; ++rail)
+            if (mRails[rail].peerSourceBytes != railBytes)
+                throw std::runtime_error("invalid remote source metadata");
+        mCopyReqPayload = EncodeCopyRequest(generation, mOptions.links, mCopyEntries);
+        const uint64_t expectedSend = ExpectedSendCallbacks(0) + 1;
+        PostAsyncSend(0, ChannelCopyRequired(0, "COPY_REQ"), mCopyReqPayload.data(),
+            mCopyReqPayload.size(), kOpCopyReq);
+        if (TraceIndex(generation, trace)) mTrace[trace].localRequestPosted.Publish(NowNs());
+        WaitData("sparse_copy completion", [this, generation, expectedSend] {
+            if (mRails[0].callbackCounters.sendDoneCallbacks.load(std::memory_order_acquire) < expectedSend)
+                return false;
+            for (uint16_t rail = 0; rail < mOptions.links; ++rail)
+                if (mRails[rail].dataDoneGeneration.load(std::memory_order_acquire) < generation) return false;
             return true;
         });
-        const uint64_t endNs = NowNs();
-        if (TraceIndex(generation, traceIndex)) {
-            mTrace[traceIndex].s2.Publish(endNs);
-        }
-        if (measure) {
-            mSubmitNs.push_back(submitNs - startNs);
-            mE2eNs.push_back(endNs - startNs);
-        }
+        const uint64_t end = NowNs();
+        if (TraceIndex(generation, trace)) mTrace[trace].localEnd.Publish(end);
+        if (measure) mSparseCopyNs.push_back(end - start);
     }
 
-    uint64_t SubmitRailRound(uint16_t rail, uint64_t generation)
+    void RunRemote()
     {
-        const UBSHcomChannelPtr channel = ChannelCopyRequired(rail, "round submission");
-        RailState &state = mRails[rail];
-        for (uint32_t localBlock = 0; localBlock < mBlocksPerRail; ++localBlock) {
-            Callback *callback = NewDataCallback(rail, generation, localBlock + 1 == mBlocksPerRail);
-            if (callback == nullptr) {
-                throw std::runtime_error("unable to allocate Put callback on rail " + std::to_string(rail));
-            }
-            ++state.appCounters.attemptedDataCallbacks;
-            const int rc = channel->Put(state.putRequests[localBlock], callback);
-            if (rc != 0) {
-                throw std::runtime_error("Put failed on rail " + std::to_string(rail) + ": " +
-                    std::to_string(rc));
-            }
-        }
-
-        state.roundReadyPayload = EncodeToken(kRoundReadyMagic, generation, rail);
-        PostAsyncSend(rail, channel, state.roundReadyPayload.data(), state.roundReadyPayload.size(), kOpRoundReady);
-        const uint64_t submitEndNs = NowNs();
-        size_t traceIndex = 0;
-        if (TraceIndex(generation, traceIndex)) {
-            mTrace[traceIndex].sPost[rail].Publish(submitEndNs);
-        }
-        return submitEndNs;
-    }
-
-    void RunReceiver()
-    {
-        uint64_t secondarySequence = 0;
-        if (mOptions.links == 2) {
-            secondarySequence = IssueSecondaryRailCommand(RailCommand::RunReceiver);
-        }
-        RunReceiverRail(0);
-        if (mOptions.links == 2) {
-            WaitSecondaryRailCommand(secondarySequence, "rail 1 receiver loop and FINISH_ACK");
-        }
-    }
-
-    void RunReceiverRail(uint16_t rail)
-    {
-        RailState &state = mRails[rail];
+        WaitData("all HELLO", [this] { return AllHellosSeen(); });
         for (uint64_t generation = 1; generation <= mParams.TotalRounds(); ++generation) {
-            WaitData("next per-rail ROUND_READY", [this, rail, generation] {
-                return mRails[rail].roundReadyGeneration.load(std::memory_order_acquire) >= generation;
-            });
-            if (generation <= mParams.verifyRounds) {
-                VerifyReceiverRail(rail, generation);
+            try {
+                ReceivePendingCopyRequest();
+                DecodeActiveCopyRequest(generation);
+                uint64_t sequence = 0;
+                if (mOptions.links == 2)
+                    sequence = IssueSecondaryRailCommand(RailCommand::ProcessRemoteRound, generation);
+                ProcessRemoteRail(0, generation);
+                if (mOptions.links == 2)
+                    WaitSecondaryRailCommand(sequence, "rail 1 remote copy");
+            } catch (...) {
+                TrySendCopyError(generation, kCopyErrorStageRemoteProcess, kCopyErrorCodeRequestFailed, 0);
+                throw;
             }
-            size_t traceIndex = 0;
-            if (TraceIndex(generation, traceIndex)) {
-                mTrace[traceIndex].rAck[rail].Publish(NowNs());
-            }
-            state.ackPayload = EncodeToken(kAckMagic, generation, rail);
-            PostAsyncSend(rail, ChannelCopyRequired(rail, "ROUND_ACK"), state.ackPayload.data(),
-                state.ackPayload.size(), kOpRoundAck);
-            const uint64_t sendTarget = ExpectedSendCallbacks(rail);
-            WaitData("per-rail ROUND_ACK local completion", [this, rail, sendTarget] {
-                return mRails[rail].callbackCounters.sendDoneCallbacks.load(std::memory_order_acquire) >= sendTarget;
-            });
         }
-        if (mParams.measureRounds != 0 || mParams.traceRounds != 0) {
-            VerifyReceiverRail(rail, 0);
-        }
-        WaitControl("per-rail FINISH", [this, rail] {
-            return mRails[rail].finishGeneration.load(std::memory_order_acquire) == mParams.TotalRounds();
-        });
-        SendFinishAckRail(rail);
+        FinishAllRails();
     }
 
-    void VerifyReceiverRail(uint16_t rail, uint64_t generation)
+    bool AllHellosSeen() const noexcept
     {
-        for (uint32_t localBlock = 0; localBlock < mBlocksPerRail; ++localBlock) {
-            const uint32_t globalBlock = rail * mBlocksPerRail + localBlock;
-            const uint8_t *destination = mRails[rail].buffer.Data() +
-                static_cast<size_t>(localBlock) * kStrideBytes;
+        for (uint16_t rail = 0; rail < mOptions.links; ++rail)
+            if (!mRails[rail].helloSeen.load(std::memory_order_acquire)) return false;
+        return true;
+    }
+
+    void ReceivePendingCopyRequest()
+    {
+        WaitData("COPY_REQ", [this] { return mPendingCopyReqPublished.load(std::memory_order_acquire); });
+        mActiveCopyReqBytes = mPendingCopyReqBytes;
+        if (mActiveCopyReqBytes <= mActiveCopyReqPayload.size())
+            std::memcpy(mActiveCopyReqPayload.data(), mPendingCopyReqPayload.data(), mActiveCopyReqBytes);
+        mPendingCopyReqPublished.store(false, std::memory_order_relaxed);
+        mPendingCopyReqOccupied.store(false, std::memory_order_release);
+    }
+
+    void DecodeActiveCopyRequest(uint64_t generation)
+    {
+        const uint64_t railBytes = static_cast<uint64_t>(mBlocksPerRail) * kStrideBytes;
+        std::string error;
+        if (!DecodeCopyRequest(mActiveCopyReqPayload.data(), mActiveCopyReqBytes, generation, mOptions.links,
+            railBytes, railBytes, mActiveCopyEntries, error))
+            throw std::runtime_error("invalid COPY_REQ: " + error);
+    }
+
+    void ProcessRemoteRail(uint16_t rail, uint64_t generation)
+    {
+        RailState &state = mRails[rail];
+        if (generation <= mParams.verifyRounds) FillRemoteSourceRail(rail, generation);
+        BuildRemotePutRequests(rail);
+        const uint64_t expectedData = state.appCounters.attemptedDataCallbacks + mBlocksPerRail;
+        const UBSHcomChannelPtr channel = ChannelCopyRequired(rail, "remote copy");
+        for (uint32_t i = 0; i < mBlocksPerRail; ++i) {
+            Callback *callback = NewDataCallback(rail, generation, i + 1 == mBlocksPerRail);
+            if (callback == nullptr) throw std::runtime_error("Put callback allocation failed");
+            ++state.appCounters.attemptedDataCallbacks;
+            const int rc = channel->Put(state.putRequests[i], callback);
+            if (rc != 0) throw std::runtime_error("Put failed: " + std::to_string(rc));
+        }
+        size_t trace = 0;
+        if (TraceIndex(generation, trace)) mTrace[trace].remotePosted[rail].Publish(NowNs());
+        state.dataDonePayload = EncodeDataDone(generation, rail, mBlocksPerRail);
+        const uint64_t expectedSend = ExpectedSendCallbacks(rail) + 1;
+        PostAsyncSend(rail, channel, state.dataDonePayload.data(), state.dataDonePayload.size(), kOpDataDone);
+        if (TraceIndex(generation, trace)) mTrace[trace].remoteDonePosted[rail].Publish(NowNs());
+        WaitData("remote callbacks", [this, rail, expectedData, expectedSend] {
+            return mRails[rail].callbackCounters.dataDoneCallbacks.load(std::memory_order_acquire) >= expectedData &&
+                mRails[rail].callbackCounters.sendDoneCallbacks.load(std::memory_order_acquire) >= expectedSend;
+        });
+    }
+
+    void BuildRemotePutRequests(uint16_t rail)
+    {
+        RailState &state = mRails[rail];
+        const uint32_t first = static_cast<uint32_t>(rail) * mBlocksPerRail;
+        for (uint32_t i = 0; i < mBlocksPerRail; ++i) {
+            const CopyEntry &entry = mActiveCopyEntries[first + i];
+            UBSHcomOneSideRequest &request = state.putRequests[i];
+            request.lAddress = reinterpret_cast<uintptr_t>(state.buffer.Data()) + entry.remoteSourceOffset;
+            request.rAddress = state.peerDestinationAddress + entry.localDestinationOffset;
+            request.lKey = state.memoryKey;
+            request.rKey = state.peerDestinationKey;
+            request.size = kBlockBytes;
+        }
+    }
+
+    void FillRemoteSourceRail(uint16_t rail, uint64_t generation)
+    {
+        for (uint32_t slot = 0; slot < mBlocksPerRail; ++slot) {
+            const uint32_t globalBlock = static_cast<uint32_t>(rail) * mBlocksPerRail + slot;
+            FillBlock(mRails[rail].buffer.Data() + static_cast<size_t>(slot) * kStrideBytes,
+                generation, globalBlock);
+        }
+    }
+
+    void VerifyLocalDestination(const std::array<CopyEntry, kBlocks> &entries, uint64_t generation)
+    {
+        for (uint32_t index = 0; index < kBlocks; ++index) {
+            const uint16_t rail = RailForRequestIndex(index, mOptions.links);
+            const uint32_t sourceSlot = static_cast<uint32_t>(entries[index].remoteSourceOffset / kStrideBytes);
+            const uint32_t globalBlock = static_cast<uint32_t>(rail) * mBlocksPerRail + sourceSlot;
             std::string error;
-            if (!VerifyBlock(destination, generation, globalBlock, error) || !VerifyGap(destination, error)) {
-                throw std::runtime_error("rail " + std::to_string(rail) + ": " + error);
-            }
+            const uint8_t *destination = mRails[rail].buffer.Data() + entries[index].localDestinationOffset;
+            if (!VerifyBlock(destination, generation, globalBlock, error) || !VerifyGap(destination, error))
+                throw std::runtime_error("request " + std::to_string(index) + ": " + error);
         }
     }
 
-    void SendFinish()
+    void TrySendCopyError(uint64_t generation, uint32_t stage, uint32_t code, uint32_t detail) noexcept
     {
-        uint64_t secondarySequence = 0;
-        if (mOptions.links == 2) {
-            secondarySequence = IssueSecondaryRailCommand(RailCommand::SendFinish);
-        }
-        SendFinishRail(0);
-        if (mOptions.links == 2) {
-            WaitSecondaryRailCommand(secondarySequence, "rail 1 FINISH/FINISH_ACK drain");
-        }
+        try {
+            const UBSHcomChannelPtr channel = ChannelCopy(0);
+            if (channel == nullptr) return;
+            mCopyErrorPayload = EncodeCopyError(generation, stage, code, detail);
+            PostAsyncSend(0, channel, mCopyErrorPayload.data(), mCopyErrorPayload.size(), kOpCopyError);
+        } catch (...) {}
     }
 
-    void SendFinishRail(uint16_t rail)
+    void FinishAllRails()
     {
-        RailState &state = mRails[rail];
-        state.finishPayload = EncodeToken(kFinishMagic, mParams.TotalRounds(), rail);
-        PostAsyncSend(rail, ChannelCopyRequired(rail, "FINISH"), state.finishPayload.data(),
-            state.finishPayload.size(), kOpFinish);
-        const uint64_t target = ExpectedSendCallbacks(rail);
-        WaitControl("per-rail FINISH local completion and FINISH_ACK", [this, rail, target] {
-            return mRails[rail].callbackCounters.sendDoneCallbacks.load(std::memory_order_acquire) >= target &&
-                mRails[rail].finishAckGeneration.load(std::memory_order_acquire) == mParams.TotalRounds();
-        });
+        uint64_t sequence = 0;
+        if (mOptions.links == 2) sequence = IssueSecondaryRailCommand(RailCommand::Finish);
+        FinishRail(0);
+        if (mOptions.links == 2) WaitSecondaryRailCommand(sequence, "rail 1 finish");
     }
 
-    void SendFinishAckRail(uint16_t rail)
+    void FinishRail(uint16_t rail)
     {
         RailState &state = mRails[rail];
-        state.finishAckPayload = EncodeToken(kFinishAckMagic, mParams.TotalRounds(), rail);
-        PostAsyncSend(rail, ChannelCopyRequired(rail, "FINISH_ACK"), state.finishAckPayload.data(),
-            state.finishAckPayload.size(), kOpFinishAck);
-        const uint64_t target = ExpectedSendCallbacks(rail);
-        WaitControl("per-rail FINISH_ACK local completion", [this, rail, target] {
-            return mRails[rail].callbackCounters.sendDoneCallbacks.load(std::memory_order_acquire) >= target;
-        });
+        if (mOptions.role == Role::Local) {
+            state.finishPayload = EncodeToken(kFinishMagic, kOpFinish, mParams.TotalRounds(), rail);
+            PostAsyncSend(rail, ChannelCopyRequired(rail, "FINISH"), state.finishPayload.data(),
+                state.finishPayload.size(), kOpFinish);
+            const uint64_t target = ExpectedSendCallbacks(rail);
+            WaitControl("FINISH_ACK", [this, rail, target] {
+                return mRails[rail].callbackCounters.sendDoneCallbacks.load(std::memory_order_acquire) >= target &&
+                    mRails[rail].finishAckGeneration.load(std::memory_order_acquire) == mParams.TotalRounds();
+            });
+        } else {
+            WaitControl("FINISH", [this, rail] {
+                return mRails[rail].finishGeneration.load(std::memory_order_acquire) == mParams.TotalRounds();
+            });
+            state.finishAckPayload = EncodeToken(kFinishAckMagic, kOpFinishAck, mParams.TotalRounds(), rail);
+            PostAsyncSend(rail, ChannelCopyRequired(rail, "FINISH_ACK"), state.finishAckPayload.data(),
+                state.finishAckPayload.size(), kOpFinishAck);
+            const uint64_t target = ExpectedSendCallbacks(rail);
+            WaitControl("FINISH_ACK completion", [this, rail, target] {
+                return mRails[rail].callbackCounters.sendDoneCallbacks.load(std::memory_order_acquire) >= target;
+            });
+        }
     }
 
-    void PostAsyncSend(uint16_t rail, const UBSHcomChannelPtr &channel, uint8_t *data, size_t size, uint16_t opcode)
+    void PostAsyncSend(uint16_t rail, const UBSHcomChannelPtr &channel,
+        uint8_t *data, size_t size, uint16_t opcode)
     {
-        if (channel == nullptr) {
-            throw std::runtime_error("null channel for Send on rail " + std::to_string(rail));
-        }
         Callback *callback = NewSendCallback(rail);
-        if (callback == nullptr) {
-            throw std::runtime_error("unable to allocate Send callback");
-        }
+        if (callback == nullptr) throw std::runtime_error("Send callback allocation failed");
         ++mRails[rail].appCounters.attemptedSendCallbacks;
-        const UBSHcomRequest request(data, static_cast<uint32_t>(size), opcode);
-        const int rc = channel->Send(request, callback);
-        if (rc != 0) {
-            throw std::runtime_error("Send opcode " + std::to_string(opcode) + " failed on rail " +
-                std::to_string(rail) + ": " + std::to_string(rc));
-        }
+        const int rc = channel->Send(UBSHcomRequest(data, static_cast<uint32_t>(size), opcode), callback);
+        if (rc != 0) throw std::runtime_error("Send failed: " + std::to_string(rc));
     }
 
     uint64_t ExpectedSendCallbacks(uint16_t rail) const noexcept
     {
-        const RailState &state = mRails[rail];
-        return state.appCounters.attemptedSendCallbacks +
-            state.callbackCounters.workerAttemptedSendCallbacks.load(std::memory_order_acquire);
+        return mRails[rail].appCounters.attemptedSendCallbacks +
+            mRails[rail].callbackCounters.workerAttemptedSendCallbacks.load(std::memory_order_acquire);
     }
 
-    void FillSenderPattern(uint64_t generation)
-    {
-        for (uint16_t rail = 0; rail < mOptions.links; ++rail) {
-            for (uint32_t localBlock = 0; localBlock < mBlocksPerRail; ++localBlock) {
-                const uint32_t globalBlock = rail * mBlocksPerRail + localBlock;
-                FillBlock(mRails[rail].buffer.Data() + static_cast<size_t>(localBlock) * kStrideBytes,
-                    generation, globalBlock);
-            }
-        }
-    }
-
-    template <typename Predicate>
-    void WaitData(const char *what, Predicate predicate)
+    template <typename Predicate> void WaitData(const char *what, Predicate predicate)
     {
         CheckFatal(what);
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(mOptions.timeoutSec);
         uint32_t spins = 0;
         while (!predicate()) {
-            CheckFatal(what);
-            CpuRelax();
-            ++spins;
-            if ((spins & (kDataDeadlineCheckInterval - 1)) == 0 &&
-                std::chrono::steady_clock::now() >= deadline) {
+            CheckFatal(what); CpuRelax();
+            if ((++spins & (kDataDeadlineCheckInterval - 1)) == 0 &&
+                std::chrono::steady_clock::now() >= deadline)
                 throw std::runtime_error(std::string("timed out waiting for ") + what);
-            }
         }
         CheckFatal(what);
     }
 
-    template <typename Predicate>
-    void WaitControl(const char *what, Predicate predicate)
+    template <typename Predicate> void WaitControl(const char *what, Predicate predicate)
     {
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(mOptions.timeoutSec);
         while (!predicate()) {
             CheckFatal(what);
-            if (std::chrono::steady_clock::now() >= deadline) {
+            if (std::chrono::steady_clock::now() >= deadline)
                 throw std::runtime_error(std::string("timed out waiting for ") + what);
-            }
             std::this_thread::yield();
         }
         CheckFatal(what);
@@ -1868,230 +2022,198 @@ private:
     void WaitForChannels()
     {
         std::unique_lock<std::mutex> lock(mChannelsMutex);
-        const bool received = mChannelCv.wait_for(lock, std::chrono::seconds(mOptions.timeoutSec), [this] {
-            if (mFatal.load(std::memory_order_acquire)) {
-                return true;
-            }
-            for (uint16_t rail = 0; rail < mOptions.links; ++rail) {
-                if (mRails[rail].channel == nullptr) {
-                    return false;
-                }
-            }
+        const bool ok = mChannelCv.wait_for(lock, std::chrono::seconds(mOptions.timeoutSec), [this] {
+            if (mFatal.load(std::memory_order_acquire)) return true;
+            for (uint16_t rail = 0; rail < mOptions.links; ++rail)
+                if (mRails[rail].channel == nullptr) return false;
             return true;
         });
-        if (!received) {
-            throw std::runtime_error("timed out waiting for all peer channels");
-        }
+        if (!ok) throw std::runtime_error("timed out waiting for channels");
         CheckFatal("peer channels");
-        for (uint16_t rail = 0; rail < mOptions.links; ++rail) {
-            if (mRails[rail].channel == nullptr) {
-                throw std::runtime_error("peer channel was not established on rail " + std::to_string(rail));
-            }
-        }
     }
 
     UBSHcomChannelPtr ChannelCopy(uint16_t rail) const
     {
-        std::lock_guard<std::mutex> lock(mChannelsMutex);
-        return mRails[rail].channel;
+        std::lock_guard<std::mutex> lock(mChannelsMutex); return mRails[rail].channel;
     }
 
     UBSHcomChannelPtr ChannelCopyRequired(uint16_t rail, const char *operation) const
     {
         UBSHcomChannelPtr channel = ChannelCopy(rail);
-        if (channel == nullptr) {
-            throw std::runtime_error(std::string(operation) + " without a channel on rail " + std::to_string(rail));
-        }
+        if (channel == nullptr)
+            throw std::runtime_error(std::string(operation) + " without channel rail " + std::to_string(rail));
         return channel;
     }
 
     void RequireOk(int rc, const char *operation)
     {
-        if (rc != 0) {
-            throw std::runtime_error(std::string(operation) + " failed: " + std::to_string(rc));
-        }
+        if (rc != 0) throw std::runtime_error(std::string(operation) + " failed: " + std::to_string(rc));
     }
 
     void RecordFailure(const std::string &message) noexcept
     {
         bool expected = false;
-        if (!mFatal.compare_exchange_strong(expected, true, std::memory_order_release, std::memory_order_relaxed)) {
-            return;
-        }
-        try {
-            std::lock_guard<std::mutex> lock(mErrorMutex);
-            mError = message;
-        } catch (...) {
-        }
+        if (!mFatal.compare_exchange_strong(expected, true, std::memory_order_release,
+            std::memory_order_relaxed)) return;
+        try { std::lock_guard<std::mutex> lock(mErrorMutex); mError = message; } catch (...) {}
         mChannelCv.notify_all();
     }
 
     void CheckFatal(const char *where) const
     {
-        if (!mFatal.load(std::memory_order_acquire)) {
-            return;
-        }
+        if (!mFatal.load(std::memory_order_acquire)) return;
         std::string error = "unknown asynchronous failure";
-        {
-            std::lock_guard<std::mutex> lock(mErrorMutex);
-            if (!mError.empty()) {
-                error = mError;
-            }
-        }
+        { std::lock_guard<std::mutex> lock(mErrorMutex); if (!mError.empty()) error = mError; }
         throw std::runtime_error(std::string(where) + ": " + error);
+    }
+
+    bool CallbacksDrained() const noexcept
+    {
+        for (uint16_t rail = 0; rail < mOptions.links; ++rail) {
+            if (mRails[rail].callbackCounters.dataDoneCallbacks.load(std::memory_order_acquire) <
+                    mRails[rail].appCounters.attemptedDataCallbacks ||
+                mRails[rail].callbackCounters.sendDoneCallbacks.load(std::memory_order_acquire) <
+                    ExpectedSendCallbacks(rail)) return false;
+        }
+        return mActiveCallbacks.load(std::memory_order_acquire) == 0;
     }
 
     bool DrainUntilComplete() noexcept
     {
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(mOptions.timeoutSec);
         while (std::chrono::steady_clock::now() < deadline) {
-            if (CallbacksDrained()) {
-                return true;
-            }
+            if (CallbacksDrained()) return true;
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
         return CallbacksDrained();
     }
 
-    bool CallbacksDrained() const noexcept
+    void TeardownFixedRails()
     {
-        for (uint16_t rail = 0; rail < mOptions.links; ++rail) {
-            const RailState &state = mRails[rail];
-            if (state.callbackCounters.dataDoneCallbacks.load(std::memory_order_acquire) <
-                    state.appCounters.attemptedDataCallbacks ||
-                state.callbackCounters.sendDoneCallbacks.load(std::memory_order_acquire) <
-                    ExpectedSendCallbacks(rail)) {
-                return false;
-            }
+        if (mOptions.links == 2) {
+            const uint64_t sequence = IssueSecondaryRailCommand(RailCommand::Teardown);
+            WaitSecondaryRailCommand(sequence, "rail 1 teardown");
         }
-        return mActiveCallbacks.load(std::memory_order_acquire) == 0;
+        TeardownRail(0);
     }
 
-    void Teardown() noexcept
+    void TryTeardownFixedRails() noexcept
     {
-        if (mTearingDown.exchange(true, std::memory_order_acq_rel)) {
-            return;
+        mTearingDown.store(true, std::memory_order_release);
+        if (mOptions.links == 2 && mSecondary.thread.joinable()) {
+            const uint64_t issued = mSecondary.issued.load(std::memory_order_acquire);
+            if (WaitSecondaryNoThrow(issued)) {
+                try {
+                    const uint64_t teardown = IssueSecondaryRailCommand(RailCommand::Teardown);
+                    (void)WaitSecondaryNoThrow(teardown);
+                } catch (...) {}
+            }
         }
-        for (uint16_t rail = 0; rail < mOptions.links; ++rail) {
-            RailState &state = mRails[rail];
-            UBSHcomChannelPtr channel;
-            {
-                std::lock_guard<std::mutex> lock(mChannelsMutex);
-                channel = state.channel;
-                state.channel.Set(nullptr);
-            }
-            if (state.service != nullptr && channel != nullptr) {
-                state.service->Disconnect(channel);
-            }
-            if (state.service != nullptr && state.memoryRegistered) {
-                state.service->DestroyMemoryRegion(state.memoryRegion);
-                state.memoryRegistered = false;
-            }
-            if (state.service != nullptr) {
-                UBSHcomService::Destroy(state.serviceName);
-                state.service = nullptr;
-            }
+        TeardownRail(0);
+    }
+
+    void TeardownRail(uint16_t rail) noexcept
+    {
+        mTearingDown.store(true, std::memory_order_release);
+        RailState &state = mRails[rail];
+        UBSHcomChannelPtr channel;
+        { std::lock_guard<std::mutex> lock(mChannelsMutex); channel = state.channel; state.channel.Set(nullptr); }
+        if (state.service != nullptr && channel != nullptr) state.service->Disconnect(channel);
+        if (state.service != nullptr && state.memoryRegistered) {
+            state.service->DestroyMemoryRegion(state.memoryRegion); state.memoryRegistered = false;
+        }
+        if (state.service != nullptr) {
+            UBSHcomService::Destroy(state.serviceName); state.service = nullptr;
         }
     }
 
     void EmitTracePoint(const char *event, uint64_t generation, int rail, const TracePoint &point) const
     {
-        std::cout << "{\"record_type\":\"trace\",\"trace_schema\":\"rdma600-stage2-v1\",\"host_role\":\""
-                  << RoleName(mOptions.role) << "\",\"case\":\"" << CaseName(mOptions.links)
-                  << "\",\"generation\":" << generation << ",\"rail\":";
-        if (rail < 0) {
-            std::cout << "null";
-        } else {
-            std::cout << rail;
-        }
-        std::cout << ",\"event\":\"" << event << "\",\"timestamp_ns\":" << point.Read(event) << "}"
-                  << std::endl;
+        std::cout << "{\"record_type\":\"trace\",\"trace_schema\":\"sparse-copy-v4-dual-rail-v1\","
+                  << "\"host_role\":\"" << RoleName(mOptions.role) << "\",\"case\":\""
+                  << CaseName(mOptions.links) << "\",\"generation\":" << generation << ",\"rail\":";
+        if (rail < 0) std::cout << "null"; else std::cout << rail;
+        std::cout << ",\"event\":\"" << event << "\",\"timestamp_ns\":" << point.Read(event) << "}" << std::endl;
     }
 
     void EmitTrace() const
     {
-        for (uint32_t index = 0; index < mParams.traceRounds; ++index) {
-            const TraceRound &trace = mTrace[index];
-            if (mOptions.role == Role::Sender) {
-                EmitTracePoint("S0", trace.generation, -1, trace.s0);
-                for (uint16_t rail = 0; rail < mOptions.links; ++rail) {
-                    EmitTracePoint("S_post", trace.generation, rail, trace.sPost[rail]);
-                    EmitTracePoint("S_data", trace.generation, rail, trace.sData[rail]);
-                    EmitTracePoint("S_ack", trace.generation, rail, trace.sAck[rail]);
-                }
-                EmitTracePoint("S1", trace.generation, -1, trace.s1);
-                EmitTracePoint("S2", trace.generation, -1, trace.s2);
+        for (uint32_t i = 0; i < mParams.traceRounds; ++i) {
+            const TraceRound &t = mTrace[i];
+            if (mOptions.role == Role::Local) {
+                EmitTracePoint("local_begin", t.generation, -1, t.localBegin);
+                EmitTracePoint("local_request_posted", t.generation, 0, t.localRequestPosted);
+                for (uint16_t rail = 0; rail < mOptions.links; ++rail)
+                    EmitTracePoint("local_data_done", t.generation, rail, t.localDataDone[rail]);
+                EmitTracePoint("local_end", t.generation, -1, t.localEnd);
             } else {
+                EmitTracePoint("remote_request_received", t.generation, 0, t.remoteRequestReceived);
                 for (uint16_t rail = 0; rail < mOptions.links; ++rail) {
-                    EmitTracePoint("R_ready", trace.generation, rail, trace.rReady[rail]);
-                    EmitTracePoint("R_ack", trace.generation, rail, trace.rAck[rail]);
+                    EmitTracePoint("remote_posted", t.generation, rail, t.remotePosted[rail]);
+                    EmitTracePoint("remote_data_callbacks_done", t.generation, rail, t.remoteDataCallbacksDone[rail]);
+                    EmitTracePoint("remote_done_posted", t.generation, rail, t.remoteDonePosted[rail]);
                 }
             }
         }
     }
 
-    void PrintSenderResult() const
+    void PrintLocalResult() const
     {
-        std::ostringstream output;
-        output << std::fixed << std::setprecision(3);
-        output << "{\"case\":\"" << CaseName(mOptions.links) << "\",\"status\":\"ok\",\"commit\":\""
-               << RDMA_600_GIT_COMMIT << "\",\"role\":\"sender\",\"kind\":\"" << KindName(mOptions.kind)
-               << "\",\"optimization\":\"stage1.5-AB\",\"data_wait\":\"busy-poll-relax\""
-               << ",\"deadline_check_interval\":" << kDataDeadlineCheckInterval
-               << ",\"counter_alignment_bytes\":" << kCounterAlignment
-               << ",\"callback_allocation\":\"per-request\""
-               << ",\"links\":" << mOptions.links
-               << ",\"services\":" << mOptions.links << ",\"application_cpus\":[";
-        for (uint16_t rail = 0; rail < mOptions.links; ++rail) {
-            if (rail != 0) {
-                output << ',';
-            }
-            output << mOptions.appCpus[rail];
-        }
-        output << "],\"blocks\":600,\"blocks_per_rail\":" << mBlocksPerRail
-               << ",\"block_bytes\":1024,\"payload_bytes\":614400"
-               << ",\"mode\":\"plain\",\"remote_layout\":\"direct-stride-4096\",\"tls_enabled\":false"
-               << ",\"internal_multirail\":false,\"channel_link_count\":1,\"rounds_in_flight\":1"
-               << ",\"application_submit_threads\":" << mOptions.links
-               << ",\"rail_thread_affinity\":\"fixed-one-thread-per-service\""
-               << ",\"multi_service_scope\":\""
-               << (mOptions.links == 1 ? "single-service-supported" : "diagnostic-unsupported-by-hcom-contract")
-               << "\""
-               << ",\"data_wr_per_round\":600,\"round_ready_wr_per_round\":"
-               << mOptions.links << ",\"ack_wr_per_round\":" << mOptions.links
-               << ",\"direct_optimization\":\"stage1.5-AB\",\"verify_passed\":true"
-               << ",\"trace_rounds\":" << mParams.traceRounds;
+        std::ostringstream out;
+        out << std::fixed << std::setprecision(3)
+            << "{\"schema_version\":4,\"protocol\":\"sparse-copy-v4-dual-rail\""
+            << ",\"measurement\":\"local-sparse-copy\",\"result_role\":\"local\",\"case\":\""
+            << CaseName(mOptions.links) << "\",\"status\":\"ok\",\"commit\":\"" << RDMA_600_GIT_COMMIT
+            << "\",\"role\":\"local\",\"kind\":\"" << KindName(mOptions.kind)
+            << "\",\"optimization\":\"stage1.5-AB\",\"data_wait\":\"busy-poll-relax\""
+            << ",\"deadline_check_interval\":256,\"counter_alignment_bytes\":" << kCounterAlignment
+            << ",\"callback_allocation\":\"per-request\",\"links\":" << mOptions.links
+            << ",\"services\":" << mOptions.links << ",\"blocks\":600,\"blocks_per_rail\":" << mBlocksPerRail
+            << ",\"block_bytes\":1024,\"payload_bytes_per_call\":614400,\"mode\":\"direct\""
+            << ",\"remote_layout\":\"per-rail-direct-stride-4096\""
+            << ",\"request_index_rail_partition\":\"contiguous-equal\",\"tls_enabled\":false"
+            << ",\"internal_multirail\":false,\"channel_link_count\":1,\"rounds_in_flight\":1"
+            << ",\"application_submit_threads\":" << mOptions.links
+            << ",\"rail_thread_affinity\":\"fixed-setup-to-drain-one-thread-per-service\""
+            << ",\"source_format\":\"direct-pairs\",\"source_address_count\":600"
+            << ",\"destination_address_count\":600,\"request_descriptor_bytes\":9600"
+            << ",\"request_bytes\":9664,\"request_send_wr_per_call\":1"
+            << ",\"data_wr_per_call_expected\":600,\"completion_send_wr_per_call_expected\":"
+            << mOptions.links << ",\"imm_events_per_call_expected\":0,\"ack_wr_per_call\":0"
+            << ",\"verify_passed\":true,\"trace_rounds\":" << mParams.traceRounds;
         if (mOptions.kind != RunKind::Measure) {
-            output << ",\"measure_rounds\":0,\"submit_avg_us\":null,\"submit_p50_us\":null"
-                   << ",\"submit_p95_us\":null,\"submit_p99_us\":null,\"e2e_avg_us\":null"
-                   << ",\"e2e_p50_us\":null,\"e2e_p95_us\":null,\"e2e_p99_us\":null"
-                   << ",\"effective_GBps\":null,\"block_Mops\":null";
+            out << ",\"measure_rounds\":0,\"sparse_copy_avg_us\":null,\"sparse_copy_p50_us\":null"
+                << ",\"sparse_copy_p95_us\":null,\"sparse_copy_p99_us\":null"
+                << ",\"effective_GBps\":null,\"block_Mops\":null,\"request_GBps\":null"
+                << ",\"measured_wall_seconds\":null";
         } else {
-            const uint64_t wallNs = mMeasureWallEndNs - mMeasureWallStartNs;
-            const double wallSeconds = static_cast<double>(wallNs) / 1000000000.0;
-            const double effectiveGbps = static_cast<double>(mParams.measureRounds) * kPayloadBytes / wallSeconds / 1e9;
-            const double blockMops = static_cast<double>(mParams.measureRounds) * kBlocks / wallSeconds / 1e6;
-            output << ",\"measure_rounds\":" << mParams.measureRounds
-                   << ",\"submit_avg_us\":" << AverageNs(mSubmitNs) / 1000.0
-                   << ",\"submit_p50_us\":" << NsToUs(PercentileNs(mSubmitNs, 0.50))
-                   << ",\"submit_p95_us\":" << NsToUs(PercentileNs(mSubmitNs, 0.95))
-                   << ",\"submit_p99_us\":" << NsToUs(PercentileNs(mSubmitNs, 0.99))
-                   << ",\"e2e_avg_us\":" << AverageNs(mE2eNs) / 1000.0
-                   << ",\"e2e_p50_us\":" << NsToUs(PercentileNs(mE2eNs, 0.50))
-                   << ",\"e2e_p95_us\":" << NsToUs(PercentileNs(mE2eNs, 0.95))
-                   << ",\"e2e_p99_us\":" << NsToUs(PercentileNs(mE2eNs, 0.99))
-                   << ",\"effective_GBps\":" << effectiveGbps
-                   << ",\"block_Mops\":" << blockMops;
+            const double seconds = static_cast<double>(mMeasureWallEndNs - mMeasureWallStartNs) / 1e9;
+            out << ",\"measure_rounds\":" << mParams.measureRounds
+                << ",\"sparse_copy_avg_us\":" << AverageNs(mSparseCopyNs) / 1000.0
+                << ",\"sparse_copy_p50_us\":" << NsToUs(PercentileNs(mSparseCopyNs, 0.50))
+                << ",\"sparse_copy_p95_us\":" << NsToUs(PercentileNs(mSparseCopyNs, 0.95))
+                << ",\"sparse_copy_p99_us\":" << NsToUs(PercentileNs(mSparseCopyNs, 0.99))
+                << ",\"effective_GBps\":" << static_cast<double>(mParams.measureRounds) * kPayloadBytes / seconds / 1e9
+                << ",\"block_Mops\":" << static_cast<double>(mParams.measureRounds) * kBlocks / seconds / 1e6
+                << ",\"request_GBps\":" << static_cast<double>(mParams.measureRounds) * kCopyReqWireBytes / seconds / 1e9
+                << ",\"measured_wall_seconds\":" << seconds;
         }
-        output << "}";
-        std::cout << output.str() << std::endl;
+        out << "}";
+        std::cout << out.str() << std::endl;
+    }
+
+    void PrintRemoteStatus() const
+    {
+        std::cout << "{\"schema_version\":4,\"protocol\":\"sparse-copy-v4-dual-rail\",\"case\":\""
+                  << CaseName(mOptions.links) << "\",\"role\":\"remote\",\"status\":\"ok\",\"processed_calls\":"
+                  << mParams.TotalRounds() << ",\"links\":" << mOptions.links << "}" << std::endl;
     }
 
     Options mOptions;
     CaseParameters mParams;
     uint32_t mBlocksPerRail = kBlocks;
     std::array<RailState, kMaxLinks> mRails{};
-    std::atomic<bool> mReceiverReady{false};
+    std::atomic<bool> mRemoteReady{false};
     std::atomic<bool> mTearingDown{false};
     std::atomic<bool> mFatal{false};
     mutable std::mutex mErrorMutex;
@@ -2099,27 +2221,44 @@ private:
     mutable std::mutex mChannelsMutex;
     std::condition_variable mChannelCv;
     alignas(kCounterAlignment) std::atomic<uint64_t> mActiveCallbacks{0};
+    std::array<CopyEntry, kBlocks> mCopyEntries{};
+    std::array<CopyEntry, kBlocks> mActiveCopyEntries{};
+    std::array<uint8_t, kCopyReqWireBytes> mCopyReqPayload{};
+    std::array<uint8_t, kCopyReqWireBytes> mPendingCopyReqPayload{};
+    std::array<uint8_t, kCopyReqWireBytes> mActiveCopyReqPayload{};
+    uint32_t mPendingCopyReqBytes = 0;
+    uint32_t mActiveCopyReqBytes = 0;
+    std::atomic<bool> mPendingCopyReqOccupied{false};
+    std::atomic<bool> mPendingCopyReqPublished{false};
+    std::array<uint8_t, kCopyErrorWireBytes> mCopyErrorPayload{};
     std::array<TraceRound, kMaxTraceRounds> mTrace{};
-    std::vector<uint64_t> mSubmitNs;
-    std::vector<uint64_t> mE2eNs;
+    std::vector<uint64_t> mSparseCopyNs;
     uint64_t mMeasureWallStartNs = 0;
     uint64_t mMeasureWallEndNs = 0;
     SecondaryRailExecutor mSecondary;
 };
 
+#endif  // RDMA_600_SELF_TEST_ONLY
+
 }  // namespace
 
 int main(int argc, char **argv)
 {
+#if defined(RDMA_600_SELF_TEST_ONLY)
+    (void)argc;
+    (void)argv;
+    return RunSelfTest() ? 0 : 1;
+#else
     try {
         const Options options = ParseOptions(argc, argv);
         if (options.selfTest) {
             return RunSelfTest() ? 0 : 1;
         }
-        DirectBenchmark benchmark(options);
+        SparseCopyBenchmark benchmark(options);
         return benchmark.Run();
     } catch (const std::exception &error) {
         std::cerr << "ERROR: " << error.what() << std::endl;
         return 1;
     }
+#endif
 }

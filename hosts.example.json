@@ -1,54 +1,36 @@
 {
-  "_note": "Reference record only. rdma_600 does not read this file; pass all values on its command line.",
-  "sender": {
-    "binary": "/absolute/path/on/sender/rdma_600",
+  "_note": "Parameter record only; rdma_600 does not read this file and this branch has no run.py.",
+  "local": {
+    "binary": "/absolute/path/on/local/rdma_600",
     "library_dirs": [
-      "/absolute/path/on/sender/ubs-comm/dist/hcom_3rdparty/libboundscheck/lib"
+      "/absolute/path/on/local/ubs-comm/dist/hcom_3rdparty/libboundscheck/lib"
     ],
     "rdma_ips": [
-      "<sender_nic0_rdma_ip>",
-      "<sender_nic1_rdma_ip>"
+      "<local_nic0_rdma_ip>",
+      "<local_nic1_rdma_ip>"
     ],
-    "app_cpus": [
-      2,
-      5
-    ],
-    "worker_cpus": [
-      3,
-      4
-    ]
+    "app_cpus": [2, 5],
+    "worker_cpus": [3, 4]
   },
-  "receiver": {
-    "binary": "/absolute/path/on/receiver/rdma_600",
+  "remote": {
+    "binary": "/absolute/path/on/remote/rdma_600",
     "library_dirs": [
-      "/absolute/path/on/receiver/ubs-comm/dist/hcom_3rdparty/libboundscheck/lib"
+      "/absolute/path/on/remote/ubs-comm/dist/hcom_3rdparty/libboundscheck/lib"
     ],
-    "oob_ip": "<receiver_oob_ip>",
-    "oob_ports": [
-      19000,
-      19001
-    ],
+    "oob_ip": "<remote_oob_ip>",
+    "oob_ports": [19000, 19001],
     "rdma_ips": [
-      "<receiver_nic0_rdma_ip>",
-      "<receiver_nic1_rdma_ip>"
+      "<remote_nic0_rdma_ip>",
+      "<remote_nic1_rdma_ip>"
     ],
-    "app_cpus": [
-      2,
-      5
-    ],
-    "worker_cpus": [
-      3,
-      4
-    ]
+    "app_cpus": [2, 5],
+    "worker_cpus": [3, 4]
   },
-  "stage1": {
-    "verify_rounds": 20,
-    "warmup_rounds": 1000,
-    "measure_rounds": 10000,
-    "timeout_sec": 10,
-    "process_timeout_sec": 600
-  },
-  "stage2": {
+  "direct": {
+    "cases": {
+      "B1": {"links": 1},
+      "B2": {"links": 2}
+    },
     "verify_rounds": 20,
     "warmup_rounds": 1000,
     "measure_rounds": 10000,

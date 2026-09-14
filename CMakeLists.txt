@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.16)
 
-project(rdma_600_stage2_direct LANGUAGES CXX)
+project(rdma_600_sparse_copy_dual_rail LANGUAGES CXX)
 
 if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
     message(FATAL_ERROR "rdma_600 targets the Linux RDMA hosts; configure it on the deployment machine.")

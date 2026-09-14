@@ -1,73 +1,40 @@
 # 实施进度
 
-代码依赖基线：只读 ubs-comm `oneside-msge-merge`，提交
-`9e4c035a5d68ccca02d05fade3b6f5907db24ef4`。阶段 2 工作目录为独立
-`perf_test_duo_card` / `duo_card` worktree；已快进同步 `main@38e6637`，未写入主 worktree。
+更新日期：2026-09-14。
 
-| 阶段 | 实现 | 验证 | 说明 |
-|---|---|---|---|
-| 1 — 单链接 B1 | IMPLEMENTED | LOCAL_PASS_HW_PENDING | 保留为同一阶段 2 二进制的 `--links 1` 回归路径。 |
-| 1.5 — direct 热路径优化 | IMPLEMENTED | LOCAL_PASS_HW_PENDING | 已从 main 同步 A+B，并同时应用到 B1/B2；每请求 callback 分配仍保留。 |
-| 2 — direct 双链接与 trace | IMPLEMENTED | LOCAL_PASS_HW_PENDING | 双 service/NIC/MR/channel/QP、每 rail 300 块、双固定 rail 线程并发提交、独立 ready/ACK 和预分配 trace 已编码；无硬件结论。 |
-| 3 — SGL | NOT_STARTED | NOT_RUN | 本阶段未实现。 |
-| 4 — WRITE_WITH_IMM | NOT_STARTED | NOT_RUN | 未修改 ubs-comm。 |
+## 当前状态
 
-## 阶段 2 已实现范围
+目标 worktree：`duo_card@8970f08115c0c44219c6a83581ef1f317c61b202` 上的未提交迁移。
 
-- 每端最多两个独立 service，service 名带 rail；每个 service 只配置一个 `<rdma-ip>/32`，
-  worker 数为 1，`linkCount=1`、worker poll、TLS 关闭、内建 multirail 关闭。
-- B1 rail0 负责 600 块；B2 rail0/rail1 各 300 块。每 rail 单独分配并注册 stride-4096
-  source/destination MR，pattern 使用 `global_block=rail*blocks_per_rail+local_block`。
-- B1 保持原主线程提交 600 次。B2 的主线程固定 rail0，另一个从连接/HELLO 到 FINISH drain
-  全程常驻的线程固定 rail1；两线程同时各异步 `Put(1024)` 300 次并通过自己的 QP 投递
-  `ROUND_READY`。总数据 WR 仍为 600，B2 ready/ACK 各为 2，不在每轮创建线程。
-- receiver B2 也由两个固定 rail 线程独立等待 ready、校验和投递 ACK；快 rail 不等待慢 rail。
-  sender 仍在两 rail ACK、本地数据与 Send callback 全部满足后才开始下一轮。
-- 该实现用于快速穿刺 HCOM TLS pool 的线程亲和假设；HCOM 源码明示两个同协议 Service 并存
-  不受支持，所以结果标记为诊断数据，不能作为最终产品架构结论。
-- HELLO/READY/ROUND_READY/ACK/FINISH/FINISH_ACK 都携带并校验 rail；协议参数包含 trace 轮数，
-  双方参数不一致即失败。每 rail 分别交换该 service 注册的 destination MR key。
-- verify、warmup、measure、trace 的 generation 连续；verify 每 rail 全量校验，measure/trace
-  结束后最终全量校验，再在两 rail 完成 FINISH drain。
-- `--kind trace` 最多 64 轮，固定数组预分配。实现 `S0/S_post/S1/S_data/S_ack/S2` 与
-  `R_ready/R_ack`；callback 中先写时间戳再 release 发布相关状态，不逐条打印，drain 后批量
-  输出 JSONL。正式 measure 不记录详细 trace。
-- `run.py` 已按当前直接运行二进制的工作流删除；配置示例仅记录双 NIC、双端口、双 app CPU
-  和双 worker CPU 的对应关系，程序不读取 JSON 配置。
-
-## 已执行的本地检查
-
-| 检查 | 结果 | 证据/限制 |
+| 项目 | 实现 | 验证 |
 |---|---|---|
-| worktree/依赖身份 | PASS | `duo_card` 已同步到 `main@38e6637`；只读 ubs-comm 为要求的分支/提交且干净。 |
-| 启动方式 | PASS（静态） | `run.py` 已删除；README 只保留直接运行 `rdma_600` 的双端命令。 |
-| 参数防错 | PASS（源码检查） | B2 拒绝重复 NIC IP、OOB endpoint、app CPU、worker CPU；任一 app/worker CPU 不得重叠，measure 要求全部显式绑定。 |
-| 固定线程生命周期 | PASS（源码检查） | rail1 线程全程常驻，命令通过 release/acquire 发布；正常和错误路径均在线程退出、TLS cache 析构后才销毁 Service。 |
-| C++ 公共头语法检查 | PASS（受限） | MinGW `g++ -fsyntax-only` 配合仅用于补齐 Windows 缺少的 Linux 声明，实际包含要求提交的 HCOM service 公共头；不替代目标 Linux 编译/链接。 |
-| 构建脚本语法 | PASS | `bash -n ./build.sh` 退出码 0。 |
-| 配置记录示例 | PASS | PowerShell `ConvertFrom-Json` 成功，双端各 2 个 RDMA IP、receiver 2 个 OOB 端口。程序不读取此文件。 |
-| Linux CMake/链接 | NOT_RUN | 当前 Windows 没有目标 Linux/AArch64 HCOM `dist` 产物。 |
-| `rdma_600 --self-test` | NOT_RUN | 需先在目标 Linux 链接出二进制。 |
-| 双机 B1/B2 verify/trace/measure | NOT_RUN | 未提供两台服务器地址、双 NIC、驱动/provider、NUMA、凭据或端口统计访问。 |
+| requester-driven direct B1 | IMPLEMENTED | LOCAL_PROTOCOL_PASS / HW_PENDING |
+| requester-driven direct B2 | IMPLEMENTED | LOCAL_PROTOCOL_PASS / HW_PENDING |
+| 固定 rail 线程 setup→drain 所有权 | IMPLEMENTED | STATIC_REVIEWED / HW_PENDING |
+| 详细 trace 与 schema 4 | IMPLEMENTED | STATIC_REVIEWED / HW_PENDING |
+| SGL/staging/scatter/IMM | NOT_IN_SCOPE | NOT_RUN |
 
-## 硬件待验证项
+## 已实现
 
-1. 两端用同一源码和 HCOM 静态库输入构建，运行 `--self-test`，记录二进制/HCOM hash。
-2. 分别跑 B1/B2 20 轮 verify，确认每 rail pattern、stride gap、严格 generation、ACK 栅栏、
-   callback drain 与 FINISH 正常；B2 额外确认两个固定应用线程的 CPU 亲和；补做单 rail 延迟/断链失败检查。
-3. 用设备/QP 日志和两端两张 NIC 的测试前后端口字节/包计数，证明 rail0/rail1 实际走不同 NIC。
-   两个 service/channel 本身不是流量证据。
-4. 检查完整 HCOM 日志：允许进程初始化阶段的池建立，但 warmup 稳定后和正式 measure 期间不应再
-   出现 rail0 pool 单边持续扩到 256 MiB 的现象；若仍出现，立即停止把该 run 作为性能样本。
-5. 单独跑 B1/B2 trace，核验事件完整性、同机区间和 B2 ACK imbalance；禁止跨主机减时间戳，
-   禁止把重叠区间相加当 e2e。
-6. 关闭 trace，以同一二进制、同一阶段 1.5 A+B 设置交替跑 B1/B2 各 5 次并反转顺序；保存原始 JSON、
-   CPU 使用量、网卡/MTU/NUMA/绑核和端口计数后才能形成性能结论。
+- 角色改为 local/remote，remote 监听、local 连接；协议升级为 `sparse-copy-v4-dual-rail` 并更换 magic/长度，拒绝旧 v3。
+- local 每次调用内生成、校验、编码完整 600 对 offset；rail0 只发送一份 9664 字节 COPY_REQ。
+- B2 由请求索引连续分 rail；每 rail offset 定位本 rail 300 槽 MR，分别验证 destination 唯一并保留非顺序映射。
+- remote callback 将请求复制到 pending；应用线程复制到独立 active 后释放 pending。active、WR、source 验证数据和 DATA_DONE 缓冲在本地 callbacks 回收前不复用。
+- remote 两条固定线程各构造并提交 300 个 Put，并在各自真实 QP 上发送 DATA_DONE；B1 提交 600 个。
+- local 等所有 rail DATA_DONE 和 rail0 请求 Send callback 才返回。成功路径没有逐轮 ACK，失败可发 COPY_ERROR。
+- rail1 常驻线程负责自己的 service 创建、MR、连接/握手、每轮提交/回收、FINISH 和 teardown；rail0 始终由主线程负责。
+- 保留阶段 1.5 忙轮询、每 256 次 deadline 检查、线程私有 attempted、acquire/release 完成发布、缓存行隔离、ActiveCallbackGuard 和每请求 callback。
+- trace 分为 local 接口时间线和 remote 本机诊断；measure 不启用详细 trace。
+- 保留 duo_card 已删除 `run.py` 的状态。
 
-完整命令与输出契约见 [README.md](README.md)。
+## 已执行检查
 
-## 明确非目标
+- `git diff --check`：PASS。
+- 使用 `ubs-comm@e709a37` 当前公共头进行 Windows/MSYS2 受限全文件语法检查：PASS；兼容头仅补 Windows 缺少的 Linux 声明，不进入仓库。
+- `RDMA_600_SELF_TEST_ONLY` 本机编译并运行：PASS，输出 `SELF_TEST: PASS (sparse-copy-v4, B1/B2, 9664-byte request, 600 direct blocks)`。
+- 目标 Linux/AArch64 完整构建/链接：NOT_RUN。
+- 双机 RDMA/hardware verify/measure：NOT_RUN。
 
-- 阶段 1.5 已共同应用于 B1/B2，但尚无目标硬件上的 original/A/AB 或 B1/B2 性能数据。
-- 未实现 SGL、staging/scatter、IMM、跨轮窗口、callback 池或 SSH 编排。
-- 未产生或推断任何真实性能、双 NIC 吞吐或单向网络时延数字。
+## 下一步
+
+在两台目标机使用相同源码和相同 ubs-comm 产物构建，先跑 self-test，再分别跑 B1/B2 的 20 轮 verify。核对两个真实 NIC/QP、每 rail 流量、完整请求容量、非顺序映射、故障退出和绑核/NUMA。正确性通过后，才运行 `1000 warmup + 10000 measure` 的多次 B1/B2 对照。旧 sender-driven 数据不是迁移后 B2 结果。
