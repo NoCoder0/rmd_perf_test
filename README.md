@@ -1,5 +1,7 @@
 # RDMA 600 × 1 KiB — requester-driven direct B1/B2
 
+阶段3工作分支为 `duo_card_sgl`，起点 `duo_card@b3f4e4e43ff87ffe2a1544a648bc0b01904b3806`。新增设计见 [STAGE3_DESIGN_CN.md](STAGE3_DESIGN_CN.md)，main的完整历史设计文档见 [参考索引](docs/main_reference/REFERENCE_INDEX_CN.md)。下文记录继承的direct基线；阶段3实现状态由后续报告单独登记。
+
 本分支在 `duo_card` 的双 rail 固定线程实现上迁入 requester-driven `sparse_copy`。当前代码状态为本地协议/语法检查通过，目标 Linux/AArch64 构建和双机 RDMA 验证仍为 `HW_PENDING`。
 
 协议细节见 [DESIGN_CN.md](DESIGN_CN.md)，实施顺序见 [IMPLEMENTATION_PLAN_CN.md](IMPLEMENTATION_PLAN_CN.md)，迁移证据见 [STAGE2_SPARSE_COPY_REPORT_CN.md](STAGE2_SPARSE_COPY_REPORT_CN.md)。
