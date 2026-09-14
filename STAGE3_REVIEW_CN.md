@@ -4,7 +4,7 @@
 
 ## R1 — P1：HELLO实际256B，声明252B造成越界和截断
 
-状态：OPEN。
+状态：CLOSED — 主会话独立复核通过，修复提交 `97131b883046d73fd9f6a40007f1db85d0781fa0`。
 
 位置：`rdma_600.cpp:139`、`:451–499`（本次基线行号）。`kHelloWireBytes` 按stage descriptor `20+80` 计算，但EncodeHello/DecodeHello都额外编码/读取4B stage reserved：stage部分实际为 `4+4+8+8+80=104` 字节。总长度为256，声明/返回array/网络发送长度为252。
 
@@ -22,7 +22,7 @@ declared=252 encoded_fields=256 accepted=1 consumed_outside_wire=1
 
 ## R2 — P2：ready先发布，trace后记录，流水诊断可能倒序
 
-状态：OPEN。
+状态：CLOSED — 主会话独立复核通过，修复提交 `97131b883046d73fd9f6a40007f1db85d0781fa0`。
 
 位置：`rdma_600.cpp:2301–2310`。OnChunkDone先CAS/release发布chunkReadyGeneration，然后才读取时钟并记录local_chunk_ready。local app acquire该ready后可以立即开始甚至结束scatter；callback随后记录的ready timestamp会晚于scatter begin/end，产生负的ready→scatter调度时延，误导on/off流水分析。
 
@@ -40,6 +40,15 @@ declared=252 encoded_fields=256 accepted=1 consumed_outside_wire=1
 
 ## 回修与最终复核
 
-原实现会话已按本文件要求完成待提交回修：HELLO 保留 reserved 并统一为256B，Encode/Decode 校验最终 cursor；新增独立字段计数、末尾非零 key、252/255/尾随边界测试。CHUNK_DONE 改为原子哨兵独占槽位，在可消费 generation 前运行 trace observer，重复通知不进入 observer；measure 短路不采时间。生产与 self-test 共用 ready 发布、固定起点完整扫描 scheduler、scatter payload、all-ready/completion gate，并覆盖慢 rail/末尾 chunk、乱序两代及 callback 延迟。流水有无进展均累计检查单元，每256个调用 fatal/deadline checkpoint。
+原实现会话已按本文件要求完成回修：HELLO 保留 reserved 并统一为256B，Encode/Decode 校验最终 cursor；新增独立字段计数、末尾非零 key、252/255/尾随边界测试。CHUNK_DONE 改为原子哨兵独占槽位，在可消费 generation 前运行 trace observer，重复通知不进入 observer；measure 短路不采时间。生产与 self-test 共用 ready 发布、固定起点完整扫描 scheduler、scatter payload、all-ready/completion gate，并覆盖慢 rail/末尾 chunk、乱序两代及 callback 延迟。流水有无进展均累计检查单元，每256个调用 fatal/deadline checkpoint。
 
-实现会话本地已运行 self-test-only 和真实公共头全文件 `-fsyntax-only`；完整命令及边界仍见 `STAGE3_REPORT_CN.md`。上述仅为回修说明，状态仍是 **PENDING_INDEPENDENT_REVIEW**；不代表主会话已复核通过。主会话应保留并重编运行 ignored `build/review_hello_extent.cpp`，再独立检查生产顺序、调度和文档。
+主会话在回修会话结束后独立审阅全部修复diff，确认生产OnChunkDone共用observer→release helper，WaitAndScatterSgl共用scheduler/scatter/completion gate；两项问题及测试覆盖缺口均已关闭。本地执行结果：
+
+- 使用当前真实公共头的全文件 `-fsyntax-only`：PASS。
+- 按实现报告的self-test编译命令增加 `-O2 -Wno-unused-function`，重新编译为 `build/stage3_review_verified.exe` 并运行：PASS，覆盖B1/B2/S1/S2、K1/8/16/30、on/off、尾chunk、多代、发布顺序及完成gate。
+- 独立重编 `build/review_hello_extent.cpp` 并运行：`declared=256 encoded_fields=256 legacy_252_accepted=0 accepted=1 tail_preserved=1`，exit0。
+- Bash脚本语法、JSON解析、diff whitespace：PASS；main参考与设计提交完全一致，无Python脚本。
+
+修复已由主会话提交为 `97131b883046d73fd9f6a40007f1db85d0781fa0`；本次关闭记录另成文档提交。子会话不能写Git元数据的临时限制已由主会话完成提交解决，没有请求用户干预或丢弃修改。
+
+最终结论：**LOCAL_REVIEW_FIXES_VERIFIED / TARGET_BUILD_AND_HW_PENDING**。在已检视范围内未发现尚未关闭的新增P1/P2问题；前述共享库、多service和真实硬件验收边界仍然保留，不据此宣布部署性能验收完成。
