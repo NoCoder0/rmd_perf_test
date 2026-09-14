@@ -8,7 +8,7 @@
 - 设计提交：`58b21f3ed6d18a66287d3d318627cfd88cef252a`；基于 `duo_card@b3f4e4e43ff87ffe2a1544a648bc0b01904b3806`。
 - 只修改本 worktree 的 C++、CMake、配置示例及根文档；`docs/main_reference/` 未改变，没有创建 Python 文件。
 - 只读依赖核对为 `ubs-comm@e709a37e71bc2493d2a195a14eaaefe86c2dfb28`，公共 C++/C 上限均为16；未修改共享依赖或其它 worktree。
-- 阶段3实现快照提交：在本报告落盘后的首次实现提交中固定，并在后续报告提交回填完整 hash。
+- 阶段3实现快照提交：`8c71dd0950c5a6e4c8db5f60c051f71bd22118e3`。本行由后续报告元数据提交回填；实现快照本身保持不变。
 
 ## 2. 已实现内容
 
