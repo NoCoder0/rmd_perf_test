@@ -1,585 +1,398 @@
-# ubs-comm：600 × 1 KiB RDMA 性能穿刺设计
+# ubs-comm：local 发起的 sparse_copy 性能穿刺设计
 
-状态：阶段 1 direct B1 与阶段 1.5 A+B 已实现；阶段 2、3、4 为计划，目标 Linux/RDMA 构建与硬件跑测尚未执行。更新日期：2026-09-12。阶段 1 原始实现参考 perf_test `0f5e382`，阶段 1.5 当前代码与证据见 `STAGE1_5_REPORT_CN.md`。
+更新：2026-09-12。阶段 1 已在 `main@38e6637` 之上的未提交工作区实现，目标 Linux/AArch64 构建与 RDMA 验证仍为 HW_PENDING；阶段 2/3/4 仍是设计。依赖保持 ubs-comm `oneside-msge-merge@9e4c035a5d68ccca02d05fade3b6f5907db24ef4`，本次未修改该依赖或其它 worktree。
 
-分阶段实施、跑测脚本契约、阶段验收与模型交接提示词见 [IMPLEMENTATION_PLAN_CN.md](C:/code/RDMA_DEMO/perf_test/IMPLEMENTATION_PLAN_CN.md)。
+实施步骤见 [IMPLEMENTATION_PLAN_CN.md](IMPLEMENTATION_PLAN_CN.md)，当前 v3 命令见 [README.md](README.md)。历史阶段 1.5 报告不再定义新协议。
 
-代码基线：`oneside-msge-merge`，提交 `9e4c035a5d68ccca02d05fade3b6f5907db24ef4`。本文依据当前本地源码，硬件能力、正确性与性能仍需在两台鲲鹏服务器上验证。
+## 1. 唯一主口径：local 调用到 local 数据可用
 
-## 1. 要解决的问题与设计取舍
+固定角色：**local 是调用者、数据接收者和最终内存拥有者；remote 是源数据提供者、RDMA WRITE 发起者**。旧 receiver 对应 local，旧 sender 对应 remote。
 
-用一个独立 C++ 程序，先建立 direct baseline，并为后续实验保留边界：
+一次同步 `sparse_copy` 包含：
 
-1. 阶段 1：600 个分散的 1 KiB 源块，通过单链接直接写入接收端分散的最终空间，端到端耗时是多少？
-2. 阶段 1.5：保持相同协议，减少忙等待中的调度开销和逐请求原子记账，能否改善提交与 e2e 时延？
-3. 阶段 2：在同一 direct B1 实现上增加第二条 NIC/QP 路径，每条写 300 块，双链接相对单链接有多少收益？
-4. 阶段 3：使用 SGL 8/16/30 把分散源写入连续 staging，并按 chunk 流水 scatter；减少 WR 的收益能否抵消 CPU 拷贝和通知成本？
-5. 阶段 4：以 `WRITE_WITH_IMM` 代替 SGL 路径的独立通知，还能减少多少开销？
+1. local 校验并编码本次地址描述，向 remote 发送完整请求。direct 基线必须携带 600 个源/目标地址对；后续 SGL 模式允许用更少的聚合源描述符配 600 个目标地址。
+2. remote 接收、解析请求，按请求地址构造并提交 600 个 1 KiB 数据的传输。
+3. local 确认最终 dst 可用；SGL 组还要完成所有 chunk 的 scatter，然后返回。
 
-当前 B1 主路径固定为：**分散源地址 → 600 次 RDMA Put 直接写入分散最终目标 → ROUND_READY → ACK**。第 `i` 次写入 `dst + i*4096`；不分配 staging、不注册 staging MR、不做 CPU scatter。各组总有效数据都是 614400 字节，即 600 KiB。
+local 使用自己的单调时钟，在函数调用前开始、返回后结束。包含请求编码/传输/解析、数据传输、完成通知处理、scatter，以及各环节的背压和线程交接。**删除逐轮 local→remote 的 ROUND_ACK，不新增请求确认 Reply。** remote→local 的数据完成通知仍必需，普通 WRITE 本身不通知 local 应用数据可用。
 
-> chunk/staging/scatter 仅属于阶段 3/4，不描述阶段 1/1.5/2。direct 与 SGL＋scatter 的最终任务相同，可以比较整体方案的 e2e；二者 CPU 拷贝与通知工作量不同，因此不能将全部差值称为“纯 SGL 合并收益”。需要分离该收益时，再增加同布局、同通知粒度的 plain-staged 诊断对照。
+```mermaid
+sequenceDiagram
+    participant L as local 调用线程
+    participant LC as local CQ worker
+    participant R as remote CQ / 应用线程
+    Note over L,R: setup：建链、MR、key/区域交换、预分配，计时外
+    L->>L: t0；进入 sparse_copy；校验和编码 600 项
+    L->>R: COPY_REQ(g, direct=600 对；SGL=聚合源+600目标)
+    R->>R: 接收复制、解析、生成本次 WR
+    R->>LC: 普通 WRITE / SGL WRITE
+    R->>LC: 同一真实 QP 上 DATA_DONE / CHUNK_DONE
+    LC-->>L: 发布本代 ready
+    L->>L: direct 数据可用 / 全部 scatter 完成；返回；t1
+    Note over L,R: 本轮没有 ACK；下次 COPY_REQ 才授予下一轮写入权限
+```
 
-以下对原要求作明确解释：
+这是完整应用接口的性能，不是纯 NIC 峰值。只允许每 session 一次调用在途，不实现跨轮窗口、异步 sparse_copy、通用内存池或自动重连。
 
-- “循环跑 600 个小包”默认指循环异步提交 600 次 `Put(1 KiB)`。如果每次同步完成再提交下一次，主要测串行往返等待，不能作为批量吞吐主 baseline。可增加单独的 `serial` 诊断项，但不得混入主表。
-- “双链接”定义为两张网卡各一条 RC QP。单 channel 设置 `linkCount=2` 并不能证明用了两张网卡，也会使数据与通知可能轮转到不同 QP。
-- SGL 是发送侧 gather。当前 hcom 的合并要求远端目标连续；若后续使用它写入 staging，最终分散落点由接收端 CPU 完成。
-- 当前唯一 B1 是 direct baseline：600 次普通 Put 直接写最终分散地址。staged/scatter 用例单独命名；主比较关注完成相同最终任务的整体策略收益，plain-staged 是按需增加的归因实验。
-- Python 负责启动和收集结果。QP 建立、MR 注册、地址交换仍使用 C++ 的 hcom 接口；把这些移到 Python 会增加 FFI 或自建协议，不能明显减少代码。
-- 第一阶段采用 **同一真实 QP 上的 600 次数据 WRITE + 一个 ROUND_READY Send 通知**。当前 hcom 已有接收缓冲、RQ 和 Send 接收回调，代码更少；无需应用轮询 RDMA 写入的内存 flag。
-- 首版只允许一轮 600 KiB 在途；一轮的唯一 ROUND_READY 与 ACK 同时控制源/目标缓冲复用。无需跨轮 slot、chunk ACK、环形缓冲分配器和自定义线程池。
+## 2. 旧基线差距与阶段 1 当前落点
 
-这是一项 hcom 端到端穿刺，包括其 API、异步上下文、callback、提交和 CQ 路径。它不等同于只测网卡或 verbs 的峰值。
-
-## 2. 当前代码能直接复用什么
-
-| 代码位置 | 已确认行为 | 对用例的约束 |
+| 项目 | main@38e6637 旧实现 | 当前 v3 实现 |
 |---|---|---|
-| [hcom_service_channel.h](C:/code/RDMA_DEMO/ubs-comm/src/hcom/service_v2/api/hcom_service_channel.h:139) | `Put/PutV` 支持 callback；`nullptr` 表示同步调用 | 热路径传非空 callback |
-| [hcom_service_def.h](C:/code/RDMA_DEMO/ubs-comm/src/hcom/service_v2/api/hcom_service_def.h:97) | OneSide 请求携带源/目的地址、key、size；SGL 是 iov 数组 | 每个 iov 填 1024 字节，目的地址连续 |
-| [service_channel_imp.cpp](C:/code/RDMA_DEMO/ubs-comm/src/hcom/service_v2/service_channel_imp.cpp:352) | `NextWorkerPollEp` 轮转选择 endpoint | 每个 channel 固定一个 endpoint |
-| [service_channel_imp.cpp](C:/code/RDMA_DEMO/ubs-comm/src/hcom/service_v2/service_channel_imp.cpp:836) | 异步 Send 通过 worker endpoint `PostSend` | 小通知禁用分片/RNDV，使用相同 channel |
-| [service_channel_imp.cpp](C:/code/RDMA_DEMO/ubs-comm/src/hcom/service_v2/service_channel_imp.cpp:2203) | 异步 PutV 走 worker `PostWrite(sglReq)`，使用 key 数组第 0 项 | 每个 service 只包含一个设备，避免内建 multirail |
-| [rdma_worker_io.cpp](C:/code/RDMA_DEMO/ubs-comm/src/hcom/transport/rdma/verbs/rdma_worker_io.cpp:446) | 按同 rkey、远端首尾连续的 iov 合并 | 一个 chunk 必须合并为一组 |
-| [rdma_verbs_wrapper_qp.h](C:/code/RDMA_DEMO/ubs-comm/src/hcom/transport/rdma/verbs/rdma_verbs_wrapper_qp.h:301) | 每组合成一个 WRITE WR，多个源 SGE，当前全部 signaled | 满 chunk 的 `num_sge` 应是 8/16/30 |
-| [hcom_service.h](C:/code/RDMA_DEMO/ubs-comm/src/hcom/service_v2/api/hcom_service.h:219) | 有设备绑定、SQ/RQ/CQ 深度、预投接收与 polling batch 设置 | 直接配置，不另造 verbs 建链层 |
-| [service_helper.cpp](C:/code/RDMA_DEMO/ubs-comm/test/hcom/tools/perf_test/test_case/service_v2/service_helper.cpp:79) | 现有 perf 工具示范 Create/Bind/Start/MR/handler | 仅参考初始化，不搬入整个 perf 框架 |
-| [service_write_bw_test.cpp](C:/code/RDMA_DEMO/ubs-comm/test/hcom/tools/perf_test/test_case/service_v2/service_write_bw_test.cpp:17) | 现有带宽测试循环异步 Put、每请求建立 callback | 可参考调用方式；需补充远端完成与 scatter 协议 |
+| 发起点 | RunSenderRound：remote 自主循环 | local 每次发 COPY_REQ，remote 只响应请求 |
+| 地址 | BuildPutRequests 在 setup 固定生成 `src+i*4096 → dst+i*4096` | direct 每次发送 600 对偏移；SGL 可发送聚合源描述符和 600 个目标偏移，remote 按本次请求重新填 WR/iov |
+| 计时 | remote 首次 Put 前至 ACK 和本地 callbacks 完成 | local 调用入口至最终 dst 可用并返回 |
+| 请求开销 | 无逐轮地址请求 | 校验、编码、Send、remote 接收和解析全部计入 |
+| 完成 | ROUND_READY 后回 ROUND_ACK | DATA_DONE/CHUNK_DONE 保留，逐轮 ACK 删除 |
+| 消息容量 | SetupService 的 maxSendRecvDataSize=1024 | 改为 16384，验证完整请求 Send 路径 |
+| baseline | 600 次异步 Put 直接写分散 dst，无 scatter | 保持 direct，不加入 staging/scatter |
+| 驱动与结果 | sender 驱动、输出性能 JSON | local 驱动、输出；remote 输出状态/诊断 |
+| 阶段 1.5 | A+B 已落地 | 按新的线程所有权复用，不能保留旧 ACK 协议 |
 
-当前分支没有完整的 `PutVWithImm` 公共接口。现有底层 `SEND_WITH_IMM` 用于 hcom 消息协议，不等于支持 `RDMA_WRITE_WITH_IMM`。
+不能只挪计时语句或删 SendRoundAck。请求驱动、描述符来源、复用条件和退出流程要一起调整。旧 `e2e_us` 与新 `sparse_copy_us` 不能直接相减来估算 ACK 或请求开销。
 
-## 3. 最小实现边界
+## 3. API、输入与请求 wire
 
-当前已有阶段 1 的以下文件；它们尚未在目标 RDMA 环境验证：
+### 3.1 最小 API 和计时边界
 
-```text
-perf_test/
-  DESIGN_CN.md            本设计
-  IMPLEMENTATION_PLAN_CN.md 分阶段任务、优化方案与验收
-  rdma_600.cpp             sender/receiver 共用一个 C++ 程序
-  CMakeLists.txt           链接现有 hcom_static 与 boundscheck 产物
-  build.sh                独立用例构建包装
-  run.py                  标准库 subprocess，在每台主机启动本地角色并保存结果
-  hosts.example.json      单链接双端配置示例
-  README.md               当前可用命令
-  PROGRESS.md             实现与验证状态
-```
-
-不新增通用 benchmark 框架，不复制 memfabric 抽象，不做自动重连、动态负载均衡、通用内存池、Python 数据面或自定义 RDMA QP 管理。
-
-首版保留必要的超时、错误退出、数据校验、计数和资源生命周期处理。每个失败 case 返回非零，不能输出看似有效的性能数字。
-
-程序结构可以保持为：`setup → exchange → verify → warmup → measure → drain → teardown`。控制消息和数据测试均复用现有 hcom channel，不另建 TCP 协议。
-
-## 4. 测试矩阵与准确的工作量
-
-当前 B1 的 `plain` 表示每块一次 `Put`，直接写入最终 stride-4096 dst；它没有 `chunk_items`。后续 `sgl` 设计表示每个 chunk 一次 `PutV`；仅该尚未实现的 staged 路径中，`chunk_items` 才同时决定一次就绪通知对应多少块以及一次 scatter 的块数。
-
-当前 direct B1 固定循环提交 600 次独立 1 KiB 写入，未将其合并为 SGL。它有 1 个轮次完成通知，而不是 20 个 chunk 通知。阶段 1.5 优化后仍称 B1，以提交/hash 标记优化版本；阶段 2 的 B1/B2 必须使用相同优化与测量设置。以下是整体方案主矩阵，不表示各方案的内部开销完全相同。
-
-| case | 链接数 L | API | 远端布局 / 控制 | 数据 WR/轮 | 通知 WR/轮 |
-|---|---:|---|---|---:|---:|
-| B1（已实现） | 1 | 600 次 Put | 直接 `dst+i*4096` / 1 ROUND_READY | 600 | 1 |
-| B2（计划） | 2 | 每条 300 次 Put | 直接最终 dst / 每条 1 ROUND_READY | 600 | 2 |
-| S1-8（计划） | 1 | PutV | stage，8 / chunk 通知 | 75 | 75 |
-| S1-16（计划） | 1 | PutV | stage，16 / chunk 通知 | 38 | 38 |
-| S1-30（计划） | 1 | PutV | stage，30 / chunk 通知 | 20 | 20 |
-| S2-8（计划） | 2 | PutV | stage，8 / chunk 通知 | 76 | 76 |
-| S2-16（计划） | 2 | PutV | stage，16 / chunk 通知 | 38 | 38 |
-| S2-30（计划） | 2 | PutV | stage，30 / chunk 通知 | 20 | 20 |
-| S2-30-off（计划） | 2 | PutV | stage，30 / 延迟 scatter | 20 | 20 |
-
-direct：B1 单条 600 个 Put 后通知一次；B2 每条 300 个 Put 后分别通知一次。以下 chunk 计算仅用于阶段 3/4：每条 `Nrail=600/L`，`chunks_per_rail=ceil(Nrail/chunk_items)`。第 c 块的有效地址数 `min(chunk_items, Nrail-c*chunk_items)`。
-
-- 单链接：SGL=8 无尾块；16 的最后一个 chunk 是 8 个地址；30 无尾块。
-- 双链接：SGL=8 每条最后一个 chunk 是 4 个地址；16 每条是 12 个地址；30 无尾块。
-- `WRITE+Send` 阶段的数据方向发送 WR 数为表中两列之和，例如 B1 为 601，S2-30 为 40，S2-8 为 152。
-- 接收端每轮每条链接额外回一个 `ROUND_ACK`：单链接 1 个，双链接 2 个。以上均不含建链、校验控制、心跳和硬件重传。
-- 地址块数量不是线上的网络报文数量；MTU 分包、协议头和 ACK 会另行影响端口计数。
-
-`S2-30-off` 仍然接收同样的 20 个 chunk 通知，只推迟 scatter，保证流水开关仅改变消费时机。**不要把 off 改成仅发送一个轮次通知，否则无法区分流水和通知数量的影响。**
-
-若要严格拆分 gather、scatter 和通知粒度的影响，按需增加 `plain-staged(L,K)`：与对应 SGL 使用相同 staging、scatter、K 和通知/ACK，但逐块 Put。其数据 WR 为 600，通知数为 `L*ceil((600/L)/K)`。该对照不属于阶段 2，也不是主矩阵必做项；8/16/30 的主表代表三种实际配置的综合效果。
-
-`serial` 和双提交线程属于诊断项；`direct` 已是当前 B1 的唯一主 baseline。
-
-## 5. 连接、线程与 NUMA
-
-两端分别创建 L 个 service，每个 service：
-
-```text
-RDMA transport
-SetDeviceIpMask({local_rdma_ip + "/32"})
-SetMultiRailOptions(enable=false)
-workerGroupThreadCount=1
-workerGroupMode=NET_BUSY_POLLING
-ConnectOptions.linkCount=1
-ConnectOptions.mode=WORKER_POLL
-ConnectOptions.cbType=CHANNEL_FUNC_CB
-```
-
-每个 service 名称唯一，例如 `rdma600_sender_0`。接收端每个 service 绑定不同 OOB 端口。OOB TCP 地址可以是管理网地址；它和实际 RDMA 网卡选择是不同配置。
-
-实际数据路径：
-
-```text
-sender service[0] / QP0 / NIC0  ── receiver service[0] / QP0 / NIC0
-sender service[1] / QP1 / NIC1  ── receiver service[1] / QP1 / NIC1
-```
-
-阶段 1/1.5：每端一个应用线程，一个 hcom CQ worker，没有 scatter。阶段 2：仍为每端一个应用线程，但每 rail 一个 hcom worker；发送线程按块交替向两条 rail 提交各 300 次 Put，不等待 rail0 完成才发 rail1，末尾分别追加 ROUND_READY。接收应用线程独立观察两条 rail 的 ready 并返回各自 ACK，不增加 scatter。
-
-阶段 3/4 才按 chunk 交替推进两条 rail；接收应用线程承担 scatter，与 CQ worker 分离。无需在原接收应用线程之外再额外启动一个通用 scatter 线程。
-
-这样无需自定义线程池，单/双链接保持相同应用线程数。双链接仍多一个 hcom worker，应在结果中记录总 CPU 使用量。若发送线程先达到瓶颈，双链接不一定更快；此时再做每 rail 一个提交线程的诊断实验，避免直接把变化全部归因于网卡。
-
-CPU 绑定规则：应用线程和 CQ worker 使用不同物理核心；记录网卡 PCIe NUMA 节点、线程 CPU 和源/destination 内存 NUMA 节点。后续 staged 用例再额外记录 staging 与 scatter 线程的 NUMA 关系；不在 B1 隐藏加入 NUMA 自动调度。
-
-## 6. 内存布局、描述符与初始化
-
-以接收者为 local，发送者为 remote；代码使用 sender/receiver 避免“远端”随角色改变产生混淆。
-
-```text
-当前 B1（L = 1）：
-  N = 600; B = 1024; stride = 4096
-  sender src：N * stride，源块 i 位于 src + i*stride
-  receiver dst：N * stride，最终块 i 位于 dst + i*stride
-```
-
-B1 的 source 和最终 `dst` 都注册为 MR；source/destination 地址之间留间隔，确保实际使用多个地址。没有 stage 分配或 stage MR。用 `posix_memalign` 或等价页对齐分配，提前触页，所有分配与注册在计时前完成。
-
-每个 MR 的 `UBSHcomMemoryKey` 先清零再 `GetMemoryKey`。按对应 service 导出并交换完整 key，不自行把裸 verbs lkey/rkey 填入 hcom 的高层结构，也不跨 service 混用 MR key。
-
-当前 B1 预生成并复用 600 个 `UBSHcomOneSideRequest`：
+以下为伪代码，真正实现要匹配当前 hcom 类型和所有权。
 
 ```cpp
-for (i = 0; i < 600; ++i) {
-    req[i] = {
-        .lAddress = src + i*4096,
-        .rAddress = peer_dst + i*4096,
-        .lKey = source_key,
-        .rKey = peer_dst_key,
-        .size = 1024
-    };
-}
-```
+struct CopyEntry { uint64_t remote_src_offset; uint64_t local_dst_offset; }; // direct: 恰好 600 对
+// session 已有连接/MR/key，模式在 setup 确定；每项固定 1024 字节。
+// direct entries 恰好 600 项；同一 session 不可并发调用。
+Status sparse_copy(Session& session, Span<const CopyEntry> entries);
 
-后续 SGL 若采用连续远端 staging，会在其独立实现中预生成 chunk/SGL 视图；它不是 B1 的布局。以上及后续均为伪代码，不保证可直接编译。真正实现需遵守当前类型和构造函数签名。
-
-首版不预先把源数据打包为连续 30 KiB；总源有效数据为 600 KiB，源与目标 stride 空间各约 2.34 MiB。后续 staged/SGL 路径会额外分配 600 KiB staging，须单列该工作量。
-
-## 7. 控制面与启动时序
-
-复用 hcom 的 `Call/Reply` 做 MR/配置交换，复用 `Send` 做轮次完成通知与 ACK。当前 B1 的控制消息使用明确 opcode：`HELLO`、`READY`、`ROUND_READY`、`ROUND_ACK`、`FINISH`。不直接序列化指针持有的 C++ 对象。
-
-握手交换：协议版本、case 参数、最终 destination 缓冲区大小/基地址、完整 memory key、代码版本标识。固定字段采用显式编码；两端参数不一致立即拒绝测试。
-
-```text
-receiver：注册 handler → Bind/Start → 申请/注册/触页/初始化最终 dst
-sender：  Start → 申请/注册/初始化 src → Connect 每条 rail
-sender：  HELLO/Call，获取每条 rail 的最终 dst 元信息
-receiver：只有内存和就绪状态初始化完成才允许返回 READY
-sender：  所有 rail READY，预生成描述符，然后开始验证和预热
-```
-
-某一条 rail READY 不代表整组 READY。连接建立后不得再清零正在接收数据的 dst；所有代际状态从 generation=1 单调递增，验证、预热、测量切换时不重置 generation。
-
-Python 包装最小职责：receiver 主机以 `--role receiver` 启动本地 receiver 并实时输出 `LISTENING`；确认后，sender 主机以 `--role sender` 启动本地 sender。两端各自等待退出并保存本机 JSONL/stdout/stderr。`LISTENING` 只是进程编排信号，真正数据面 READY 由 C++ 协议保证。
-
-不需要 Python 交换 QPN、PSN、GID 或 MR key，也不需要 Python 每轮发消息。可直接在两个终端手工启动 C++ 程序，结果应与 Python 包装一致。
-
-## 8. 第一阶段通知协议：600 WRITE + ROUND_READY Send
-
-每轮提交顺序：
-
-```text
-B1：Put(block0), Put(block1), ... Put(block599), Send(ROUND_READY)
-```
-
-所有调用异步，同一应用线程提交到唯一 QP。提交完第 600 个数据请求后即可追加 ROUND_READY，不必等发送端数据 callback 才发送通知。
-
-依赖条件是标准 RC QP 的有序操作、该 channel 唯一真实 QP，以及正常的 verbs 完成/内存可见性语义。不启用改变写入顺序的 relaxed ordering 扩展。接收端看到该 QP 的成功 Send 接收完成后，才发布整轮最终 dst 的就绪状态。两条 QP 之间没有顺序保证，后续双链接应分别处理。
-
-在两台鲲鹏机器上必须先以唯一数据模式验证这条路径；C++ `release/acquire` 只用于 CQ worker 与应用线程之间发布整轮就绪状态，不能拿它代替设备 DMA 完成语义。若无法确认实际 QP 映射或后续代码改变路由，停止使用这个顺序假设，诊断时可改为等待数据完成后再 Send，并单列其额外等待开销。
-
-ROUND_READY 和 ROUND_ACK 均为 16 字节，不计 hcom 自身头部：
-
-```cpp
-// wire 字段须显式编码，不依赖结构体隐式 padding
-struct RoundToken {
-    uint32_t magic;
-    uint64_t generation;
-    uint16_t rail;
-    uint16_t reserved;      // 写 0，消息类型由 hcom opcode 区分
+// 阶段 3 扩展输入视图；remote_source_descriptors 的含义由 source_format 决定。
+struct SglCopyInput {
+    SourceFormat source_format; // SPARSE_600 或 GROUPED
+    Span<const uint64_t> remote_source_descriptors; // 600 个源偏移，或真实源组描述符
+    Span<const uint64_t> local_dst_offsets;         // 始终 600 个目标偏移
+    uint16_t sgl_items;                             // 8 / 16 / 30
 };
-```
+Status sparse_copy(Session& session, const SglCopyInput& input);
 
-接收时校验长度、magic、rail/channel 对应关系和严格递增的 generation。
-
-receiver 的 verify 轮在 ROUND_READY 后检查全部 600 个块和每个 stride gap，再发送本轮 ROUND_ACK。warmup/measure 轮收到 ROUND_READY 后直接发送本轮 ACK，不做逐轮完整扫描；所有测量轮结束后才检查最终 dst，并在成功后完成 FINISH/FINISH_ACK 握手。最终扫描不计入每轮 e2e，但失败仍使整个 run 无效。sender 每轮同时满足 ACK 与本地 data/Send 完成后才开始下一轮。阶段 2 对每条 rail 分别处理此流程，整轮等齐两条 rail。
-
-为何不采用独立 flag WRITE：它虽然也可在同一 QP 追加，但需要额外 MR 地址、源 flag 生命周期、CPU 轮询及 DMA 可见性约定；当前 hcom 已有 Send 接收通路，首版无需增加这些工作。它可以是后续专门比较的通知方式，不与首版混用。
-
-## 9. 阶段 3 的 staged 流水状态与伪代码（未实现）
-
-当前 B1 只有一个 `round_ready_generation`、一个 ACK generation 和累计 callback 计数；它没有 chunk ready 数组，也没有 scatter 线程。以下 chunk 状态机只保留为未来 staged/SGL 用例的设计草案，不能用来解释或修改 B1。
-
-未来 staged 路径可保持 `rounds_in_flight=1`，不用 slot。每条 rail 至多 75 个 chunk，静态容量可取 128。
-
-```cpp
-struct RailState {
-    atomic<uint64_t> ready_generation[128]; // CQ worker 写，scatter 线程读
-    atomic<uint64_t> ack_generation;        // sender 的接收 callback 写
-    atomic<uint64_t> data_done_total;       // sender 的本地写 callback 累加
-    atomic<uint64_t> send_done_total;       // 本端通知/ACK 发送 callback 累加
-};
-atomic<int> fatal_error;
-```
-
-累计计数不每轮清零，提交线程维护累计期望值。所有状态和计数预分配。generation 标记无需在消费后写回 0，减少双方同时重置的竞态。
-
-接收 CQ callback：
-
-```cpp
-OnDataReady(ctx) {
-    if (ctx.Result() != OK) return Fail(ctx.Result());
-    Notice m = DecodeAndCopy(ctx);       // callback 返回后不保留 ctx/消息指针
-    ValidateNoticeAgainstCaseAndChannel(m);
-    old = ready_generation[m.chunk_id].load(relaxed);
-    if (m.generation != old + 1) return Fail(PROTOCOL_ERROR);
-    ready_generation[m.chunk_id].store(m.generation, release);
-    return OK;                          // 不 memcpy，不等待 ACK，不同步 Send
+Session s = SetupAndExchange(config);            // 不计时
+PrepareSourceAndCallerInputLists(s);             // 不计时
+samples.reserve(rounds);                         // 不计时
+wall_begin = LocalMonotonicRawNow();
+for (...) {
+    const auto& entries = caller_lists[next_list];
+    auto t0 = LocalMonotonicRawNow();
+    Status rc = sparse_copy(s, entries);
+    auto t1 = LocalMonotonicRawNow();
+    if (!rc.ok()) FailRun();
+    samples.push_back(t1-t0);
 }
+wall_end = LocalMonotonicRawNow();
+ValidateFinalDestination();                      // 不计时，失败仍使结果无效
+FinishAndDrainBothSides(s);                      // 不计时
 ```
 
-`ready_generation` 初始为 0，每个有效 chunk 每轮恰好收到一次通知。固定 case 内 chunk 划分不变。先到的下一轮通知允许发布，即使应用线程还在等待上一轮 ACK 的本地发送完成；不会因此错误清零或丢失通知。
+计时外可分配/触页/注册 MR，预分配请求、WR、iov、统计容量，初始化稳定源内容，生成调用方的输入列表。**不能提前编码可直接发送的请求、预生成本轮 remote WR，或只发 generation 让 remote 重用预置地址。** 每次必须完整编码发送，remote 每次解析并填充 WR/iov。复用容量可以，绕过请求内容不可以。
 
-发送端每轮：
+阶段 1/2 的 direct API 固定使用 600 个 `CopyEntry`。阶段 3 若调用方本来就持有可唯一展开 K 个源块的聚合源描述符，可以改用 SGL 请求；总源组数为 `L*ceil((600/L)/K)`，每 rail 为 `ceil((600/L)/K)`。例如单/双 rail 的 K=30 总数都是 20 个源组描述符，再配 600 个目标地址。若输入仍是 600 个任意分散源地址，则不能为缩短请求而假装成 20 个地址，仍须传 600 个源地址，再由 remote 构造 20 个 PutV。
+
+### 3.2 内存与地址契约
+
+固定 `N=600, B=1024, stride=4096`。remote 源区和 local 最终 dst 各 `N*stride=2457600` 字节，页对齐、预触页。首版偏移是 4096 的整数倍、处于对应区域内；目标槽互不重复，可用预分配的 600 项标记数组校验，成本在调用内。源槽允许重复。先验证 `region_bytes >= B`，再验证 `offset <= region_bytes-B`，避免加法溢出。
+
+offset 是对应已注册区域的字节偏移，不把一个进程的指针直接当成另一进程的指针。local 在 setup 中把自己的 dst（SGL 时还包括 staging）基址、大小、区域 ID 和完整 `UBSHcomMemoryKey` 发送给 remote，供 remote 发起 RDMA WRITE。remote 只向 local 返回 source 区域 ID、大小、对齐/聚合能力等校验信息；source 基址和 source MemoryKey 留在 remote 本地，不发送给 local。每项固定 1 KiB，不逐项携带 key；导出 local key 前清零结构，不自行把裸 verbs rkey 塞入高层 key。
+
+双 rail 使用同一逻辑源池和 dst 池，分别向两个 service 注册并保存每 rail 的 key，不能跨 PD/设备混用。只有 SGL 组额外分配并注册 local 连续 staging，大小 614400 字节。direct 无 staging。
+
+全局请求索引决定 rail：L=1 时 0..599 全部 rail0；L=2 时 0..299 属于 rail0，300..599 属于 rail1。每项最终目标为 `dst_base + entries[i].local_dst_offset`，不能用偏移大小代替请求索引分 rail。
+
+### 3.3 完整请求：direct 固定 9664 字节，SGL 允许聚合源描述符
+
+阶段 1/2 direct 必须携带 **600 对源/目标偏移**，每项 16 字节，正文 9600 字节，加 64 字节应用头，共 **9664 字节（9.4375 KiB）**；hcom/网络头另计。remote 不得自行推导或复用 setup 时预置的源地址，因为只有 local 的本次请求知道要读取和写往哪里。
+
+阶段 3 SGL 的目标地址数仍固定为 600。源侧有两种合法输入契约：
+
+- sparse-source：仍传 600 个源地址和 600 个目标地址，remote 按 K 将源地址构造成 PutV；请求仍为 9664 字节。
+- grouped-source：每个源描述符本身能够唯一定位最多 K 个源块，wire 传 `src_group_count` 个聚合源地址和 600 个目标地址。K=30 且总块数为 600 时，`src_group_count=20`；若每个聚合源地址为 8 字节，请求为 `64 + 20*8 + 600*8 = 5024` 字节。
+
+grouped-source 不是把 600 个任意地址无损“压成”20个地址。聚合描述符必须来自调用方真实输入契约，例如指向已存在的连续 K-block 源区或可验证的 remote 本地组描述符；如果生成聚合源区需要额外 gather/copy，该工作必须计入 `sparse_copy`，不能放到计时外。阶段 3 编码前必须固定并记录 source layout，不能在不同 case 中静默切换。
+
+COPY_REQ 固定头：
+
+| 字段 | 字节 | 约束 |
+|---|---:|---|
+| magic / version / opcode | 4 / 2 / 2 | 新协议 version=3，不兼容旧 version=2 |
+| generation | 8 | 从 1 单调递增 |
+| src_address_count / dst_address_count / block_bytes | 4 / 4 / 4 | direct 为 600 / 600 / 1024；SGL dst 固定 600 |
+| mode / rail_count / sgl_items / source_format | 2 / 2 / 2 / 2 | direct 的 sgl_items=0；格式为 DIRECT_PAIRS / SPARSE_600 / GROUPED，并与正文一致 |
+| src_region_id / dst_region_id / stage_region_id | 4 / 4 / 4 | direct 的 stage ID=0（无效 ID） |
+| header_bytes / descriptor_bytes / payload_bytes | 4 / 4 / 4 | 头固定 64；描述符长度按 source_format 精确计算；payload 固定 614400 |
+| reserved | 4 | 0 |
+
+三种正文与长度必须严格对应：
+
+- `DIRECT_PAIRS`：600 个 `(src_offset:uint64, dst_offset:uint64)`，`descriptor_bytes=600*16=9600`，`request_bytes=9664`。
+- `SPARSE_600`：同样编码 600 个源/目标对，长度仍为 9600/9664；remote 再按 K 分组构造 PutV。
+- `GROUPED`：先编码 `src_address_count` 个 8 字节真实源组描述符，再编码 600 个 8 字节 `dst_offset`；`descriptor_bytes=8*(src_address_count+600)`，`request_bytes=64+descriptor_bytes`。K=30 时源组数为 20，长度为 4960/5024。
+
+接收端必须同时校验 `received_bytes == header_bytes + descriptor_bytes`、格式对应的计数和公式，不能仅信任头内长度。显式网络字节序编码，不 memcpy 原生 C++ struct 或 padding。若聚合描述符使用 remote 地址，只能作为 remote 自己校验和解引用的业务地址，不能当作 local 指针。验证版本、保留字段、generation、区域和范围，不接受截断或尾随数据。callback 返回后接收缓冲可能复用，不能保留借用指针。
+
+每次 COPY_REQ **只在 rail0 发一次**。direct 双 rail 仍携带完整 600 对；SGL 携带其声明的全部源描述符和 600 个目标地址。remote app 再向两条 rail 分派。使用异步 Send，不用逐轮 Call/Reply 增加一次成功确认。
+
+当前 service 将 maxSendRecvDataSize 映射为 driver 的 mrSendReceiveSegSize。两端所有 service 改为 16384，并保留禁用 Send split/RNDV 的配置；先确认含库头的实际可用容量和最大 direct 9664 字节 Send，再跑数据。一次 hcom Send 不等于一个以太网包，9.4 KiB 不假设走 inline。不得截断消息或退回只传计数来“跑通”。
+
+## 4. setup、线程和关键参数
+
+Python 只负责本地主机进程、配置和证据收集；QP/MR/key 交换由 C++ hcom 完成。无需 Python FFI 或自建 verbs 建链。新 CLI 使用 `--role remote|local`，**remote 监听、local 连接**；这与旧 receiver 监听的方向不同，配置和脚本一起迁移。
+
+```text
+remote：注册 handler，Bind/Start，初始化/注册 source
+local： Start，初始化/注册 dst（SGL 才有 stage），Connect 所有 rail
+local → remote：每 rail HELLO/Call，带协议/配置和本 rail dst/stage 基址、大小、区域 ID、完整 key
+remote → local：READY/Reply，只返回 source 区域 ID、大小、对齐/聚合能力；不返回 source key
+local：所有 rail READY 后才允许 sparse_copy(g=1)
+```
+
+READY 保证内存、handler 和状态可用；LISTENING 仅供启动编排。generation 跨 verify/warmup/measure 连续递增。local 最终校验后发一次 FINISH，remote drain 在途 callbacks 后回 FINISH_ACK；双方再 drain/teardown。这次退出握手不进入 sparse_copy 或 measured wall，但失败使结果无效。
+
+每端一个 app 线程，每 rail 一个 hcom CQ worker。remote app 构造/提交 WR；local app 发请求并 scatter。CQ callback 只做有界接收复制、校验和状态发布，不 scatter、不阻塞等待或逐次打印。
+
+| 参数 | 默认值 / 规则 |
+|---|---|
+| service/device/channel/QP | 每 rail 各一个，IP `/32` 绑定，禁用内部 multirail |
+| channel | WORKER_POLL，linkCount=1，异步 API 非空 callback |
+| worker | NET_BUSY_POLLING，每 service 1 个，poll batch=16 |
+| SQ / RQ / CQ / 预投 | 请求 1024 / 256 / 2048 / 128；记录实际创建值/库调整 |
+| maxSendRecvDataSize | 16384，两端及各 case 一致 |
+| splitThreshold / rndvThreshold | UINT32_MAX；核对实际 worker Send 路径 |
+| TLS | Start 前显式 enableTls=false，沿用测试设置 |
+| timeout | 每调用 10 秒；每 256 次 spin 检查 deadline，每次检查错误 |
+| verify / warmup / measure / repeat | 20 / 1000 / 10000 / 5 |
+| 在途 / trace | 一次调用在途；正式 measure 关闭详细 trace |
+| SGL K | 8/16/30，受实际 QP max_send_sge 和当前合并上限 30 约束 |
+
+两端 app 和各 worker 绑定不同物理核心，记录 NIC/CPU/内存 NUMA、MTU、QP 到 NIC 映射。双 rail 多一个 worker，要记录 CPU 成本，不预设带宽翻倍。
+
+## 5. 无逐轮 ACK 的生命周期与伪代码
+
+### 5.1 复用规则
+
+每次 COPY_REQ 仅授予 remote **一代**写权限，remote 不得根据预设轮数自主发下一轮。local 上代消费完成（SGL 全部 scatter）后才发下一请求，因此 `COPY_REQ(g+1)` 已表明 g 的 dst/staging 可以复用，不需要独立 ACK。
+
+local 返回条件：本代所有 rail 数据 ready（SGL 为全部 chunk 已 scatter），且本端 COPY_REQ Send callback 成功完成。后者保障请求缓冲可安全复用，属于步骤 1 的本地完成处理，不增加网络消息。返回后 dst 有效到调用方下次调用或关闭 session；调用方不能在下一次写入开始后继续读旧 dst。
+
+remote 数据/通知 callbacks 必须正常回收。新请求可能比上代 remote 本地 callback 的处理更早到达：接收 callback 将新请求放入**一个预分配 pending 槽**；remote app 等上代本地 callbacks 全部完成后，才复制 pending 到独立 active 存储、释放 pending，再复用本地 WR/iov/验证源数据。pending 发布/消费用 release/acquire；active 不能与可被覆盖的 pending 共用内存。
+
+这不是多代数据并发：只有 local 已消费上一代才会到下一代请求。上代 remote 资源等待计入下一次 local 调用，不在两次计时之间加“等 remote 空闲”屏障隐藏成本。最后一代私有回收在退出 drain 完成，不额外加确认往返到数据可用时延。
+
+### 5.2 local
 
 ```cpp
-RunSenderRound(generation) {
-    // 上轮已收齐 ACK，且本地数据/通知 callback 都已完成
-    t0 = now();
-    for (c = 0; c < chunks_per_rail; ++c) {
-        for (r = 0; r < L; ++r) {        // 两条 rail 交替推进
-            chunk = chunks[r][c];
-            if (mode == PLAIN) {
-                for (i : chunk.items) {
-                    ++expected_data_done[r];
-                    Check(ch[r]->Put(req[r][i], NewDataDoneCallback(r)));
+Status sparse_copy(Session& s, Span<const CopyEntry> e) {
+    // 调用方 t0 已开始；不建链、不注册 MR。
+    CheckSessionAndValidate600Entries(e);
+    g = s.NextGenerationChecked();
+    SetExpectedGenerationAndLayout(g, e);          // 必须早于请求发送
+    EncodeCopyReq(s.request_wire, g, e);           // direct 每轮完整 9664 字节
+    AsyncSend(s.rail[0], COPY_REQ, s.request_wire, RequestSendDone);
+    if (s.mode == DIRECT) {
+        WaitData(AllRailsReady(g) && RequestSendCompleted(g));
+    } else {
+        if (s.scatter == AFTER_ALL) WaitData(AllChunksReady(g));
+        while (scattered_chunks < expected_chunks) {
+            CheckFatalAndPeriodicDeadline();
+            for (rail, chunk) {                   // 公平扫描，不被一个缺块阻塞
+                if (!Consumed(rail,chunk) && ReadyAcquire(rail,chunk) == g) {
+                    for (i : Indices(rail,chunk))
+                        memcpy(dst + e[i].local_dst_offset, stage + i*1024, 1024);
+                    MarkConsumedByLocalApp(rail,chunk);
                 }
-            } else {
-                ++expected_data_done[r]; // 一次 PutV 的 API 完成
-                Check(ch[r]->PutV(chunk.sgl, NewDataDoneCallback(r)));
             }
-            FillPersistentNotice(r, c, generation);
-            ++expected_send_done[r];
-            Check(ch[r]->Send(notice_req[r][c], NewSendDoneCallback(r)));
+            CpuRelaxIfNoProgress();
         }
+        WaitData(RequestSendCompleted(g));
     }
-    t_submit = now();
-    while (!AllAckAtLeast(generation) || !AllLocalCallbacksDone()) {
-        CheckFatalAndDeadlinePeriodically();
-        // hcom worker 独立处理 CQ；这里不使用其 self-poll 接口
-    }
-    t_end = now();
-    Record(t_submit-t0, t_end-t0);
+    return CheckSuccess();                        // 无 ROUND_ACK
+}
+
+OnReadyReceive(ctx) {                              // local CQ worker
+    ActiveCallbackGuard guard;
+    CheckSuccessAndCopyDecodeNotice(ctx);
+    ValidateChannelGenerationChunkLengthAndNoDuplicate();
+    ready_generation[rail][chunk].store(g, release);
 }
 ```
 
-callback 只检查 `Result()`，然后对相应累计计数 `fetch_add`，错误写入 `fatal_error`。所有 API 返回值同时检查；API 接受请求、发送端完成、接收端 scatter 完成是三个不同事件。
+所有 WaitData 和进度循环共享本次调用的绝对 deadline，不能在每个阶段重新给满 10 秒。direct 每 rail 只用一个 ready 单元，不创建 chunk/scatter 状态。SGL ready 容量每 rail 128；存完整 generation，不由双方反复清零；consumed 是 local app 私有。通知重复、旧代、未来代及 rail 不匹配都失败，不能只数通知个数后放行。
 
-接收端应用线程每轮：
+expected generation 从 local app 发布给 CQ worker，同样须用 release/acquire；与该代相关的条目/布局先写完再发布。callback 在发布 ready 后不再读取会被下一调用覆盖的条目。只在独立 verify/trace 中记录逐事件时间，正式路径不增加时钟采样。
+
+### 5.3 remote
 
 ```cpp
-RunReceiverRound(generation) {
-    next_chunk[0..L-1] = 0;
-    ack_posted[0..L-1] = false;
-    if (scatter_mode == AFTER_ALL) {
-        WaitUntilEveryChunkReady(generation); // 期间 CQ worker 持续工作
-    }
-    while (!AllRailsAckPosted()) {
-        progressed = false;
-        for (r = 0; r < L; ++r) {
-            c = next_chunk[r];
-            if (c == chunks_per_rail) continue;
-            if (ready[r][c].load(acquire) < generation) continue;
-            chunk = chunks[r][c];
-            for (i : chunk.items)
-                memcpy(dst[r] + i*4096, stage[r] + i*1024, 1024);
-            // verify 模式在此完整验证对应数据；measure 模式不逐块校验
-            ++next_chunk[r];
-            progressed = true;
-            if (next_chunk[r] == chunks_per_rail) {
-                FillPersistentAck(r, generation);
-                ++expected_ack_send_done[r];
-                Check(ch[r]->Send(ack_req[r], NewAckDoneCallback(r)));
-                ack_posted[r] = true;
-            }
+OnCopyReq(ctx) {                                   // remote rail0 CQ worker
+    ActiveCallbackGuard guard;
+    CheckReceiveSuccessAndExactWireLength(ctx);
+    RequirePendingSlotFreeAndNextGeneration();
+    CopyExactRequestToPreallocatedPending(ctx);     // direct=9664；不保留 ctx 借用指针
+    pending_generation.store(g, release);
+}
+
+RemoteServeLoop() {
+    for (;;) {
+        WaitData(PendingRequestOrFinish());
+        if (FinishRequested()) break;
+        WaitData(PreviousLocalDataAndNoticeCallbacksDrained());
+        CopyPendingToActiveThenReleasePendingSlot();
+        DecodeAndValidateAllEntries(active);
+        if (verify) FillSourceGenerationPattern(); // 验证运行不出性能数字
+        if (mode == DIRECT) {
+            for (j = 0; j < 600/links; ++j)
+                for (r = 0; r < links; ++r) {
+                    i = r*(600/links) + j;
+                    req[i] = MakePutFromEntry(active[i], rail_keys[r], 1024);
+                    AsyncPut(channel[r], req[i], DataDoneCallback);
+                }
+            for (r = 0; r < links; ++r)
+                AsyncSend(channel[r], DATA_DONE(g,r), NoticeDoneCallback);
+        } else {
+            for (c = 0; c < chunks_per_rail; ++c)
+                for (r = 0; r < links; ++r) {
+                    BuildChunkIovFromActiveRequest(r,c);
+                    AsyncPutV(channel[r], iov[r][c], DataDoneCallback);
+                    AsyncSend(channel[r], CHUNK_DONE(g,r,c), NoticeDoneCallback);
+                }
         }
-        CheckFatalAndDeadlinePeriodically();
+        // 不等 ACK，不自行生成下一代；active/WR/通知 buffer 仍存活。
     }
-    WaitForOwnAckSendCallbacks(); // ACK 消息缓冲复用前必须完成
+    DrainAndReplyFinish();
 }
 ```
 
-每次扫描每条 rail 最多消费一个 chunk，避免慢 rail 阻塞快 rail，也避免 rail0 长时间独占 scatter 线程。同一 rail 按 chunk 顺序消费，不需要复杂就绪队列；只有单个生产 worker，状态数组已足够。
+每个在途请求/iov/通知 buffer 在对应本地 callback 前不能覆盖，尤其多个 chunk Send 不能共用一个不断改写的临时 buffer。期望计数累计递增，callback 可能早于 API 返回。部分提交失败不能按“全部 600 个必有 callback”等待；遵守库 callback 所有权，不能失败后一律 delete。有界 drain 失败则进程失败退出，不释放仍被 DMA/callback 引用的对象。
 
-一次典型流水如下；具体是否重叠到足够多时间取决于实测，不能只因采用此结构就声称获得加速：
+删除成功 ACK 不等于允许 remote 失败后让 local 只等超时。增加仅失败路径使用的 `COPY_ERROR(generation, stage, error_code)`：remote 在请求解析/校验或尚可用的 channel 上发生提交错误时尽力发送，local CQ 发布对应 fatal generation，所有 `WaitData` 立即失败。若 QP/发送路径已经不可用，则 remote 主动关闭 channel，由 local channel-broken handler 唤醒等待。`COPY_ERROR` 不在成功路径出现，不改变 `ack_wr_per_call=0`；错误通知自身失败时仍执行有界 drain/进程失败退出。其 32 字节编码为 magic:u32、version:u16、opcode:u16、generation:u64、stage:u32、error_code:u32、detail:u32、reserved:u32；stage/error_code 使用稳定枚举，reserved 必须为 0，detail 不适用时为 0。
 
-```text
-NIC : [write c0][notify0][write c1][notify1][write c2][notify2] ...
-CPU :                  [scatter c0]       [scatter c1]       ...
-```
+### 5.4 普通完成通知及 QP 顺序
 
-**缓冲和对象生命周期：**源数据保持到本地写完成；notice 保持到本地 Send 完成；staging 保持到对应 scatter 完成；ACK 保持到自身 Send 完成；MR、channel、状态对象保持到全部操作 drain 后。最后一轮结束仍执行 FINISH 握手并 drain，随后断链/停服务，按库要求销毁 MR 和服务，不能在 worker 仍有 callback 时释放状态。
+DATA_DONE/CHUNK_DONE 统一 32 字节显式编码：magic:u32、version:u16、opcode:u16、generation:u64、rail:u16、chunk:u16、first_item:u32、item_count:u32、payload_bytes:u32。direct 的 chunk=0、item_count=600/L；SGL 为真实尾块数。hcom opcode 与头内 opcode 一致。
 
-### callback 的精简边界
+每个通知在它覆盖的数据 WRITE **之后提交到同一真实 RC QP**。禁用 endpoint 轮转和改变写入排序的扩展，验证 provider/DMA 可见性。local 成功收到 Send CQE 后才发布 ready；CPU release/acquire 仅用于 CQ worker 到 app 发布，不能代替 DMA 完成。双 QP 没有全局顺序，rail0 通知不能证明 rail1 完成。
 
-第一版使用公共 `UBSHcomNewCallback`，每请求一个自删除 callback，与当前 service API 示例一致。请求描述符和消息缓冲全部预分配；callback 分配及 hcom timer/context 管理开销保留在测量中。
+## 6. 测试矩阵与 SGL 流水
 
-不直接把栈上 callback 传给 hcom，也不共享一个可被删除的 callback 给多次请求。当前异步错误路径可能删除 callback，应用不能在任意失败后再无条件 `delete` 同一指针。请求失败后记录错误并终止该次测试，具体资源回收按各 API 的实际所有权路径处理。
+所有组每次同为 614400 字节有效数据、600 个最终目标地址、**逐轮成功 ACK=0**。direct 请求固定 9664 字节；SGL 可选 grouped-source 时请求随源组数缩短。下表为应用预期 WR，不含 setup/FINISH、失败时才有的 COPY_ERROR、hcom 内部控制及网络 ACK/重传；真实数据 WR 另做诊断。
 
-若 profile 证实 callback 分配占主导，再单独设计 callback 池或库内轻量异步接口，并让各组使用相同版本重新测量。首版不为了减少表面行数而依赖内部 `gEmptyCallback` 或切换全局 callback 模式绕过正常完成管理。
+| case | rail | 方式 | 数据 WR | 完成 Send WR | 请求 Send WR | 请求 source/dst 地址数 |
+|---|---:|---|---:|---:|---:|---:|
+| SC-B1 | 1 | 600 次 direct Put | 600 | 1 | 1 | 600 / 600 |
+| SC-B2 | 2 | 每 rail 300 次 direct Put | 600 | 2 | 1 | 600 / 600 |
+| SC-S1-8 | 1 | SGL + stage + 流水 scatter | 75 | 75 | 1 | grouped 可为 75 / 600 |
+| SC-S1-16 | 1 | 同上 | 38 | 38 | 1 | grouped 可为 38 / 600 |
+| SC-S1-30 | 1 | 同上 | 20 | 20 | 1 | grouped 可为 20 / 600 |
+| SC-S2-8 | 2 | 同上 | 76 | 76 | 1 | grouped 可为 76 / 600 |
+| SC-S2-16 | 2 | 同上 | 38 | 38 | 1 | grouped 可为 38 / 600 |
+| SC-S2-30 | 2 | 同上 | 20 | 20 | 1 | grouped 可为 20 / 600 |
+| SC-S2-30-off | 2 | 等所有 chunk ready 后 scatter | 20 | 20 | 1 | 与 SC-S2-30 相同 |
 
-### 阶段 1.5：direct 热路径优化边界（已实现，硬件验证 pending）
+chunk 数为 `L*ceil((600/L)/K)`。stage 目标为 `stage_base + global_item_index*1024`。sparse-source 时源由 600 个 CopyEntry 给出；grouped-source 时每个源组描述符必须按已声明的 layout 展开本 chunk 的 K 个源块。当前 hcom PutV 按相同 rkey、远端首尾连续分组；每 chunk 必须一组/一个 WR。**普通 WRITE WR 不能直接散写 local 的多个不连续 dst。** local 始终保留并使用 600 个目标偏移完成 scatter，600 次 memcpy 在调用内。
 
-阶段 1 原始 direct 代码在等待中每次调用时钟和 `std::this_thread::yield()`；每个数据请求还动态分配 callback，并执行提交计数、完成计数、活动 callback 进入/退出的原子更新。阶段 1.5 已优化这些应用侧成本，但不改变 600 个 Put、一个 ROUND_READY/ACK、单轮在途及全 signaled 的库路径。
+K=16 单 rail 尾块 8 项；双 rail K=8 每 rail 尾块 4 项，K=16 尾块 12 项；K=30 均整除。每 chunk ready 就可 scatter，不等整轮；各 chunk 独占 staging 区域，不需要 chunk ACK 或分块复用环形 buffer。下一调用前全部消费完成，一份 600 KiB stage 足够。
 
-优化 A：仅数据面改为绑核条件下的忙轮询，默认每 256 次循环检查时钟/deadline，去掉每次 OS yield；保留 acquire 可见性、错误退出和非性能路径的有界等待。优化 B：把仅应用线程访问的提交计数改为线程私有累计值，隔离不同写入线程的共享缓存行，保留必要完成发布和退出保护。callback 分配先保留，只有独立 profile 证实其主导时才评估固定容量复用；不得直接复用会被 hcom 删除的 callback。
+off 与 pipeline 必须使用相同的source请求格式、通知数/粒度和布局，仅改变scatter时机。direct与SGL比的是完整接口策略收益，可能同时包含请求压缩、WR、通知和CPU拷贝变化；不能把综合收益全部归为SGL硬件聚合。若要分离请求压缩影响，同一SGL case增加 `source_format=sparse-600|grouped` 对照；若要分离纯WR合并收益，再加plain-staged(L,K)：600普通Put、相同请求、stage/K/通知/scatter。这些是归因诊断，不属于阶段2。
 
-A、B 分别形成可对比版本，记录 B1 原版、A、A+B 的正确性及性能；阶段 2 的 B1/B2 一起采用已验证的相同版本。具体实现、失败路径、当前本地证据和待执行硬件验收见实施计划“阶段 1.5”及 `STAGE1_5_REPORT_CN.md`。
+不能以常量 30 代替实际 QP max_send_sge。不足明确 SKIP，能力未知标 pending；不能静默拆分后声称单 WR。短诊断观察 grouped post 的 groupCount=1、opcode、num_sge、地址和 QP，正式测量关闭诊断。现有多组 post 的部分失败语义、30×30 SGE 临时数组开销不在首版顺手重构；单组约束不代表修复了通用问题。
 
-## 10. 参数与队列预算
+## 7. 阶段 1.5 优化迁移
 
-当前 B1 的固定值是 `links=1`、`mode=plain`、`rounds_in_flight=1`、600 个数据 WR、1 个 ROUND_READY WR、无 `chunk_items`、无 scatter。下表中 SGL/chunk/staging 相关行仅适用于未来 staged 设计。
+保留 main 已有两项优化，但移除旧 ACK 等待依赖：
 
-| 参数 | 首版值 | 原因/约束 |
-|---|---|---|
-| blocks / block_bytes | 600 / 1024 | 固定有效数据量 |
-| src_stride / dst_stride | 4096 / 4096 | 明确模拟分散块 |
-| links | B1=1；B2=2（计划） | 一张 NIC 一个 service/channel/QP |
-| sgl_items | 8、16、30 | 实际 QP 能力不足则 SKIP，不能静默降级 |
-| plain chunk_items | B1 不适用 | 仅未来 plain-staged 与 SGL 使用 |
-| rounds_in_flight | 固定 1 | B1 用 source/dst+ACK 栅栏，无 slot 协议 |
-| scatter | B1 无；未来 staged 为 pipeline / after-all | staged 主表另行定义 |
-| application threads | B1/B2 每端各 1 | staged 接收应用线程执行 scatter，与 CQ worker 独立 |
-| worker threads | 每 rail 1 | busy poll |
-| SQ requested depth | 1024 | B1 单 rail 最多 600+1 个数据方向 WR/轮，保留余量 |
-| RQ requested depth | 256 | 控制消息与通知接收 |
-| preposted receive | 128 | 单 rail SGL=8 最多 75 次通知/轮，另留控制余量 |
-| CQ requested depth | 2048 | 容纳当前全 signaled 数据完成与接收完成；记录实际配置 |
-| polling batch | 16 | 初始统一值；需要时单独扫 4/16/32 |
-| service ctx store capacity | 保持库默认 2097152 | 各组一致；timer 对象回收可能滞后于 IO 完成，不按单轮 WR 数贸然缩小 |
-| maxSendRecvDataSize | 1024 | 容纳小控制消息及库头部需求；不限制 RDMA WRITE 数据长度 |
-| split / RNDV | 禁用 | 小通知必须走普通 Send |
-| verify rounds | 20 | 带代际的完整数据校验，独立于性能统计 |
-| warmup rounds | 1000 | 清除建链/触页等一次性影响 |
-| measure rounds | 10000 | 各 case 相同；运行过短时包装脚本增加轮数 |
-| independent repeats | 5 | 每次新进程，报告中位数与波动 |
-| application progress timeout | 当前默认 10 秒 | 数据面每 256 次 spin 读时钟；控制/失败路径仍有界 |
-| hcom operation timeout | 当前与 timeout_sec 相同，默认 10 秒 | 对齐实际 SetChannelTimeOut；阶段 1.5 不改变此值 |
-| data wait | 忙轮询 + CPU relax | 阶段 1.5 已实现每 256 次查 deadline；目标机验证 pending |
-| generation | uint64，初始 1 | 不随 warmup/measure 重置 |
+- A：local 数据/请求完成等待、remote 请求/回收等待用绑核忙轮询；每 256 次检查 deadline，每次检查 fatal/acquire 状态。ARM yield hint/x86 pause 不等于 OS 调度 yield。setup/退出有界控制等待。
+- B：app 独占的 attempted/submitted 为普通累计值；跨线程 completed、pending、ready、active callback 保留原子变量。按实际新所有权隔离缓存行，不能把 CQ 写的计数改成 app 私有。保留 ActiveCallbackGuard 和正确的生命周期。
 
-SQ/RQ/CQ 表内是请求配置，实际创建值可能由 hcom 调整、受设备限制。不得仅凭设置值声称拥有对应硬件资源。记录设备 `max_sge`、实际 QP `max_send_sge`、队列大小和 active MTU；如果库暂未暴露实际 QP capability，可利用查询/诊断路径核实，不能把创建前日志当创建后结果。
+callback 仍按当前 UBSHcomNewCallback 所有权使用；profile 证明主要成本后才另做最小复用实验，不能把会被库 delete 的栈对象传入。reserve 和容量准备在 wall 外，请求编码/解析/WR 填充在调用内。original/A/AB 必须同为新协议，不能把换向/删 ACK 收益归到忙轮询优化。
 
-当前 group 合并上限直接使用 30，尚未按实际 QP 的能力拆分。因此 SGL=30 是有前置条件的用例；能力不足则输出 `SKIP: max_send_sge < 30`。若今后允许自动拆分，应另报真实 WR 数，不能再称“一次 30 SGE WR”。
+## 8. 指标、trace 与验证
 
-WR 数核验使用独立短运行：在 `PostOneSideSglGrouped` 提交前通过调试器或临时诊断计数观察 `groupCount=1`、`wr.num_sge`、目标地址和 QP；性能运行关闭这些诊断。仅从应用 PutV 次数推导的数值标为 expected，未经核验不能标为 measured。
-
-第一版全 signaled，保持当前实现。暂不引入 selective signaling，它会改变 callback、上下文回收与队列信用协议，超出最小穿刺范围。
-
-## 11. 正确性验证与性能口径
-
-### 正确性：先验证，再计时
-
-验证轮次将每个 64 位 word 填为由 `(generation, global_block_id, word_index)` 计算的确定值，保证完整 1 KiB 内容都参与校验。填充在验证阶段，不进入正式性能统计。
-
-当前 B1 receiver 初始化最终 dst 及 stride gap 哨兵；verify 轮收到 ROUND_READY 后检查全部 600 个块、块内所有 word 和应保持不变的间隙，正式 measure 不逐轮扫描。没有 stage 或 scatter。发现错误报告 generation、block、word、expected/actual 并失败退出。仅检查第一个字节不足以验证尾部、块偏移和跨轮覆盖。
-
-当前 B1 的额外小规模验证应确认 sender 不会在 ROUND_ACK 前开始下一轮，并确认所有本地 callback 和 ACK 计数匹配。未来 staged/SGL 路径再覆盖人为延迟 scatter、双链接及 8/16 尾块。失败注入仅用于验证运行，不在性能测量开启。
-
-正式性能轮次使用提前准备好的稳定内容，禁止每轮生成 600 KiB 数据或完整扫描校验。结束后完整检查最终目标和哨兵；这验证最终状态，不能宣称每一个测量轮次均做了完整内容验证。每轮通知 generation、完成数量和错误码仍严格检查。
-
-### 计时：全部使用本机单调时钟
-
-发送端每轮记录：
-
-- `submit_us`：首个数据 API 调用前，到唯一的 ROUND_READY 提交后。包含 hcom API、callback 创建和遇到的内部背压。
-- `e2e_us`：首个数据 API 调用前，到收齐 B1 的 ROUND_ACK，且本地数据/通知 callback 完成。它是 direct baseline 的主完成口径。
-- 可选诊断 `local_write_done_us`：所有数据 API callback 完成的时刻；不代表接收端已处理 ROUND_READY，不能用来替代 `e2e_us`。正式最小路径可不采集此项，避免增加 callback 时间戳开销。
-
-遗留问题（阶段 1.5 submit 长尾）：目标机 10000 轮结果中，`submit_avg/p50/p95/p99` 为 689.469/460.990/590.800/4617.720 us，`e2e_avg/p50/p95/p99` 为 699.652/469.210/599.190/4627.710 us。一次临时诊断显示逐轮 `post_submit_wait` 平均仅 10.183 us，且各完成事件的 p99 都紧随 submit p99；ACK 虽在 10000 轮中均为最终完成 gate，但现有证据表明毫秒级长尾已在 600 次 Put 加一次 ROUND_READY 的提交阶段形成，不能归因于最后的 `WaitData("round completion")` 或 ACK 双边往返。该问题暂缓，后续若恢复调查，应使用独立诊断模式定位 600 次提交内部的背压、callback/上下文分配回收、SQ/CQ 资源周期及线程抢占/频率/NUMA 影响，避免在正式 measure 的 callback 中保留额外时钟采样。
-
-direct B1 不记录 `scatter_cpu_us`，因为没有 memcpy/scatter。后续 staged 诊断可记录该指标及首个 chunk 就绪到最后一个 scatter 完成的本机区间。正式计时默认不在每个 1 KiB memcpy 周围读时钟。不用未同步的两台机器时间戳直接相减。
+主指标由 local CLOCK_MONOTONIC_RAW 计算：`sparse_copy_avg/p50/p95/p99_us`。measured wall 包含所有正式调用、循环间隙和样本写入，不含 warmup、最终完整校验、FINISH、排序/打印；不能在循环间隐藏 remote 空闲屏障。
 
 ```text
-e2e_avg：measure 轮次 e2e_us 的算术平均值
-e2e_p50/p95/p99：measure 轮次的 e2e_us 分位数
 effective_GBps = measure_rounds * 614400 / measured_wall_seconds / 1e9
-block_Mops    = measure_rounds * 600 / measured_wall_seconds / 1e6
-speedup       = reference_e2e_median / candidate_e2e_median
+block_Mops = measure_rounds * 600 / measured_wall_seconds / 1e6
+request_GBps = measure_rounds * request_bytes_per_call / measured_wall_seconds / 1e9
+latency_speedup = reference_sparse_copy_p50 / candidate_sparse_copy_p50
 ```
 
-`measured_wall_seconds` 覆盖整个正式循环，包括轮次之间的调度、统计数组写入和 ACK 等待。分位数排序、JSON 输出都在计时结束后，不逐轮打印日志。阶段 1.5 已将两个统计数组的 reserve 移到 wall 计时前，并在对比报告记录该边界修正；每轮 submit/e2e 的起止定义保持不变。
+copy 有效带宽只用 614400 作分子，请求字节按case实际值单列。结果必须标 `protocol=sparse-copy-v3`、`measurement=local-sparse-copy`、`result_role=local`、source format及实际source/destination计数，旧sender submit/e2e不进新主表。
 
-主带宽是 **单轮在途、包含 ROUND_READY/ACK 的 direct 应用有效带宽**，不能标成 NIC 峰值。它不包含 CPU scatter。若 ACK 栅栏使端口明显空闲，再增加跨轮窗口实验；该扩展需要多套 source/dst、slot 与 credit，本次先不实现。
+详细 trace 独立短跑，按 generation/rail/chunk 对齐，**不同机器时间戳不相减**：
 
-报告每个 case 的有效字节、API 次数、预计及核验的数据 WR 数、通知数、ACK 数、CPU 利用率、版本、网卡/MTU/NUMA/绑核信息。硬件端口字节作为辅助，包含协议开销，不能直接替代有效数据带宽。不要期待双链接必然 2 倍；CPU 提交、scatter、PCIe、NUMA 和端口共享资源都可能先饱和。
+| 主机 | 事件及可解释区间 |
+|---|---|
+| local | call_enter、encode_end、request_post_return、request_send_callback、每 rail/chunk ready、scatter_begin/end、call_return |
+| local 派生 | 请求校验/编码/提交；调用到首/末 ready；ready 到 scatter 调度；scatter 累计 memcpy CPU 时间；最后数据可用到返回 |
+| remote | request_receive、pending_copy_done、parse_begin/end、previous_callbacks_drained、first_put、last_put、各 rail done_post、local_callbacks_done |
+| remote 派生 | 接收交接、上代资源等待、解析/构造、提交及本地回收 |
 
-## 12. 阶段 4：最小改造 WRITE_WITH_IMM
+remote 时长用于定位，不能与 local 等待/scatter 区间直接相加，网络/提交/scatter 可重叠。正式主跑不在每个 Put/callback/memcpy 周围读时钟，不保留详细日志或 profile。
 
-阶段 4 仅面向阶段 3 的 staged/SGL 路径：保留 staging 数据布局、轮次 ACK、CPU scatter 逻辑与计时口径，只把独立的 chunk 就绪通知替换为 `WRITE_WITH_IMM`。阶段 1/1.5/2 的 direct B1/B2 不包含 staging、chunk 或 scatter，也不因阶段 4 扩展而改变。先针对 SGL 用例增加能力，不在本次目标中顺带扩展 GetV、UB、UMQ 等后端。
+验证要求：
 
-### 12.1 最小 API 语义
+1. direct 9664 字节及各 SGL source format 的完整编解码和真实 Send；截断、版本不符、计数/格式错、越界/溢出、重复目标、错误 rail/chunk/generation 都拒绝。grouped-source 必须验证每个组能唯一展开声明的块数，不能遗漏或重复源块。
+2. 多轮非顺序源/目标排列，并改变下一轮映射；verify 用 `(generation, source_slot, word_index)` 填源，local 按本次条目检查所有 64-bit word 和 dst gap。源重复按 source_slot 定义内容，不能按请求索引覆盖源。
+3. 人为延迟 local 消费/scatter，remote 不得自主下一轮；延迟 remote 本地 callback 回收，pending 不覆盖 active，下一轮等待计入调用。
+4. 双 rail 单条延迟必须等齐；SGL 覆盖尾块、重复/错代通知、pipeline/off 一致性。不同 rail/chunk 的合法交错不能误判为错误。
+5. measure 源内容稳定，每轮不生成 600 KiB；verify 每轮填完整源池，结束后直接冻结最后一个 verify generation 的源模式作为 warmup/measure 的稳定内容，local 用该固定 seed 校验；verify=0 的独立诊断用 setup seed。数据模式 seed 与通知 generation 分开，避免切换阶段时重填源数据污染首轮计时。可以用固定非顺序输入列表，但必须完整发送解析。每轮检查协议状态，最后全量验证 dst；不能宣称逐轮全量数据检查。
+6. 错误/post失败时可用channel发送COPY_ERROR使local立即结束等待；channel不可用则断链唤醒。错误、断链、超时或未drain都非零退出，无有效性能结果。无硬件则pending，self-test不代替DMA/CQ/RQ验证。
 
-拟新增 C++ 接口，名称为设计占位，当前不存在：
+## 9. 阶段 4：WRITE_WITH_IMM
+
+当前 ubs-comm 有 worker-poll Put/PutV、Send 和接收 handler，没有完整公开的 PutVWithImm；已有 SEND_WITH_IMM 是另一操作。阶段 1 无需改库，阶段 4 才新增最小接口：
 
 ```cpp
-int32_t PutVWithImm(const UBSHcomOneSideSglRequest &req,
-                   uint32_t token_host_order,
-                   const Callback *local_done);
-
-RegisterWriteImmHandler(handler(channel, token_host_order, byte_len));
+Status PutVWithImm(const SglRequest& req, uint32_t token, Callback* local_done);
+OnWriteImm(channel, token, byte_len);              // 独立于普通消息接收
 ```
 
-新 API 要求非空本地 callback、RDMA worker-poll 路径。首版明确限制：`iovCount <= actual max_send_sge`、所有目标连续、相同 rkey，一次调用对应一个数据 WR、一个接收通知。不满足条件返回参数/不支持错误；先不实现一个调用对应多组通知的泛化语义。
-
-不往现有公共请求结构里直接塞字段，不借用已有 `upCtxData` 的 service seqNo 传远端 token。token 必须作为独立参数逐层传递。增加虚函数同样涉及 C++ ABI，两个端点、库和用例全部用新版本重编；第一阶段二进制保留以便对照。用例只使用 C++，这一阶段不必同时增加 C 包装。
-
-### 12.2 sender 的底层变化
-
-调用链：service API → channel → RDMA endpoint → worker 请求 → QP 的 grouped post。
-
-在已经构造好的唯一 WR 上：
+限定 RDMA、worker-poll、非空本地 callback、同 rkey/连续目标、单 chunk/单 WR、K 不超过实际能力。token 显式经 service/channel→endpoint→worker→QP 传递，不借用本地上下文 upCtxData。
 
 ```cpp
 wr.opcode = IBV_WR_RDMA_WRITE_WITH_IMM;
-wr.imm_data = htonl(token_host_order);
-wr.sg_list = data_sges;
-wr.num_sge = chunk.count;           // 8/16/30 或尾块实际数量
-wr.wr.rdma.remote_addr = remote_chunk_begin;
-wr.wr.rdma.rkey = remote_key;
-wr.send_flags = IBV_SEND_SIGNALED;
+wr.sg_list = chunk_data_sges;
+wr.num_sge = chunk.count;                         // 30 项仍为 30，无第 31 个 SGE
+wr.imm_data = htonl(token);
+wr.wr.rdma.remote_addr = chunk.stage_address;
+wr.wr.rdma.rkey = stage_rkey;
+// 保留 signaled、本地 callback 与上下文回收
 ```
 
-32 位 immediate 是操作携带的元数据，不是第 31 个 SGE，不写入 staging，也不占 staging 的一个数据槽。发送端完成仍按本地 RDMA write 完成路径回收上下文；它不表示 scatter 已完成。
+接收 CQ 成功后按 IBV_WC_RECV_RDMA_WITH_IMM 和 IBV_WC_WITH_IMM 分流，ntohl 取 token，验证 `byte_len == chunk.count*1024`，发布与 CHUNK_DONE 相同 ready。WRITE 数据在 stage，不能解析普通 receive buffer 的消息头。每次消耗一个接收 WQE，必须正确回收 context、持续补投；RQ 还接收 COPY_REQ/HELLO/FINISH 等 Send，保持有缓冲 WQE，不盲目改成零 SGE。
 
-若以后放宽成多 WR 的 PutV，可定义只有最后一个 WR 带 immediate，利用同一 QP 顺序通知整个调用；那时接收 CQ 的 `byte_len` 仅属于带 immediate 的那个 WRITE，不能当整个 PutV 的总长度。本次严格单 WR 约束避免这项歧义。
+token=`(generation << 8) | chunk_id`：非零 24 位 generation、8 位 chunk，rail 由 channel 得出。开始前检查所有 verify/warmup/measure 代数 `< 2^24`，禁止回绕；普通消息保留完整 64 位 generation。local 按当前布局恢复 first_item/count，拒绝越界和重复。
 
-### 12.3 receiver 必须新增的处理
+IMM 只替换 remote→local 的 CHUNK_DONE；同一 SGL case 的 Send/IMM 必须使用相同 source format、COPY_REQ 字节数、计时和 ACK=0 规则。SC-S2-30 从 `1 COPY_REQ + 20 WRITE + 20 Send` 变为 `1 COPY_REQ + 20 WRITE_WITH_IMM`；local 仍有 20 个 chunk CQE/接收信用消耗、600 次 memcpy。首版不要求 direct 最后一笔 Put 改 IMM。
 
-当前 [rdma_worker_core.cpp](C:/code/RDMA_DEMO/ubs-comm/src/hcom/transport/rdma/verbs/rdma_worker_core.cpp:255) 按接收 context 类型分发，随后 [net_rdma_driver_oob.cpp](C:/code/RDMA_DEMO/ubs-comm/src/hcom/transport/rdma/verbs/net_rdma_driver_oob.cpp:1645) 根据 immediate 是否为零进入普通/RAW 消息解析。WRITE_WITH_IMM 的数据在 staging，不在接收 WQE 的消息缓冲，不能复用该消息解析。
+使用同一改造库/二进制成对跑 send/imm，回归 direct 和旧 Send/PutV。公共虚接口变更影响 ABI，两端全部重编。不要顺带泛化 C API、GetV、非 RDMA backend、多组拆分，或混入 callback 池/单组快路径来归因 IMM 收益。
 
-因此需在成功 CQE 上首先识别 opcode：
+## 10. 结果契约与实施顺序
 
-```cpp
-if (wc.status != IBV_WC_SUCCESS) {
-    ExistingErrorAndContextCleanup(wc);
-} else if (wc.opcode == IBV_WC_RECV_RDMA_WITH_IMM) {
-    Check(wc.wc_flags & IBV_WC_WITH_IMM);
-    Event ev = {ChannelOfReceiveContext(wc.wr_id),
-                ntohl(wc.imm_data), wc.byte_len};
-    RePostReceiveOrFail();          // 使用原接收 context/缓冲，先复制 event
-    PublishWriteImmEvent(ev);       // 不读取 receive buffer 中的消息头
-} else {
-    ExistingCompletionDispatch(wc);
-}
-```
-
-真实实现必须同步处理已有 op context 移除/重新挂入、QP 引用与接收 WQE 计数，避免双重回收；以上伪代码只表示分流次序。callback 只发布 ready generation，不直接 scatter。
-
-需要接收 WQE 信用：每个 WRITE_WITH_IMM 消耗一个接收 WQE，缺少时会触发 RNR/重试甚至超时。沿用当前 hcom 预投的有缓冲 receive WQE，因为同一 RQ 还承载 HELLO、ACK、FINISH 等普通 Send。该缓冲承载普通 Send；WRITE_WITH_IMM 数据落点仍由 remote_addr/rkey 指定。不在混合消息的 RQ 上盲目改成零 SGE 接收。
-
-当前旧 SEND 协议对 immediate 有自己的解释。新分支单独做 `ntohl`，不要全局改变旧 RAW 消息 immediate 的编码，否则会破坏旧消息路径。
-
-### 12.4 最小 token，不引入 slot
-
-只有一轮在途、最多 75 chunk，因此 token 可用：
-
-```text
-31                 8 7                 0
-+-------------------+-------------------+
-| generation:24 bit | chunk_id:8 bit    |
-+-------------------+-------------------+
-
-token = (generation << 8) | chunk_id
-```
-
-rail 由接收 channel 得到，无需重复占 token 位；协议类型由 CQ opcode 得到；chunk 有效块数由配置推导。没有跨轮 slot，因此不为 slot 预留字段。
-
-generation 从 1 开始。单进程包含验证/预热/测量的总轮数必须小于 `2^24`，达到上限则在运行前拒绝参数，首版不处理回绕。若以后跑长时多窗口测试，再扩展代际协议。
-
-接收端检查 chunk 范围、generation 递增以及 `byte_len == chunk.count*1024`，然后复用阶段 3 的 `ready_generation`。每轮每条 rail 的 scatter ACK 保持不变。
-
-### 12.5 对比与最小修改范围
-
-在同一份改造后的库中同时保留 `notify=send` 和 `notify=imm`，同样的 SGL/链接/队列/线程/计时配置对比，再与原始库的 send 结果核对回归。
-
-S2-30 的数据方向从 20 个 WRITE + 20 个 Send 变为 20 个 WRITE_WITH_IMM；接收侧仍然有 20 次就绪 CQE，仍做 600 次 memcpy，仍发 2 个 ACK。预期减少通知 WR、Send API/callback 和消息处理开销，不能声称消除了接收 CQ 或 scatter 开销。
-
-最小修改区域：公共 C++ 声明与 handler 类型、service/channel 实现、内部单边 SGL 请求元数据、RDMA endpoint/worker/QP 传递、接收 CQ opcode 分流与事件上送。旧 PutV 和 Send 保持原行为；不支持的 transport 明确返回 unsupported。测试至少覆盖单/双 rail、8/16/30/尾块、普通 Send 与 immediate 共存、接收补投和错误清理。
-
-## 13. 当前分支风险对用例的影响
-
-1. **硬件实际 max_send_sge。** 当前设备限制与 group=30 常量可能不一致。用例先核实能力并跳过不支持的 case；后续库改造应在 post 前校验实际 QP cap。
-2. **部分提交失败。** 当前 grouped post 对 `bad_wr` 的处理不完整，失败时上层会归还整批上下文。本设计每次 PutV 恰好一组/一个 WR，避免多组 WR 的成功前缀场景，但不代表通用问题已修复。若后续扩大输入范围，必须修复此路径。
-3. **callback 与超时。** 当前错误路径存在库内部删除 callback 的行为；不得依照示例简单套用“失败后一律应用 delete”。测试首版直接失败退出，不做重试恢复。库内部资源紧张可能出现等待/重试，计时应包含它，并将相关错误视为无效结果。
-4. **QP 和设备映射。** `/32` 过滤、唯一 service 设备、`linkCount=1` 和关闭 multirail 是必要约束；启动时核实实际设备，双链接用端口计数验证两条路径都有流量。
-5. **调试日志。** 当前分支数据路径有多处日志调用。性能构建关闭 debug/trace 输出，但保留错误输出；记录构建配置，不能一个 case 开日志另一个关日志。
-6. **stack/context 成本。** 当前 grouped QP 路径为最多 30×30 SGE 的数组清零，即使本例只有一组；先测当前真实成本。若 profile 显示明显，再做单组快路径，作为独立优化对比，不与 WRITE_WITH_IMM 的收益混在一次变更中。
-
-这些是测试解释与最小输入约束，不要求在实现首版用例前先重构整个 ubs-comm。
-
-## 14. 运行接口、结果格式与实施顺序
-
-当前源码已实现 direct B1 接口，尚未完成目标机构建/运行；实际命令以 README 为准。下面是阶段 3 SGL 双链接的计划接口，不是阶段 2 direct B2 命令；当前阶段 1 程序会明确拒绝这些参数：
-
-```bash
-# receiver：两张网卡的本机 RDMA IP 分别绑定两个 service
-./rdma_600 --role receiver --links 2 \
-  --rdma-ips <receiver_nic0_ip>,<receiver_nic1_ip> \
-  --listen <receiver_oob_ip>:19000,<receiver_oob_ip>:19001 \
-  --mode sgl --sgl 30 --scatter pipeline --notify send \
-  --app-cpu <scatter_cpu> --worker-cpus <cq0_cpu>,<cq1_cpu>
-
-./rdma_600 --role sender --links 2 \
-  --rdma-ips <sender_nic0_ip>,<sender_nic1_ip> \
-  --peer <receiver_oob_ip>:19000,<receiver_oob_ip>:19001 \
-  --mode sgl --sgl 30 --scatter pipeline --notify send \
-  --app-cpu <submit_cpu> --worker-cpus <cq0_cpu>,<cq1_cpu> \
-  --verify-rounds 20 --warmup 1000 --rounds 10000
-```
-
-当前 B1 使用 `--mode plain`，不接受 `--chunk-items`、`--scatter` 或 `--notify`；单链接只提供一组 IP、端口和 worker CPU。两端交换并校验最终解析出的参数，避免脚本漏传导致不同配置运行。
-
-当前 B1 sender 每个 case 输出一行 JSON，字段如下（SGL 计划用例会另行扩展）：
+新结果最小示例，null 仅表示待测占位：
 
 ```json
 {
-  "case": "B1", "status": "ok", "commit": "<git-commit>",
-  "links": 1, "blocks": 600, "block_bytes": 1024,
-  "mode": "plain", "remote_layout": "direct-stride-4096", "tls_enabled": false,
-  "rounds_in_flight": 1, "data_wr_per_round": 600,
-  "round_ready_wr_per_round": 1, "ack_wr_per_round": 1, "measure_rounds": 10000,
-  "e2e_avg_us": null, "e2e_p50_us": null, "e2e_p95_us": null, "e2e_p99_us": null,
-  "submit_p50_us": null, "effective_GBps": null,
-  "verify_passed": true
+  "schema_version": 3,
+  "protocol": "sparse-copy-v3", "measurement": "local-sparse-copy", "result_role": "local",
+  "case": "SC-B1", "status": "ok", "mode": "direct", "links": 1,
+  "blocks": 600, "block_bytes": 1024, "rounds_in_flight": 1,
+  "source_format": "direct-pairs", "source_address_count": 600, "destination_address_count": 600,
+  "request_descriptor_bytes": 9600, "request_bytes": 9664,
+  "request_send_wr_per_call": 1, "data_wr_per_call_expected": 600,
+  "completion_send_wr_per_call_expected": 1, "imm_events_per_call_expected": 0,
+  "ack_wr_per_call": 0, "payload_bytes_per_call": 614400,
+  "measure_rounds": 10000, "verify_passed": true,
+  "sparse_copy_avg_us": null, "sparse_copy_p50_us": null,
+  "sparse_copy_p95_us": null, "sparse_copy_p99_us": null,
+  "effective_GBps": null, "block_Mops": null, "request_GBps": null,
+  "measured_wall_seconds": null
 }
 ```
 
-示例中的 null 是尚未实测的占位，不是结果。设备、NUMA、队列、MTU、编译和 CPU 元信息可输出一次独立 JSON，避免每行重复大量内容。
+成功 measure 输出有限正值；verify 的性能值为 null。不支持明确 SKIP，不用零冒充测量。manifest 保存两端源码/diff、二进制/静态库 hash、协议/配置、线程/队列/MTU/NUMA、布局/请求格式；WR expected 与诊断 measured 分开。
 
-实施顺序：
-
-1. 阶段 1：direct B1 与每主机本地角色脚本已实现；先完成目标机验证和原版跑测证据。
-2. 阶段 1.5：优化数据面等待与原子记账，分别对比原版、优化 A、A+B；协议保持 direct B1。
-3. 阶段 2：在阶段 1 的 direct 结构上增加双 rail，B1/B2 使用相同的阶段 1.5 优化，测量双链接收益并新增独立 trace。此阶段没有 SGL/staging/scatter。
-4. 阶段 3：增加 SGL 8/16/30＋连续 staging＋流水 scatter，与同链接数 direct 比较整体策略；保留 scatter-off，纯合并收益归因需要时再增加 plain-staged。
-5. 阶段 4：最小 PutVWithImm 改造，同库对比 SGL Send/IMM 并回归 direct。Python 继续在两台主机分别启动角色，每个 repeat 重启两端并保存各自结果，不自动跨主机编排。
-
-验收不预设加速倍数：要求所有支持的 case 数据正确、无超时/队列错误、WR/通知数符合设计、两条 NIC 确实参与、统计口径一致，能明确说明 direct B1 的时间消耗在提交、传输和 ACK 栅栏；staged 路径再单列 scatter。
-
-参考语义资料：[rdma-core ibv_post_send](https://github.com/linux-rdma/rdma-core/blob/master/libibverbs/man/ibv_post_send.3)、[rdma-core verbs 类型与完成定义](https://github.com/linux-rdma/rdma-core/blob/master/libibverbs/verbs.h)、[NVIDIA RDMA 编程手册](https://docs.nvidia.com/rdma-aware-networks-programming-user-manual-1-7.pdf)。设备相关能力以实际鲲鹏机器的网卡、驱动/provider 和 QP 查询结果为准。
+顺序：阶段 1 重构 SC-B1（固定 600 对）→ 阶段 1.5 优化迁移复核和同协议对照 → 同步新协议基线到其它分支 → 阶段 2 SC-B2/trace → 阶段 3 固定 grouped-source 语义后实现 SGL 流水 → 阶段 4 IMM。duo_card 不能只改结果字段就冒充新口径。旧性能及其协议标签保留，新口径重新建基线。

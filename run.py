@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Run and archive one local role of the stage-1 B1 RDMA experiment.
+"""Run and archive one local role of the stage-1 SC-B1 sparse_copy experiment.
 
 The data plane is always the C++ binary.  This wrapper deliberately uses only
 the Python standard library for local process orchestration, log collection,
 result validation, and report generation.  It never builds, installs, or
-copies software. Run it separately with --role receiver and --role sender on
+copies software. Run it separately with --role remote and --role local on
 the corresponding Linux RDMA hosts.
 """
 
@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import os
 import pathlib
 import signal
@@ -33,10 +34,10 @@ class RunFailure(RuntimeError):
 class Case:
     name: str
     links: int = 1
-    mode: str = "plain"
+    mode: str = "direct"
 
 
-B1 = Case("B1")
+SC_B1 = Case("SC-B1")
 
 
 def utc_now() -> str:
@@ -101,7 +102,7 @@ def require_library_dirs(data: Dict[str, Any], owner: str) -> List[str]:
     ]
 
 
-def validate_host(name: str, host: Any, receiver: bool) -> Dict[str, Any]:
+def validate_host(name: str, host: Any, listener: bool) -> Dict[str, Any]:
     if not isinstance(host, dict):
         raise RunFailure(f"{name} must be an object")
     checked = dict(host)
@@ -118,7 +119,7 @@ def validate_host(name: str, host: Any, receiver: bool) -> Dict[str, Any]:
         raise RunFailure(f"{name}.worker_cpus must contain integer CPU IDs") from error
     if any(cpu < 0 for cpu in checked["worker_cpus"]):
         raise RunFailure(f"{name}.worker_cpus must contain non-negative CPU IDs")
-    if receiver:
+    if listener:
         checked["oob_ip"] = require_string(checked, "oob_ip", name)
         ports = checked.get("oob_ports")
         if not isinstance(ports, list) or not ports or not all(isinstance(port, int) and 1 <= port <= 65535 for port in ports):
@@ -128,13 +129,13 @@ def validate_host(name: str, host: Any, receiver: bool) -> Dict[str, Any]:
 
 
 def validate_config(raw: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, int]]:
-    sender = validate_host("sender", raw.get("sender"), receiver=False)
-    receiver = validate_host("receiver", raw.get("receiver"), receiver=True)
-    if len(sender["rdma_ips"]) < 1 or len(receiver["rdma_ips"]) < 1:
+    local = validate_host("local", raw.get("local"), listener=False)
+    remote = validate_host("remote", raw.get("remote"), listener=True)
+    if len(local["rdma_ips"]) < 1 or len(remote["rdma_ips"]) < 1:
         raise RunFailure("stage 1 requires one RDMA IP on each host")
-    if len(sender["worker_cpus"]) < 1 or len(receiver["worker_cpus"]) < 1:
+    if len(local["worker_cpus"]) < 1 or len(remote["worker_cpus"]) < 1:
         raise RunFailure("stage 1 requires one worker CPU on each host")
-    if sender["app_cpu"] == sender["worker_cpus"][0] or receiver["app_cpu"] == receiver["worker_cpus"][0]:
+    if local["app_cpu"] == local["worker_cpus"][0] or remote["app_cpu"] == remote["worker_cpus"][0]:
         raise RunFailure("stage 1 requires distinct app_cpu and worker_cpus[0] on each host")
 
     raw_stage = raw.get("stage1", {})
@@ -158,7 +159,7 @@ def validate_config(raw: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, int]
         raise RunFailure("stage1.timeout_sec must be in [1, 32767]")
     if stage["process_timeout_sec"] < stage["timeout_sec"]:
         raise RunFailure("stage1.process_timeout_sec must be at least stage1.timeout_sec")
-    return {"sender": sender, "receiver": receiver}, stage
+    return {"local": local, "remote": remote}, stage
 
 
 def library_search_path(host: Dict[str, Any]) -> str:
@@ -174,15 +175,15 @@ def local_environment(host: Dict[str, Any]) -> Dict[str, str]:
 
 
 def stage1_argv(role: str, config: Dict[str, Any], stage: Dict[str, int], kind: str) -> List[str]:
-    sender = config["sender"]
-    receiver = config["receiver"]
-    if role == "receiver":
-        host = receiver
-        endpoint = f"{receiver['oob_ip']}:{receiver['oob_ports'][0]}"
+    local = config["local"]
+    remote = config["remote"]
+    if role == "remote":
+        host = remote
+        endpoint = f"{remote['oob_ip']}:{remote['oob_ports'][0]}"
         role_args = ["--listen", endpoint]
-    elif role == "sender":
-        host = sender
-        endpoint = f"{receiver['oob_ip']}:{receiver['oob_ports'][0]}"
+    elif role == "local":
+        host = local
+        endpoint = f"{remote['oob_ip']}:{remote['oob_ports'][0]}"
         role_args = ["--peer", endpoint]
     else:
         raise AssertionError(role)
@@ -213,7 +214,7 @@ def stage1_argv(role: str, config: Dict[str, Any], stage: Dict[str, int], kind: 
         "--links",
         "1",
         "--mode",
-        "plain",
+        "direct",
     ]
 
 
@@ -353,25 +354,31 @@ def local_identity(host: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def parse_sender_result(path: pathlib.Path, case: Case) -> Dict[str, Any]:
+def parse_role_record(path: pathlib.Path, case: Case, role: str) -> Dict[str, Any]:
     records: List[Dict[str, Any]] = []
     for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
         try:
             value = json.loads(line)
         except json.JSONDecodeError:
             continue
-        if isinstance(value, dict) and value.get("case") == case.name:
+        if isinstance(value, dict) and value.get("case") == case.name and value.get("role") == role:
             records.append(value)
     if len(records) != 1:
-        raise RunFailure(f"expected exactly one {case.name} JSON result in {path}, found {len(records)}")
+        raise RunFailure(
+            f"expected exactly one {case.name} role={role} JSON record in {path}, found {len(records)}"
+        )
     return records[0]
 
 
 def validate_result(result: Dict[str, Any], case: Case, kind: str, stage: Dict[str, int]) -> None:
     expected = {
+        "schema_version": 3,
+        "protocol": "sparse-copy-v3",
+        "measurement": "local-sparse-copy",
+        "result_role": "local",
         "case": case.name,
         "status": "ok",
-        "role": "sender",
+        "role": "local",
         "kind": kind,
         "optimization": "stage1.5-AB",
         "data_wait": "busy-poll-relax",
@@ -380,14 +387,21 @@ def validate_result(result: Dict[str, Any], case: Case, kind: str, stage: Dict[s
         "links": case.links,
         "blocks": 600,
         "block_bytes": 1024,
-        "payload_bytes": 614400,
         "mode": case.mode,
         "remote_layout": "direct-stride-4096",
         "tls_enabled": False,
         "rounds_in_flight": 1,
-        "data_wr_per_round": 600,
-        "round_ready_wr_per_round": 1,
-        "ack_wr_per_round": 1,
+        "source_format": "direct-pairs",
+        "source_address_count": 600,
+        "destination_address_count": 600,
+        "request_descriptor_bytes": 9600,
+        "request_bytes": 9664,
+        "request_send_wr_per_call": 1,
+        "data_wr_per_call_expected": 600,
+        "completion_send_wr_per_call_expected": 1,
+        "imm_events_per_call_expected": 0,
+        "ack_wr_per_call": 0,
+        "payload_bytes_per_call": 614400,
         "verify_passed": True,
     }
     for key, value in expected.items():
@@ -397,9 +411,8 @@ def validate_result(result: Dict[str, Any], case: Case, kind: str, stage: Dict[s
     if not isinstance(counter_alignment, int) or isinstance(counter_alignment, bool) or counter_alignment <= 0:
         raise RunFailure("result field 'counter_alignment_bytes' must be a positive integer")
     metrics = [
-        "submit_avg_us", "submit_p50_us", "submit_p95_us", "submit_p99_us",
-        "e2e_avg_us", "e2e_p50_us", "e2e_p95_us", "e2e_p99_us",
-        "effective_GBps", "block_Mops",
+        "sparse_copy_avg_us", "sparse_copy_p50_us", "sparse_copy_p95_us", "sparse_copy_p99_us",
+        "effective_GBps", "block_Mops", "request_GBps", "measured_wall_seconds",
     ]
     if kind == "verify":
         if result.get("measure_rounds") != 0 or any(result.get(metric) is not None for metric in metrics):
@@ -409,43 +422,65 @@ def validate_result(result: Dict[str, Any], case: Case, kind: str, stage: Dict[s
         raise RunFailure("measure result has an unexpected round count")
     for metric in metrics:
         value = result.get(metric)
-        if not isinstance(value, (int, float)) or isinstance(value, bool) or value < 0:
-            raise RunFailure(f"measure result {metric} must be a non-negative number")
+        if (
+            not isinstance(value, (int, float))
+            or isinstance(value, bool)
+            or not math.isfinite(float(value))
+            or value <= 0
+        ):
+            raise RunFailure(f"measure result {metric} must be a positive number")
 
 
-def write_sender_report(output: pathlib.Path, kind: str, outcome: Dict[str, Any]) -> None:
-    lines = ["# Stage 1.5 sender report", "", f"- Generated: {utc_now()}", f"- Requested kind: `{kind}`", ""]
+def validate_remote_status(result: Dict[str, Any], case: Case, kind: str, stage: Dict[str, int]) -> None:
+    expected_calls = stage["verify_rounds"]
+    if kind == "measure":
+        expected_calls += stage["warmup_rounds"] + stage["measure_rounds"]
+    expected = {
+        "schema_version": 3,
+        "protocol": "sparse-copy-v3",
+        "case": case.name,
+        "role": "remote",
+        "status": "ok",
+        "processed_calls": expected_calls,
+    }
+    for key, value in expected.items():
+        if result.get(key) != value:
+            raise RunFailure(f"remote status field {key!r} is {result.get(key)!r}, expected {value!r}")
+
+
+def write_local_report(output: pathlib.Path, kind: str, outcome: Dict[str, Any]) -> None:
+    lines = ["# Stage 1 sparse_copy local report", "", f"- Generated: {utc_now()}", f"- Requested kind: `{kind}`", ""]
     result = outcome.get("result")
     if outcome.get("status") == "ok" and isinstance(result, dict):
         lines += [
             f"- Optimization: `{result['optimization']}`",
             f"- Data wait: `{result['data_wait']}`; deadline checked every {result['deadline_check_interval']} spins",
             f"- Callback allocation: `{result['callback_allocation']}`",
+            "- Protocol: `sparse-copy-v3`; request: 600 source/destination pairs (9664 bytes); success ACK: 0",
             "",
         ]
     if outcome.get("status") == "ok" and isinstance(result, dict) and kind == "measure":
         lines += [
             "## Measurement",
             "",
-            "| Case | e2e avg (us) | e2e p50/p95/p99 (us) | submit avg (us) | submit p50/p95/p99 (us) | effective GB/s |",
-            "|---|---:|---:|---:|---:|---:|",
-            f"| B1 | {float(result['e2e_avg_us']):.3f} | "
-            f"{float(result['e2e_p50_us']):.3f}/{float(result['e2e_p95_us']):.3f}/{float(result['e2e_p99_us']):.3f} | "
-            f"{float(result['submit_avg_us']):.3f} | "
-            f"{float(result['submit_p50_us']):.3f}/{float(result['submit_p95_us']):.3f}/{float(result['submit_p99_us']):.3f} | "
-            f"{float(result['effective_GBps']):.3f} |",
+            "| Case | sparse_copy avg (us) | p50/p95/p99 (us) | effective GB/s | request GB/s |",
+            "|---|---:|---:|---:|---:|",
+            f"| SC-B1 | {float(result['sparse_copy_avg_us']):.3f} | "
+            f"{float(result['sparse_copy_p50_us']):.3f}/{float(result['sparse_copy_p95_us']):.3f}/"
+            f"{float(result['sparse_copy_p99_us']):.3f} | {float(result['effective_GBps']):.3f} | "
+            f"{float(result['request_GBps']):.6f} |",
             "",
-            "This is one validated sender result. It is application effective throughput with one round in flight, including the ROUND_READY/ACK control path; it is not a NIC peak claim.",
+            "This is one validated local synchronous sparse_copy result. It includes request encoding/transfer/parse, remote submission, data completion, and local handoff; it is not a NIC peak claim.",
             "",
         ]
     elif outcome.get("status") == "ok" and isinstance(result, dict) and kind == "verify":
-        lines += ["## Verification", "", "- B1 verification succeeded.", "- No formal bandwidth values are reported for `--kind verify`.", ""]
+        lines += ["## Verification", "", "- SC-B1 verification succeeded.", "- No formal bandwidth values are reported for `--kind verify`.", ""]
     else:
-        lines += ["## Failure", "", f"- {outcome.get('error', 'No validated sender result was produced.')}", ""]
+        lines += ["## Failure", "", f"- {outcome.get('error', 'No validated local result was produced.')}", ""]
     lines += [
         "## Evidence",
         "",
-        "This sender invocation has immutable command metadata, local identity output, stdout/stderr, and `result.jsonl` when a result was valid.",
+        "This local invocation has immutable command metadata, local identity output, stdout/stderr, and `result.jsonl` when a result was valid.",
         "",
     ]
     (output / "REPORT.md").write_text("\n".join(lines), encoding="utf-8")
@@ -462,7 +497,8 @@ def run_role(
 ) -> Dict[str, Any]:
     argv = stage1_argv(role, config, stage, kind)
     manifest: Dict[str, Any] = {
-        "schema_version": 2,
+        "schema_version": 3,
+        "protocol": "sparse-copy-v3",
         "created_at": utc_now(),
         "case": case.__dict__,
         "role": role,
@@ -483,13 +519,18 @@ def run_role(
         if exit_code != 0:
             raise RunFailure(f"{role} exited with {exit_code}")
         outcome: Dict[str, Any] = {"repeat": 1, "case": case.name, "role": role, "status": "ok", "path": str(output)}
-        if role == "sender":
-            result = parse_sender_result(output / "sender.stdout.log", case)
+        if role == "local":
+            result = parse_role_record(output / "local.stdout.log", case, role)
             validate_result(result, case, kind, stage)
             (output / "result.jsonl").write_text(
                 json.dumps(result, ensure_ascii=False, sort_keys=True) + "\n", encoding="utf-8"
             )
             outcome["result"] = result
+        else:
+            result = parse_role_record(output / "remote.stdout.log", case, role)
+            validate_remote_status(result, case, kind, stage)
+            json_dump(output / "status.json", result)
+            outcome["remote_status"] = result
         manifest["finished_at"] = utc_now()
         manifest["status"] = "ok"
         json_dump(output / "manifest.json", manifest)
@@ -506,9 +547,10 @@ def run_role(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--config", type=pathlib.Path, required=True, help="shared sender/receiver JSON configuration")
-    parser.add_argument("--role", choices=["sender", "receiver"], required=True, help="role to run on this host")
+    parser.add_argument("--config", type=pathlib.Path, required=True, help="shared local/remote JSON configuration")
+    parser.add_argument("--role", choices=["local", "remote"], required=True, help="role to run on this host")
     parser.add_argument("--suite", choices=["stage1"], required=True)
+    parser.add_argument("--case", choices=["SC-B1"], required=True)
     parser.add_argument("--kind", choices=["verify", "measure"], required=True)
     parser.add_argument("--output", type=pathlib.Path, required=True, help="new local result directory")
     return parser.parse_args()
@@ -523,9 +565,9 @@ def main() -> int:
     if args.output.exists() and any(args.output.iterdir()):
         raise RunFailure(f"--output already exists and is not empty: {args.output}")
     args.output.mkdir(parents=True, exist_ok=True)
-    outcome = run_role(config, stage, B1, args.role, args.kind, args.output, args.config)
-    if args.role == "sender":
-        write_sender_report(args.output, args.kind, outcome)
+    outcome = run_role(config, stage, SC_B1, args.role, args.kind, args.output, args.config)
+    if args.role == "local":
+        write_local_report(args.output, args.kind, outcome)
     print(json.dumps({"output": str(args.output), "role": args.role, "status": outcome["status"]}, ensure_ascii=False))
     return 0 if outcome["status"] == "ok" else 1
 

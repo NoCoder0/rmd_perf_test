@@ -1,226 +1,124 @@
-# RDMA 600 × 1 KiB — 阶段 1.5（direct B1）
+# RDMA 600 × 1 KiB — sparse_copy 阶段 1
 
-这是 ubs-comm RDMA 穿刺测试的最小独立实现。当前代码在阶段 1 单链接 `B1` 上实现了阶段 1.5 的 A+B 热路径优化；数据协议和 WR 数没有改变。设计、协议边界和后续阶段请见 [DESIGN_CN.md](DESIGN_CN.md)、[IMPLEMENTATION_PLAN_CN.md](IMPLEMENTATION_PLAN_CN.md) 与 [STAGE1_5_REPORT_CN.md](STAGE1_5_REPORT_CN.md)。
+当前工作区已将单卡 direct baseline 重构为 `sparse-copy-v3`。实现仍需在目标 Linux/AArch64 RDMA 主机完成真实构建、self-test、双端 verify 和 measure；本地检查不能替代硬件结论。
 
-本仓库没有附带或伪造任何硬件性能数字。实际 RDMA 正确性和性能验证需要两台目标 Linux 主机、可工作的 RDMA 路径及匹配版本的 ubs-comm 构建产物。`run.py` 只在启动它的当前主机上运行由 `--role` 指定的一个角色，不会通过 SSH 连接、部署或启动另一台机器。
+完整协议见 [DESIGN_CN.md](DESIGN_CN.md)，实施与验收见 [IMPLEMENTATION_PLAN_CN.md](IMPLEMENTATION_PLAN_CN.md)，当前状态见 [PROGRESS.md](PROGRESS.md)。[STAGE1_5_REPORT_CN.md](STAGE1_5_REPORT_CN.md) 只保留旧 sender/receiver + ROUND_ACK 协议的历史证据。
 
-## B1 的固定工作量
+## 阶段 1 行为
 
-- 一条 RDMA path：一个 service、一个 device、一个 `linkCount=1` 的 worker-poll channel/QP；内部 multirail 关闭。
-- 每轮总有效数据严格为 `600 × 1024 = 614400` 字节。
-- sender 的源块位于 `src + i * 4096`；第 `i` 个普通 `Put(1024)` 直接写入 receiver 的最终地址 `dst + i * 4096`。没有 `stage` 缓冲，也没有 CPU scatter。
-- 600 个异步 `Put(1024)` 全部提交后，sender 在同一 channel/QP 上异步追加一个 `Send(ROUND_READY)`；每轮为 600 个数据 WR、1 个完成通知 WR。
-- receiver 收到 `ROUND_READY` 后，verify 轮检查最终 `dst` 的全部块和 stride gap，再异步 `Send(ROUND_ACK)`。measure 轮不做逐轮 CPU 拷贝或校验，结束后才完整检查最终 `dst`；收到 ACK 且 sender 的本地 data/Send callbacks 均完成后才复用下一轮缓冲。
-- `generation` 从 1 递增，覆盖 verify、warmup 与 measure，不会在阶段切换时清零。
-- 程序会在 `Start()` 前显式调用 `SetTlsOptions` 并设置 `enableTls=false`；因此不会初始化 TLS context，也不需要证书、私钥或 PSK 回调。
+固定角色：
 
-此变更将 B1 协议版本提升为 2；receiver 和 sender 必须同时重新构建并使用同一版 `rdma_600`。TLS 已关闭，只应在受控、可信的测试网络上运行。
+- `local`：`sparse_copy` 调用者、最终 destination 拥有者和主计时端；主动连接 remote。
+- `remote`：source 拥有者和 RDMA WRITE 发起端；监听连接。
 
-阶段 1 明确拒绝双链接、SGL、旧的 `--chunk-items` / `--scatter` / `--notify` 参数和 `WRITE_WITH_IMM`；它们不属于这个 direct baseline。
+一次 SC-B1 调用：
 
-阶段 1.5 的当前实现保持现有协议，只优化数据面等待和记账：热路径不再逐次调用 OS yield，默认每 256 次 spin 检查 deadline；应用线程独占的 attempted 计数不再逐请求做原子 RMW；callback 完成发布和 `ActiveCallbackGuard` 保留。每请求 callback 仍由 `UBSHcomNewCallback` 分配，尚无 profile 证据支持安全复用。阶段 2 之后才扩展 direct 双链接；当前没有实现 SGL、scatter 或 IMM。
+1. local 从调用入口开始计时，校验并编码 600 个源/目标偏移对。
+2. local 发送一条 9664 字节 `COPY_REQ`：64 字节头加 `600×16` 字节正文。
+3. remote 将接收内容复制到独立 pending 槽，应用线程解析并按本次请求重建 600 个 `Put(1024)`。
+4. remote 在同一真实 QP 的 600 次 WRITE 后发送一个 `DATA_DONE`。
+5. local 等待 `DATA_DONE` 和自己的 COPY_REQ Send callback 后返回并停止计时。
 
-正式 `measure` 必须显式提供不同的 `--app-cpu` 和 `--worker-cpu`，并由运行者确认它们属于不同物理核心。结果 JSON 会标记 `optimization=stage1.5-AB`、等待策略、deadline 检查间隔、计数对齐值及 callback 分配策略，避免把优化版误当成原始基线。
+成功路径没有逐轮 ACK。下一次 COPY_REQ 表示 local 已消费上一代并授予下一代写入权限；remote 仍须等待自己的 Put/Send callbacks 后复用描述符和通知缓冲。失败路径使用 `COPY_ERROR`，发送路径失效时依靠断链唤醒。
+
+local 在 setup 中把 destination 基址、大小、区域 ID 和完整 `UBSHcomMemoryKey` 发送给 remote。remote source key 始终留在 remote 本地，local 只发送相对 source 区域的偏移。
+
+阶段 1 保持：单 service、单真实 QP、`linkCount=1`、关闭内建 multirail、每端一个应用线程和一个 busy-poll worker；没有 staging、scatter、SGL 或 IMM。Send/Recv 应用消息容量为 16384 字节。
 
 ## 构建
 
-以下命令应在目标 Linux 机器上执行。本项目的 CMake 只会链接已构建的
-ubs-comm / HCOM 产物；它不会自动下载依赖、构建 ubs-comm 或安装软件包。
-
-### 1. 构建 ubs-comm 的 HCOM RDMA 产物
-
-先确保目标机上的 RDMA 驱动、设备和 ubs-comm 所需依赖已经按该项目要求就绪，
-然后在 ubs-comm 根目录运行其自带构建脚本：
+在目标 Linux 主机上使用匹配的 ubs-comm 产物：
 
 ```bash
-UBS_ROOT=/absolute/path/to/ubs-comm
-cd "$UBS_ROOT"
-
-HCOM_BUILD_TYPE=release \
-HCOM_BUILD_SERVICE=on \
-HCOM_BUILD_RDMA=on \
-HCOM_BUILD_UB=off \
-HCOM_BUILD_SOCK=off \
-HCOM_BUILD_SHM=off \
-HCOM_BUILD_TESTS=off \
-HCOM_BUILD_EXAMPLE=off \
-BUILD_HCOM=ON \
-bash ./build.sh
+bash ./build.sh --ubs-root /absolute/path/to/ubs-comm
 ```
 
-该脚本会创建（并在每次构建前重新生成）`$UBS_ROOT/tmp_build_dir` 和
-`$UBS_ROOT/dist/hcom`。如需清理这些生成目录，可显式执行
-`bash ./build.sh clean`；不要在其中保留未备份的手工文件。
-
-构建成功后，至少确认本测试需要的 HCOM 和第三方产物存在：
+也可以分别指定公共头、静态库和 boundscheck 根目录，详见：
 
 ```bash
-test -f "$UBS_ROOT/dist/hcom/lib/libhcom_static.a"
-test -f "$UBS_ROOT/dist/hcom/include/hcom/hcom_service.h"
-test -f "$UBS_ROOT/dist/hcom/include/hcom/hcom_service_context.h"
-test -f "$UBS_ROOT/dist/hcom_3rdparty/libboundscheck/lib/libboundscheck.so" || \
-  test -f "$UBS_ROOT/dist/hcom_3rdparty/libboundscheck/lib/libboundscheck.a"
+bash ./build.sh --help
 ```
 
-### 2. 构建 rdma_600
+构建系统要求真实 `hcom_service.h`、`hcom_service_context.h`、`libhcom_static.a` 和 boundscheck。不要用本机兼容头生成部署二进制。
 
-`CMakeLists.txt` 不写死任何本地的 HCOM 路径；`build.sh` 会把路径作为 CMake
-配置参数传入。常规部署只需传入已构建 ubs-comm 的根目录：
-
-```bash
-PERF_ROOT=/absolute/path/to/rmd_perf_test
-UBS_ROOT=/absolute/path/to/ubs-comm
-cd "$PERF_ROOT"
-
-bash ./build.sh --ubs-root "$UBS_ROOT"
-```
-
-脚本默认创建 `$PERF_ROOT/build`，并通过 `nproc` 自动选择并行度。可按需覆盖：
-
-```bash
-bash ./build.sh --ubs-root "$UBS_ROOT" \
-  --build-dir /tmp/rdma_600-debug \
-  --build-type Debug \
-  --jobs 16
-```
-
-若此前复用过旧构建目录，其中的 `CMakeCache.txt` 可能仍显示已经从工程中删除的
-缓存项。请改用新的 `--build-dir`，或先清理旧构建目录再重新配置；当前源工程不会
-读取这些旧缓存项。
-
-若 HCOM 安装目录不是标准的 `$UBS_ROOT/dist` 布局，可将每个路径作为脚本参数传入：
-
-```bash
-bash ./build.sh \
-  --hcom-include /absolute/path/to/dist/hcom/include \
-  --hcom-lib /absolute/path/to/dist/hcom/lib \
-  --boundscheck-root /absolute/path/to/dist/hcom_3rdparty/libboundscheck
-```
-
-也可通过环境变量 `UBS_ROOT`、`HCOM_INCLUDE_DIR`、`HCOM_LIB_DIR`、
-`BOUNDSCHECK_ROOT`、`BUILD_DIR`、`CMAKE_BUILD_TYPE` 和
-`JOBS` 提供同样的构建参数。若要传递其他 CMake 配置参数，将它们置于 `--` 后，
-例如 `bash ./build.sh --ubs-root "$UBS_ROOT" -- -G Ninja`。
-
-本程序只使用 HCOM 的 RDMA service 公共 API。直接编译依赖为 HCOM 公共头文件、
-`libhcom_static.a` 和 `boundscheck`（公共头 `hcom_service_def.h` 直接包含
-`securec.h`），链接依赖为 pthread、dl 与平台存在时的 rt。程序不包含 URMA
-头文件；配套的 ubs-comm 构建也只启用 service/RDMA，显式关闭 UB、SOCK 和 SHM。
-配置失败时先核实实际 `dist` 路径和目标机器的构建产物；不要把 Windows 路径复制到 Linux 命令中。
-
-## 无硬件逻辑检查
-
-构建出的二进制可运行不接触 RDMA 网卡的本地检查：
+## 本地协议自测
 
 ```bash
 ./build/rdma_600 --self-test
 ```
 
-它验证 614400 字节布局、600 个 direct block、显式 HELLO/READY/ROUND_READY 编解码、memory-key 编码、generation 数据模式和 destination stride 间隙。它不是建链、DMA、CQ、RQ、MR、TLS 初始化或性能验证。
+自测覆盖 version=3 的 HELLO/READY、9664 字节 COPY_REQ、DATA_DONE/COPY_ERROR、截断请求、重复目标、非顺序 600 项映射和完整数据/gap 校验。它不验证建链、MR、DMA、CQ/RQ 或 QP 顺序。
 
-## 手工双端运行
+## 直接运行双端
 
-先在 receiver 主机启动 receiver 角色，再在 sender 主机启动 sender 角色。`LISTENING` 仅供进程编排；真正的 READY 只会在 receiver 已分配、触页并注册最终 destination MR 后通过 HCOM HELLO/Reply 返回。
+先在 remote 主机启动监听：
 
 ```bash
-export LD_LIBRARY_PATH="$UBS_ROOT/dist/hcom_3rdparty/libboundscheck/lib:${LD_LIBRARY_PATH:-}"
-
-./build/rdma_600 --role receiver \
-  --rdma-ip <receiver_nic0_rdma_ip> \
-  --listen <receiver_oob_ip>:19000 \
+./build/rdma_600 --role remote \
+  --rdma-ip <remote_nic0_rdma_ip> \
+  --listen <remote_oob_ip>:19000 \
   --kind verify --verify-rounds 20 --warmup 0 --rounds 0 \
-  --timeout-sec 10 --app-cpu <receiver_app_cpu> --worker-cpu <cq_cpu> \
-  --links 1
+  --timeout-sec 10 --app-cpu <remote_app_cpu> --worker-cpu <remote_worker_cpu> \
+  --links 1 --mode direct
 ```
 
-确认 receiver 已输出 `LISTENING` 后，在 sender 主机启动匹配参数的 sender：
+看到 `LISTENING role=remote` 后，在 local 主机启动：
 
 ```bash
-export LD_LIBRARY_PATH="$UBS_ROOT/dist/hcom_3rdparty/libboundscheck/lib:${LD_LIBRARY_PATH:-}"
-
-./build/rdma_600 --role sender \
-  --rdma-ip <sender_nic0_rdma_ip> \
-  --peer <receiver_oob_ip>:19000 \
+./build/rdma_600 --role local \
+  --rdma-ip <local_nic0_rdma_ip> \
+  --peer <remote_oob_ip>:19000 \
   --kind verify --verify-rounds 20 --warmup 0 --rounds 0 \
-  --timeout-sec 10 --app-cpu <submit_cpu> --worker-cpu <cq_cpu> \
-  --links 1
+  --timeout-sec 10 --app-cpu <local_app_cpu> --worker-cpu <local_worker_cpu> \
+  --links 1 --mode direct
 ```
 
-用 `--kind measure`、`--warmup 1000 --rounds 10000` 进入正式计时；该模式仍会先跑完整 verify。sender 只在正常结束时输出一行 JSON。`--kind verify` 中所有正式带宽/延迟字段为 `null`，避免将正确性运行误读为性能结果。
-
-## 双机本地角色脚本
-
-从示例生成同一份配置并复制到两台主机，填入 sender/receiver 各自的绝对二进制/库路径、OOB IP、RDMA IP 和 CPU。
-HCOM 已静态链接进 `rdma_600`。`library_dirs` 只需列出实际的动态运行时依赖；默认构建使用共享 boundscheck 时，只保留其库目录即可。脚本会按当前角色的列表组装本机 `LD_LIBRARY_PATH` 并记录实际路径。旧的单值 `library_dir` 仍可使用，但建议迁移为 `library_dirs`：
-
-```bash
-cp hosts.example.json hosts.json
-chmod 600 hosts.json
-```
-
-`sender` 字段描述 sender 主机，`receiver` 字段描述 receiver 主机。两端都要保存同一份配置，但各自执行时只会检查并使用本机角色的 `binary`、`library_dirs`、RDMA IP 和 CPU。`receiver.oob_ip` 必须能从 sender 主机连接。
-
-在 receiver 主机先执行，终端会实时显示 `LISTENING`：
-
-```bash
-python3 run.py --config hosts.json --role receiver \
-  --suite stage1 --kind verify --output results/20260911-b1-verify-receiver
-```
-
-确认 `LISTENING` 后，在 sender 主机执行：
-
-```bash
-python3 run.py --config hosts.json --role sender \
-  --suite stage1 --kind verify --output results/20260911-b1-verify-sender
-```
-
-measure 时两端使用相同的 `--kind measure`，每个物理 repeat 都要先启动新的 receiver，再启动新的 sender，并使用新的输出目录：
-
-```bash
-# receiver 主机
-python3 run.py --config hosts.json --role receiver \
-  --suite stage1 --kind measure --output results/20260911-b1-measure-001-receiver
-
-# sender 主机，待 receiver 输出 LISTENING 后执行
-python3 run.py --config hosts.json --role sender \
-  --suite stage1 --kind measure --output results/20260911-b1-measure-001-sender
-```
-
-每个脚本调用只启动一个本地角色。失败或超时时只会终止本次调用启动的本地进程组，绝不会 `pkill` 同名进程。receiver 输出目录包含其 manifest 与日志；sender 输出目录还包含经过校验的结果和报告：
+正式 measure 将两端同时改为：
 
 ```text
-results/<run-id>-receiver/
-  manifest.json
-  receiver.stdout.log
-  receiver.stderr.log
-
-results/<run-id>-sender/
-  manifest.json
-  sender.stdout.log
-  sender.stderr.log
-  result.jsonl
-  REPORT.md
+--kind measure --verify-rounds 20 --warmup 1000 --rounds 10000
 ```
 
-脚本会记录本机二进制 SHA-256、真实路径、`LD_LIBRARY_PATH` 下的 `ldd` 输出、命令参数、退出码和日志。sender 只接受参数与 B1 约束完全匹配的 JSON；失败、超时、缺少/重复结果或参数不匹配都会使本次 sender 调用失败，且不会用旧结果替代。
+每端的 app/worker CPU 必须不同。两台机器使用完全一致的轮数、超时和协议版本。
 
-## 计时与验证口径
+## 使用 run.py 归档
 
-sender 使用本机 `CLOCK_MONOTONIC_RAW` 记录：
+从 [hosts.example.json](hosts.example.json) 复制 `hosts.json`，分别填写 `local` 和 `remote` 的二进制、动态库、RDMA IP、CPU，以及 remote 的 OOB 地址和端口。两端保存相同配置。
 
-- `submit_us`：第一个 `Put` 前至唯一的 `ROUND_READY` `Send` 提交成功后，输出 avg/p50/p95/p99；
-- `e2e_us`：第一个 `Put` 前至收齐 ROUND_ACK，且本地 data/Send callback 均完成；
-- 有效带宽：正式循环的总 614400 字节/轮除以整段正式 wall time。
+remote 主机：
 
-不同机器的时间戳不会相减。这个 direct baseline 没有 receiver 的 1 KiB memcpy 或 scatter 计时。正式 measure 每轮只检查 `ROUND_READY` generation 和完成状态，结束后完整检查最终 destination 与 stride gap；verify 轮则检查所有 64-bit word 的 generation/block/word 数据模式。
+```bash
+python3 run.py --config hosts.json --role remote \
+  --suite stage1 --case SC-B1 --kind verify \
+  --output results/<run-id>-remote
+```
 
-## 运行前清单
+local 主机：
 
-- 每个 `--rdma-ip` 必须是本机预期网卡 IP；OOB 管理网地址可以不同。
-- app CPU 与 HCOM worker CPU 应使用不同物理核心，并记录 NIC/内存 NUMA 关系。
-- 检查双方部署的是同一源码提交、相同 hcom_static 链接输入及兼容的运行时依赖；当前 CMake 静态链接 hcom。脚本记录二进制 hash、ldd 等本机信息，静态库输入 hash/源码 dirty diff 需额外保存，不能仅凭 ldd 证明 hcom 版本相同。
-- 先运行 `verify`，再运行 `measure`。真实结果应同时保存端口计数、设备/QP 映射和 CPU 使用量；当前脚本不把建链日志当作 NIC 流量证据。
+```bash
+python3 run.py --config hosts.json --role local \
+  --suite stage1 --case SC-B1 --kind verify \
+  --output results/<run-id>-local
+```
 
-当前实现和验证状态见 [PROGRESS.md](PROGRESS.md)。
+measure 使用新的输出目录并把两端 `--kind` 改为 `measure`。脚本只启动当前主机的一个角色，不 SSH、不部署、不构建，也不会清理其它同名进程。
 
-review 目录中的历史审阅报告只对应报告注明的提交快照；涉及旧 staging/scatter B1 的描述不代表当前 direct B1 行为。
+local 目录包含 `result.jsonl` 和 `REPORT.md`；remote 目录包含 `status.json`。manifest 记录实际命令、本机二进制 SHA-256、动态依赖和退出状态。
+
+## 结果口径
+
+local 输出 schema 3：
+
+- 主时延：`sparse_copy_avg_us`、`p50`、`p95`、`p99`。
+- 有效载荷：614400 字节/调用；请求：9664 字节/调用。
+- 应用预期 WR：1 COPY_REQ、600 data WRITE、1 DATA_DONE、0 success ACK。
+- 吞吐：`effective_GBps`、`block_Mops`、`request_GBps` 和 `measured_wall_seconds`。
+
+verify 的性能字段全部为 `null`。measure 在最后一次调用后完整校验 destination；verify 每轮改变源/目标排列并完整校验。不同主机时钟不相减，remote 的提交时长不是主结果。
+
+## 当前限制
+
+- 尚未完成目标 Linux/AArch64 构建和真实 RDMA 验证，所有性能结论为 pending。
+- 阶段 2 双 NIC、阶段 3 SGL/staging/scatter、阶段 4 IMM 尚未实现。
+- SGL=30 的未来 grouped-source 请求只有在调用方确实提供可展开的 20 个源组描述符时才可使用 20 source + 600 destination；任意 600 个分散源地址仍必须完整发送。
+- 当前 callback 仍按请求分配；没有引入池或修改 ubs-comm。

@@ -1,28 +1,28 @@
 {
-  "sender": {
-    "binary": "/absolute/path/on/sender/rdma_600",
+  "local": {
+    "binary": "/absolute/path/on/local/rdma_600",
     "library_dirs": [
-      "/absolute/path/on/sender/ubs-comm/dist/hcom_3rdparty/libboundscheck/lib"
+      "/absolute/path/on/local/ubs-comm/dist/hcom_3rdparty/libboundscheck/lib"
     ],
     "rdma_ips": [
-      "<sender_nic0_rdma_ip>"
+      "<local_nic0_rdma_ip>"
     ],
     "app_cpu": 2,
     "worker_cpus": [
       3
     ]
   },
-  "receiver": {
-    "binary": "/absolute/path/on/receiver/rdma_600",
+  "remote": {
+    "binary": "/absolute/path/on/remote/rdma_600",
     "library_dirs": [
-      "/absolute/path/on/receiver/ubs-comm/dist/hcom_3rdparty/libboundscheck/lib"
+      "/absolute/path/on/remote/ubs-comm/dist/hcom_3rdparty/libboundscheck/lib"
     ],
-    "oob_ip": "<receiver_oob_ip>",
+    "oob_ip": "<remote_oob_ip>",
     "oob_ports": [
       19000
     ],
     "rdma_ips": [
-      "<receiver_nic0_rdma_ip>"
+      "<remote_nic0_rdma_ip>"
     ],
     "app_cpu": 2,
     "worker_cpus": [

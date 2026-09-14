@@ -1,12 +1,16 @@
-# 阶段 1.5 实施记录与双边消息精简分析
+# 旧协议阶段 1.5 实施记录与双边消息分析
 
 日期：2026-09-12
+
+> 适用边界：本文记录 remote（旧 sender）主动传输并计时、接收后回 ROUND_ACK 的旧协议。2026-09-12 新设计已改为 local 请求驱动的 sparse_copy，见 [DESIGN_CN.md](DESIGN_CN.md) 和 [IMPLEMENTATION_PLAN_CN.md](IMPLEMENTATION_PLAN_CN.md)。本报告是历史证据，不是下一阶段的执行指令。
+>
+> 新协议的阶段1/2 direct每次包含9664字节的600个源/目标地址对，在local计时，逐轮成功ACK=0；下一COPY_REQ代表上一轮消费完成并授予复用权限，remote仍排空自己的callbacks。阶段3若调用方真实提供可展开的聚合源描述符，SGL=30可使用20个source地址加600个destination地址；否则source仍为600个。local只向remote提供dst/staging key，remote source key不导出。下文“ACK不能无条件删除”只适用于当时缺少请求驱动的旧状态机；第5/6节保留ACK、direct最后一笔IMM和门铃实验建议已被新路线替代。A/B的等待和记账优化仍可迁移，旧性能不能直接作新指标对照。
 
 ## 1. 结论与状态
 
 阶段 1.5 的 A+B 最小优化已在 `perf_test` 中实现，保持 direct B1 的数据与控制协议不变：每轮仍为 600 个异步 `Put(1024)`、1 个 `ROUND_READY` Send、1 个反向 `ROUND_ACK`，单轮在途，source/destination stride 均为 4096。没有 staging、scatter、SGL、IMM、跨轮窗口或 `ubs-comm` 修改。
 
-当前只能记为 `IMPLEMENTED / LOCAL_PASS_HW_PENDING`。Windows 本机已完成受限语法检查；目标 Linux/AArch64 构建、self-test、错误注入、profile、双机 verify 和 5 次 original/A/AB 性能对照均未执行，因此本文没有性能数字，也不推断加速比例。
+初始交付时记为 `IMPLEMENTED / LOCAL_PASS_HW_PENDING`：Windows 本机完成了受限语法检查，当时未执行目标 Linux/AArch64 构建、self-test、错误注入、profile、双机 verify 或 5 次 original/A/AB 对照。后续旧目标机性能摘要保存在第 7 节；它未补齐整套验收证据，也不能据此推断 A/B 加速比例。
 
 ## 2. 阶段 1.5 改动
 
@@ -38,7 +42,7 @@
 
 上述 A/AB SHA-1 是 `git diff --binary -- rdma_600.cpp | git hash-object --stdin` 的内容标识，不是假装成 git commit。正式跑测应保存原始 diff、源码状态、二进制和静态 hcom 链接输入 hash；不得只依赖该表。
 
-## 4. 当前时序
+## 4. 旧协议时序
 
 ```mermaid
 sequenceDiagram
@@ -75,7 +79,7 @@ sequenceDiagram
     QP->>SW: FINISH_ACK receive
 ```
 
-## 5. 双边消息能否与单边写合并
+## 5. 旧协议下的双边消息合并分析（历史）
 
 | 消息 | 频率 | 能否精简 | 分析 |
 |---|---:|---|---|
@@ -124,9 +128,19 @@ sequenceDiagram
 
 它可以把每轮双边消息数降到 0，但没有减少 WR：前向仍是 601 个 WR，反向仍是 1 个 WR；同时新增 control MR/key 交换、DMA 内存轮询、缓存一致性与设备可见性验证。若把 generation 嵌入第 600 个数据块可把前向降到 600 WR，但会改变 measure 数据内容并引入每轮源数据更新，已不再是严格相同的 B1 基线。这个方案应作为独立 case，不应覆盖 original/A/AB。
 
-## 6. 建议的后续实验顺序
+## 6. 当时建议的实验顺序（已被新实施计划替代）
 
 1. 先在目标机完成 original、A、AB 的 20 轮完整 verify 和各 5 次正式测量，确认阶段 1.5 本身的收益与 CPU 代价。
 2. 新增独立 `notify=imm-last-put` 实验，且只改 ROUND_READY；保持 ACK、FINISH、600 块 direct 布局和单轮在途。它需要明确授权修改 `ubs-comm`。
 3. 若目标是“每轮零双边消息”，再新增 `notify=doorbell-put, ack=doorbell-put` 的独立实验，与 Send/IMM 成对比较。必须记录真实 WR、RQ/CQ、CPU 占用和断链有界退出。
 4. 最后才评估将最终状态并入最后 ACK。HELLO/READY 仍建议保留为低频 bootstrap，不为消除两条一次性消息牺牲参数校验和 MR 安全。
+
+## 7. 旧目标机 submit 长尾摘要（从旧设计文档迁存）
+
+旧 DESIGN_CN.md 在 `main@38e6637` 记录了以下后续目标机摘要，现移到历史报告以避免丢失调查线索。这是旧 remote 计时/ACK 协议的数据，不是本次新跑测；本次文档修改未重新核验完整原始日志或补齐各阶段硬件验收。
+
+10000 轮的 `submit_avg/p50/p95/p99` 为 `689.469/460.990/590.800/4617.720 us`，`e2e_avg/p50/p95/p99` 为 `699.652/469.210/599.190/4627.710 us`。临时诊断中 `post_submit_wait` 平均 `10.183 us`；ACK 在 10000 轮中均为最后完成 gate，而完成事件 p99 紧随 submit p99。
+
+当时的判断是毫秒级长尾已经在 600 次 Put 加 ROUND_READY 的提交阶段形成，不能只因 ACK 最后满足就归因于回程 ACK 或末尾 WaitData。若恢复调查，独立诊断提交内部的背压、callback/上下文分配回收、SQ/CQ 资源周期及线程抢占/频率/NUMA；正式测量不保留额外 callback 时钟采样。
+
+新协议仍可能遇到相同的 remote 提交瓶颈，但需要在 local sparse_copy 主计时和独立 remote trace 下重新验证，不能将旧数字直接迁入新结果表。
