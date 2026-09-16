@@ -72,6 +72,8 @@ local：
 
 正式测量两端使用 `--kind measure --verify-rounds 20 --warmup 1000 --rounds 10000`。每端所有 app/worker CPU 应使用不同物理核心。详细 trace 必须单独以 `--kind trace --trace-rounds N` 运行；正式 measure 不采集事件时间。
 
+trace schema `sparse-copy-v4-dual-rail-v3` 按 generation 输出以下阶段：local 调用开始、请求准备完成、请求 Send 返回、各 rail DATA_DONE 到达和调用返回；remote 请求到达、应用线程开始处理、请求解码结束、各 rail WR 构造结束、Put 循环开始、每完成 100 次 Put、Put 循环结束、DATA_DONE Send 返回、最后一个 data callback 和包含 Send callback 在内的 callbacks 全部排空。`remote_posted` 与 `remote_put_loop_ended` 保持相同的墙钟时间戳，供旧分析逻辑兼容。Put 循环另有 `remote_put_loop_thread_cpu_started/ended`，其 `clock` 为 `thread_cpu`；其余事件的 `clock` 为 `monotonic_raw`。只对同一 rail 的同类时钟求差：墙钟增长但线程 CPU 时间不增长，优先检查抢占、睡眠或阻塞；二者同步增长，优先检查分配、自旋或 Put 执行路径。连续 trace 轮会保留相邻 generation，可直接比较第 N 轮请求开始与第 N-1 轮 callbacks 排空的关系。两端时间戳只在各自本机内求差，不能跨主机相减。
+
 本分支保持删除 Python 编排的状态：没有 `run.py`，也不应从 main 恢复。各主机直接启动二进制并自行保存 stdout/stderr。`hosts.example.json` 仅作为参数记录模板，程序不读取。
 
 ## 地址与结果口径

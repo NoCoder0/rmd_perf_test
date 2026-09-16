@@ -81,6 +81,8 @@ constexpr uint32_t kMaxBlocksPerRail = kBlocks;
 constexpr uint32_t kBlockBytes = 1024;
 constexpr uint32_t kStrideBytes = 4096;
 constexpr uint32_t kMaxTraceRounds = 64;
+constexpr uint32_t kPutTraceInterval = 100;
+constexpr uint32_t kMaxPutTraceCheckpoints = kMaxBlocksPerRail / kPutTraceInterval;
 constexpr uint32_t kDataDeadlineCheckInterval = 256;
 constexpr uint64_t kPayloadBytes = static_cast<uint64_t>(kBlocks) * kBlockBytes;
 constexpr uint8_t kDstGapSentinel = 0xa5;
@@ -98,6 +100,8 @@ constexpr size_t kCounterAlignment = 64;
 #endif
 
 static_assert(kPayloadBytes == 614400, "the benchmark payload is fixed by design");
+static_assert(kBlocks % kMaxLinks == 0 && (kBlocks / kMaxLinks) % kPutTraceInterval == 0,
+    "each supported rail count must have an integral number of Put trace checkpoints");
 static_assert((kDataDeadlineCheckInterval & (kDataDeadlineCheckInterval - 1)) == 0,
     "the data deadline interval must be a power of two");
 
@@ -260,6 +264,17 @@ bool TryNowNs(uint64_t &value) noexcept
     value = static_cast<uint64_t>(ts.tv_sec) * 1000000000ULL + static_cast<uint64_t>(ts.tv_nsec);
     return true;
 }
+
+#ifndef RDMA_600_SELF_TEST_ONLY
+uint64_t ThreadCpuNowNs()
+{
+    timespec ts{};
+    if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts) != 0) {
+        throw std::runtime_error("clock_gettime(CLOCK_THREAD_CPUTIME_ID) failed");
+    }
+    return static_cast<uint64_t>(ts.tv_sec) * 1000000000ULL + static_cast<uint64_t>(ts.tv_nsec);
+}
+#endif
 
 void PutU16(uint8_t *&cursor, uint16_t value)
 {
@@ -1041,13 +1056,23 @@ struct TracePoint {
 struct TraceRound {
     uint64_t generation = 0;
     TracePoint localBegin;
+    TracePoint localRequestPrepared;
     TracePoint localRequestPosted;
     std::array<TracePoint, kMaxLinks> localDataDone;
     TracePoint localEnd;
     TracePoint remoteRequestReceived;
+    TracePoint remoteProcessingStarted;
+    TracePoint remoteRequestDecoded;
+    std::array<TracePoint, kMaxLinks> remotePutRequestsBuilt;
+    std::array<TracePoint, kMaxLinks> remotePutLoopStarted;
+    std::array<TracePoint, kMaxLinks> remotePutLoopThreadCpuStarted;
+    std::array<std::array<TracePoint, kMaxPutTraceCheckpoints>, kMaxLinks> remotePutCheckpoints;
+    std::array<TracePoint, kMaxLinks> remotePutLoopEnded;
+    std::array<TracePoint, kMaxLinks> remotePutLoopThreadCpuEnded;
     std::array<TracePoint, kMaxLinks> remotePosted;
     std::array<TracePoint, kMaxLinks> remoteDataCallbacksDone;
     std::array<TracePoint, kMaxLinks> remoteDonePosted;
+    std::array<TracePoint, kMaxLinks> remoteCallbacksDrained;
 };
 
 bool RunSelfTest()
@@ -1807,6 +1832,7 @@ private:
             if (mRails[rail].peerSourceBytes != railBytes)
                 throw std::runtime_error("invalid remote source metadata");
         mCopyReqPayload = EncodeCopyRequest(generation, mOptions.links, mCopyEntries);
+        if (TraceIndex(generation, trace)) mTrace[trace].localRequestPrepared.Publish(NowNs());
         const uint64_t expectedSend = ExpectedSendCallbacks(0) + 1;
         PostAsyncSend(0, ChannelCopyRequired(0, "COPY_REQ"), mCopyReqPayload.data(),
             mCopyReqPayload.size(), kOpCopyReq);
@@ -1828,8 +1854,10 @@ private:
         WaitData("all HELLO", [this] { return AllHellosSeen(); });
         for (uint64_t generation = 1; generation <= mParams.TotalRounds(); ++generation) {
             try {
-                ReceivePendingCopyRequest();
+                ReceivePendingCopyRequest(generation);
                 DecodeActiveCopyRequest(generation);
+                size_t trace = 0;
+                if (TraceIndex(generation, trace)) mTrace[trace].remoteRequestDecoded.Publish(NowNs());
                 uint64_t sequence = 0;
                 if (mOptions.links == 2)
                     sequence = IssueSecondaryRailCommand(RailCommand::ProcessRemoteRound, generation);
@@ -1851,9 +1879,11 @@ private:
         return true;
     }
 
-    void ReceivePendingCopyRequest()
+    void ReceivePendingCopyRequest(uint64_t generation)
     {
         WaitData("COPY_REQ", [this] { return mPendingCopyReqPublished.load(std::memory_order_acquire); });
+        size_t trace = 0;
+        if (TraceIndex(generation, trace)) mTrace[trace].remoteProcessingStarted.Publish(NowNs());
         mActiveCopyReqBytes = mPendingCopyReqBytes;
         if (mActiveCopyReqBytes <= mActiveCopyReqPayload.size())
             std::memcpy(mActiveCopyReqPayload.data(), mPendingCopyReqPayload.data(), mActiveCopyReqBytes);
@@ -1873,27 +1903,43 @@ private:
     void ProcessRemoteRail(uint16_t rail, uint64_t generation)
     {
         RailState &state = mRails[rail];
+        size_t trace = 0;
+        const bool tracing = TraceIndex(generation, trace);
         if (generation <= mParams.verifyRounds) FillRemoteSourceRail(rail, generation);
         BuildRemotePutRequests(rail);
+        if (tracing) mTrace[trace].remotePutRequestsBuilt[rail].Publish(NowNs());
         const uint64_t expectedData = state.appCounters.attemptedDataCallbacks + mBlocksPerRail;
         const UBSHcomChannelPtr channel = ChannelCopyRequired(rail, "remote copy");
+        if (tracing) {
+            mTrace[trace].remotePutLoopStarted[rail].Publish(NowNs());
+            mTrace[trace].remotePutLoopThreadCpuStarted[rail].Publish(ThreadCpuNowNs());
+        }
         for (uint32_t i = 0; i < mBlocksPerRail; ++i) {
             Callback *callback = NewDataCallback(rail, generation, i + 1 == mBlocksPerRail);
             if (callback == nullptr) throw std::runtime_error("Put callback allocation failed");
             ++state.appCounters.attemptedDataCallbacks;
             const int rc = channel->Put(state.putRequests[i], callback);
             if (rc != 0) throw std::runtime_error("Put failed: " + std::to_string(rc));
+            if (tracing && (i + 1) % kPutTraceInterval == 0) {
+                const size_t checkpoint = static_cast<size_t>((i + 1) / kPutTraceInterval - 1);
+                mTrace[trace].remotePutCheckpoints[rail][checkpoint].Publish(NowNs());
+            }
         }
-        size_t trace = 0;
-        if (TraceIndex(generation, trace)) mTrace[trace].remotePosted[rail].Publish(NowNs());
+        if (tracing) {
+            mTrace[trace].remotePutLoopThreadCpuEnded[rail].Publish(ThreadCpuNowNs());
+            const uint64_t loopEnd = NowNs();
+            mTrace[trace].remotePutLoopEnded[rail].Publish(loopEnd);
+            mTrace[trace].remotePosted[rail].Publish(loopEnd);
+        }
         state.dataDonePayload = EncodeDataDone(generation, rail, mBlocksPerRail);
         const uint64_t expectedSend = ExpectedSendCallbacks(rail) + 1;
         PostAsyncSend(rail, channel, state.dataDonePayload.data(), state.dataDonePayload.size(), kOpDataDone);
-        if (TraceIndex(generation, trace)) mTrace[trace].remoteDonePosted[rail].Publish(NowNs());
+        if (tracing) mTrace[trace].remoteDonePosted[rail].Publish(NowNs());
         WaitData("remote callbacks", [this, rail, expectedData, expectedSend] {
             return mRails[rail].callbackCounters.dataDoneCallbacks.load(std::memory_order_acquire) >= expectedData &&
                 mRails[rail].callbackCounters.sendDoneCallbacks.load(std::memory_order_acquire) >= expectedSend;
         });
+        if (tracing) mTrace[trace].remoteCallbacksDrained[rail].Publish(NowNs());
     }
 
     void BuildRemotePutRequests(uint16_t rail)
@@ -2127,13 +2173,16 @@ private:
         }
     }
 
-    void EmitTracePoint(const char *event, uint64_t generation, int rail, const TracePoint &point) const
+    void EmitTracePoint(const char *event, uint64_t generation, int rail, const TracePoint &point,
+        const char *clock = "monotonic_raw", int putCount = -1) const
     {
-        std::cout << "{\"record_type\":\"trace\",\"trace_schema\":\"sparse-copy-v4-dual-rail-v1\","
+        std::cout << "{\"record_type\":\"trace\",\"trace_schema\":\"sparse-copy-v4-dual-rail-v3\","
                   << "\"host_role\":\"" << RoleName(mOptions.role) << "\",\"case\":\""
                   << CaseName(mOptions.links) << "\",\"generation\":" << generation << ",\"rail\":";
         if (rail < 0) std::cout << "null"; else std::cout << rail;
-        std::cout << ",\"event\":\"" << event << "\",\"timestamp_ns\":" << point.Read(event) << "}" << std::endl;
+        std::cout << ",\"event\":\"" << event << "\",\"clock\":\"" << clock << "\"";
+        if (putCount >= 0) std::cout << ",\"put_count\":" << putCount;
+        std::cout << ",\"timestamp_ns\":" << point.Read(event) << "}" << std::endl;
     }
 
     void EmitTrace() const
@@ -2142,16 +2191,38 @@ private:
             const TraceRound &t = mTrace[i];
             if (mOptions.role == Role::Local) {
                 EmitTracePoint("local_begin", t.generation, -1, t.localBegin);
+                EmitTracePoint("local_request_prepared", t.generation, -1, t.localRequestPrepared);
                 EmitTracePoint("local_request_posted", t.generation, 0, t.localRequestPosted);
                 for (uint16_t rail = 0; rail < mOptions.links; ++rail)
                     EmitTracePoint("local_data_done", t.generation, rail, t.localDataDone[rail]);
                 EmitTracePoint("local_end", t.generation, -1, t.localEnd);
             } else {
                 EmitTracePoint("remote_request_received", t.generation, 0, t.remoteRequestReceived);
+                EmitTracePoint("remote_processing_started", t.generation, -1, t.remoteProcessingStarted);
+                EmitTracePoint("remote_request_decoded", t.generation, -1, t.remoteRequestDecoded);
                 for (uint16_t rail = 0; rail < mOptions.links; ++rail) {
+                    EmitTracePoint("remote_put_requests_built", t.generation, rail,
+                        t.remotePutRequestsBuilt[rail]);
+                    EmitTracePoint("remote_put_loop_started", t.generation, rail,
+                        t.remotePutLoopStarted[rail]);
+                    EmitTracePoint("remote_put_loop_thread_cpu_started", t.generation, rail,
+                        t.remotePutLoopThreadCpuStarted[rail], "thread_cpu");
+                    for (uint32_t checkpoint = 0;
+                         checkpoint < mBlocksPerRail / kPutTraceInterval; ++checkpoint) {
+                        const int putCount = static_cast<int>((checkpoint + 1) * kPutTraceInterval);
+                        EmitTracePoint("remote_put_checkpoint", t.generation, rail,
+                            t.remotePutCheckpoints[rail][checkpoint], "monotonic_raw", putCount);
+                    }
+                    EmitTracePoint("remote_put_loop_ended", t.generation, rail,
+                        t.remotePutLoopEnded[rail]);
+                    EmitTracePoint("remote_put_loop_thread_cpu_ended", t.generation, rail,
+                        t.remotePutLoopThreadCpuEnded[rail], "thread_cpu");
                     EmitTracePoint("remote_posted", t.generation, rail, t.remotePosted[rail]);
-                    EmitTracePoint("remote_data_callbacks_done", t.generation, rail, t.remoteDataCallbacksDone[rail]);
                     EmitTracePoint("remote_done_posted", t.generation, rail, t.remoteDonePosted[rail]);
+                    EmitTracePoint("remote_data_callbacks_done", t.generation, rail,
+                        t.remoteDataCallbacksDone[rail]);
+                    EmitTracePoint("remote_callbacks_drained", t.generation, rail,
+                        t.remoteCallbacksDrained[rail]);
                 }
             }
         }
