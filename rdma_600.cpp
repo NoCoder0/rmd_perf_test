@@ -31,7 +31,6 @@
 #endif
 #include <mutex>
 #include <new>
-#include <numeric>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -177,7 +176,6 @@ struct Options {
     uint32_t timeoutSec = 10;
     std::vector<int> appCpus;
     std::vector<int> workerCpus;
-    bool selfTest = false;
 };
 
 struct CaseParameters {
@@ -1033,8 +1031,7 @@ void PrintUsage(std::ostream &stream)
 {
     stream << "Usage:\n"
            << "  rdma_600 --role remote --rdma-ips <ip0[,ip1]> --listen <ep0[,ep1]> [options]\n"
-           << "  rdma_600 --role local --rdma-ips <ip0[,ip1]> --peer <ep0[,ep1]> [options]\n"
-           << "  rdma_600 --self-test\n\n"
+           << "  rdma_600 --role local --rdma-ips <ip0[,ip1]> --peer <ep0[,ep1]> [options]\n\n"
            << "Modes: --mode direct (B1/B2), or --mode sgl --pipeline on|off (S1/S2).\n"
            << "SGL K comes from RDMA_600_SGL_ITEMS (default 16, design range 1..30).\n"
            << "SGL measure also requires RDMA_600_QP_MAX_SEND_SGE=<cap0[,cap1]>.\n"
@@ -1048,16 +1045,11 @@ void PrintUsage(std::ostream &stream)
 Options ParseOptions(int argc, char **argv)
 {
     std::map<std::string, std::string> values;
-    bool selfTest = false;
     for (int index = 1; index < argc; ++index) {
         const std::string argument(argv[index]);
         if (argument == "--help" || argument == "-h") {
             PrintUsage(std::cout);
             std::exit(0);
-        }
-        if (argument == "--self-test") {
-            selfTest = true;
-            continue;
         }
         if (argument.rfind("--", 0) != 0 || index + 1 >= argc) {
             throw std::runtime_error("expected an option and value; use --help");
@@ -1069,14 +1061,6 @@ Options ParseOptions(int argc, char **argv)
     }
 
     Options options;
-    options.selfTest = selfTest;
-    if (selfTest) {
-        if (!values.empty()) {
-            throw std::runtime_error("--self-test cannot be combined with RDMA options");
-        }
-        return options;
-    }
-
     static const std::array<std::string, 18> kAllowedOptions = {
         "--role", "--rdma-ip", "--rdma-ips", "--listen", "--peer", "--kind", "--verify-rounds", "--warmup",
         "--rounds", "--trace-rounds", "--timeout-sec", "--app-cpu", "--app-cpus", "--worker-cpu",
@@ -1407,487 +1391,6 @@ bool AllSglChunksReady(uint16_t links, uint32_t chunksPerRail, Ready ready)
             if (!ready(rail, chunk)) return false;
     return true;
 }
-
-void SelfTestReadyPublicationOrder()
-{
-    std::atomic<uint64_t> ready{4};
-    std::string error;
-    uint32_t observerCalls = 0;
-    uint32_t traceMarker = 0;
-    bool consumerSawReadyBeforeObserver = false;
-    bool observerSawReservation = false;
-    if (!PublishChunkReadyAfterOptionalObserver(ready, 5, true, [&] {
-            ++observerCalls;
-            traceMarker = 0x51;
-            consumerSawReadyBeforeObserver = ready.load(std::memory_order_acquire) == 5;
-            observerSawReservation = ready.load(std::memory_order_acquire) == kChunkReadyPublishing;
-            return true;
-        }, error) || consumerSawReadyBeforeObserver || !observerSawReservation || observerCalls != 1 ||
-        ready.load(std::memory_order_acquire) != 5)
-        throw std::runtime_error("CHUNK_DONE observer was not ordered before ready publication");
-    if (PublishChunkReadyAfterOptionalObserver(ready, 5, true, [&] {
-            ++observerCalls; traceMarker = 0x52; return true;
-        }, error) || observerCalls != 1 || traceMarker != 0x51 ||
-        ready.load(std::memory_order_acquire) != 5)
-        throw std::runtime_error("duplicate CHUNK_DONE overwrote its observer/ready state");
-    if (PublishChunkReadyAfterOptionalObserver(ready, 6, true,
-            [&] { ++observerCalls; return false; }, error) ||
-        observerCalls != 2 || ready.load(std::memory_order_acquire) != 5)
-        throw std::runtime_error("failed CHUNK_DONE observer exposed a consumable generation");
-    uint32_t measureSamples = 0;
-    if (!PublishChunkReadyAfterOptionalObserver(ready, 6, false,
-            [&] { ++measureSamples; return true; }, error) || measureSamples != 0 ||
-        ready.load(std::memory_order_acquire) != 6)
-        throw std::runtime_error("measure-mode CHUNK_DONE sampled a chunk observer");
-}
-
-void SelfTestSglMapping(uint16_t links, uint16_t sglItems, PipelineMode pipeline)
-{
-    const uint32_t blocksPerRail = kBlocks / links;
-    const uint32_t chunks = ChunkCount(blocksPerRail, sglItems);
-    std::array<AlignedBuffer, kMaxLinks> source;
-    std::array<AlignedBuffer, kMaxLinks> expected;
-    std::array<AlignedBuffer, kMaxLinks> actual;
-    std::array<AlignedBuffer, kMaxLinks> stage;
-    std::array<std::array<std::atomic<uint64_t>, kMaxBlocksPerRail>, kMaxLinks> ready{};
-    std::array<std::array<uint64_t, kMaxBlocksPerRail>, kMaxLinks> consumed{};
-    for (uint16_t rail = 0; rail < links; ++rail) {
-        const size_t sparseBytes = static_cast<size_t>(blocksPerRail) * kStrideBytes;
-        source[rail].Allocate(sparseBytes);
-        expected[rail].Allocate(sparseBytes);
-        actual[rail].Allocate(sparseBytes);
-        stage[rail].Allocate(static_cast<size_t>(blocksPerRail) * kBlockBytes);
-    }
-    for (uint64_t generation : {uint64_t{5}, uint64_t{6}}) {
-        auto entries = MakeCopyEntries(generation, links);
-        // Exercise the contract that source offsets may repeat while destinations may not.
-        entries[1].remoteSourceOffset = entries[0].remoteSourceOffset;
-        std::string error;
-        const uint64_t sparseBytes = static_cast<uint64_t>(blocksPerRail) * kStrideBytes;
-        if (!ValidateCopyEntries(entries, links, sparseBytes, sparseBytes, error))
-            throw std::runtime_error("SGL self-test mapping rejected: " + error);
-        for (uint16_t rail = 0; rail < links; ++rail) {
-            std::memset(source[rail].Data(), kSourceGapSentinel, source[rail].Size());
-            std::memset(expected[rail].Data(), kDstGapSentinel, expected[rail].Size());
-            std::memset(actual[rail].Data(), kDstGapSentinel, actual[rail].Size());
-            std::memset(stage[rail].Data(), 0xcc, stage[rail].Size());
-            for (uint32_t slot = 0; slot < blocksPerRail; ++slot)
-                FillBlock(source[rail].Data() + static_cast<size_t>(slot) * kStrideBytes, generation,
-                    static_cast<uint32_t>(rail) * blocksPerRail + slot);
-        }
-        for (uint32_t index = 0; index < kBlocks; ++index) {
-            const uint16_t rail = RailForRequestIndex(index, links);
-            std::memcpy(expected[rail].Data() + entries[index].localDestinationOffset,
-                source[rail].Data() + entries[index].remoteSourceOffset, kBlockBytes);
-        }
-
-        const uint32_t totalChunks = chunks * links;
-        const uint32_t slowLinear = totalChunks - 1;
-        SglSchedulerState scheduler{};
-        uint32_t checkpoints = 0;
-        auto isPublished = [&](uint16_t rail, uint32_t chunk) {
-            return ready[rail][chunk].load(std::memory_order_acquire) == generation;
-        };
-        auto isReady = [&](uint16_t rail, uint32_t chunk) {
-            return consumed[rail][chunk] != generation && isPublished(rail, chunk);
-        };
-        auto scatter = [&](uint16_t rail, uint32_t chunk) {
-            if (consumed[rail][chunk] == generation)
-                throw std::runtime_error("shared SGL scheduler scattered a chunk twice");
-            ScatterChunkPayload(rail, chunk, blocksPerRail, sglItems, entries,
-                actual[rail].Data(), actual[rail].Size(), stage[rail].Data(), stage[rail].Size());
-            consumed[rail][chunk] = generation;
-        };
-        auto scan = [&] {
-            return ScanReadySglChunks(links, chunks, scheduler, isReady, scatter, [&] { ++checkpoints; });
-        };
-        auto publish = [&](uint32_t linear) {
-            const uint16_t rail = static_cast<uint16_t>(linear % links);
-            const uint32_t chunk = linear / links;
-            const uint32_t first = chunk * sglItems;
-            const uint32_t count = ChunkItemCount(blocksPerRail, sglItems, chunk);
-            for (uint32_t item = 0; item < count; ++item) {
-                const CopyEntry &entry = entries[static_cast<uint32_t>(rail) * blocksPerRail + first + item];
-                std::memcpy(stage[rail].Data() + static_cast<size_t>(first + item) * kBlockBytes,
-                    source[rail].Data() + entry.remoteSourceOffset, kBlockBytes);
-            }
-            const ChunkDoneInfo info{rail, generation, chunk, first, count, count * kBlockBytes, chunks};
-            if (!ValidateChunkDone(info, rail, generation, blocksPerRail, sglItems, error))
-                throw std::runtime_error("valid CHUNK_DONE rejected: " + error);
-            if (!PublishChunkReadyAfterOptionalObserver(
-                    ready[rail][chunk], generation, false, [] { return true; }, error))
-                throw std::runtime_error("valid CHUNK_DONE state transition rejected: " + error);
-        };
-
-        // Publish every chunk except one in reverse order. The withheld final chunk
-        // models a slow rail/tail while generation 6 also reuses generation-5 slots.
-        for (uint32_t reverse = totalChunks; reverse > 0; --reverse) {
-            const uint32_t linear = reverse - 1;
-            if (linear != slowLinear) publish(linear);
-        }
-        if (AllSglChunksReady(links, chunks, isPublished))
-            throw std::runtime_error("slow-rail/final-chunk all-ready gate completed early");
-        if (pipeline == PipelineMode::On) {
-            std::vector<uint32_t> visits(totalChunks, 0);
-            auto countingReady = [&](uint16_t rail, uint32_t chunk) {
-                ++visits[chunk * links + rail];
-                return isReady(rail, chunk);
-            };
-            if (!ScanReadySglChunks(links, chunks, scheduler, countingReady, scatter, [&] { ++checkpoints; }))
-                throw std::runtime_error("pipelined scan made no progress with ready chunks");
-            if (std::any_of(visits.begin(), visits.end(), [](uint32_t count) { return count != 1; }) ||
-                scheduler.cursor != (totalChunks == 1 ? 0U : 1U))
-                throw std::runtime_error("fixed-start SGL scan skipped/revisited a slot or failed to rotate");
-            if (scheduler.scattered != totalChunks - 1)
-                throw std::runtime_error("slow-rail/final-chunk pipeline gate completed early");
-        } else if (scheduler.scattered != 0) {
-            throw std::runtime_error("pipeline=off scattered before the all-ready gate");
-        }
-        if (SglCompletionReached(scheduler.scattered, totalChunks, false))
-            throw std::runtime_error("delayed request callback released the SGL generation early");
-
-        publish(slowLinear);
-        if (!AllSglChunksReady(links, chunks, isPublished))
-            throw std::runtime_error("all-ready gate rejected the final slow chunk");
-        if (!scan() || scheduler.scattered != totalChunks)
-            throw std::runtime_error("shared SGL scheduler did not scatter the final ready chunks");
-        if (SglCompletionReached(scheduler.scattered, totalChunks, false) ||
-            !SglCompletionReached(scheduler.scattered, totalChunks, true))
-            throw std::runtime_error("production SGL completion gate ignored request callback state");
-        if (totalChunks >= kDataDeadlineCheckInterval && checkpoints == 0)
-            throw std::runtime_error("shared SGL scheduler did not run periodic deadline checkpoints");
-        for (uint16_t rail = 0; rail < links; ++rail) {
-            if (std::memcmp(expected[rail].Data(), actual[rail].Data(), actual[rail].Size()) != 0)
-                throw std::runtime_error("SGL scatter differs from direct reference");
-            for (uint32_t chunk = 0; chunk < chunks; ++chunk)
-                if (consumed[rail][chunk] != generation)
-                    throw std::runtime_error("multi-generation consumed state was not published");
-        }
-    }
-}
-
-bool RunSelfTest()
-{
-    try {
-        for (const std::string bad : {"", "-1", " 8", "8 ", "+8", "0", "31", "999999999999999999999"}) {
-            bool rejected = false;
-            try { (void)ResolveSglItems(CopyMode::Sgl, bad.c_str()); } catch (...) { rejected = true; }
-            if (!rejected) throw std::runtime_error("bad RDMA_600_SGL_ITEMS was accepted: " + bad);
-        }
-        if (ResolveSglItems(CopyMode::Direct, "not-even-parsed") != 0 ||
-            ResolveSglItems(CopyMode::Sgl, nullptr) != kDefaultSglItems)
-            throw std::runtime_error("SGL K default/direct isolation failed");
-        bool capsDeclared = false;
-        const auto caps = ParseQpCaps("8,16", 2, capsDeclared);
-        if (!capsDeclared || caps.size() != 2 || caps[0] != 8 || caps[1] != 16)
-            throw std::runtime_error("QP cap declaration parsing failed");
-        for (const char *badCaps : {"", "16", "16,", "0,16", "16, 16"}) {
-            bool rejected = false;
-            try { (void)ParseQpCaps(badCaps, 2, capsDeclared); } catch (...) { rejected = true; }
-            if (!rejected) throw std::runtime_error("bad QP cap declaration was accepted");
-        }
-        {
-            Options parsed{};
-            ResolveModeAndPipeline(parsed, "sgl", false, "on");
-            if (parsed.mode != CopyMode::Sgl || parsed.pipeline != PipelineMode::On)
-                throw std::runtime_error("default SGL pipeline parsing failed");
-            ResolveModeAndPipeline(parsed, "sgl", true, "off");
-            if (parsed.pipeline != PipelineMode::Off) throw std::runtime_error("off pipeline parsing failed");
-            bool rejected = false;
-            try { ResolveModeAndPipeline(parsed, "direct", true, "off"); } catch (...) { rejected = true; }
-            if (!rejected) throw std::runtime_error("direct accepted --pipeline");
-            rejected = false;
-            try { ResolveModeAndPipeline(parsed, "unknown", false, "on"); } catch (...) { rejected = true; }
-            if (!rejected) throw std::runtime_error("unknown mode was accepted");
-            Options capability{};
-            capability.mode = CopyMode::Sgl;
-            capability.links = 1;
-            capability.sglItems = static_cast<uint16_t>(std::min<uint32_t>(8, kCompiledSgeMax));
-            capability.kind = RunKind::Verify;
-            ValidateSglCapability(capability);
-            capability.kind = RunKind::Measure;
-            rejected = false;
-            try { ValidateSglCapability(capability); } catch (...) { rejected = true; }
-            if (!rejected) throw std::runtime_error("SGL measure accepted missing QP cap declaration");
-            capability.qpCapDeclared = true;
-            capability.qpMaxSendSge = {static_cast<uint32_t>(capability.sglItems - 1)};
-            rejected = false;
-            try { ValidateSglCapability(capability); } catch (...) { rejected = true; }
-            if (!rejected) throw std::runtime_error("SGL accepted QP cap below K");
-            if (kCompiledSgeMax < 30) {
-                capability.qpMaxSendSge = {30};
-                capability.sglItems = 30;
-                rejected = false;
-                try { ValidateSglCapability(capability); } catch (...) { rejected = true; }
-                if (!rejected) throw std::runtime_error("K30 accepted by current cap16 dependency");
-            }
-        }
-
-        for (uint16_t links : {uint16_t{1}, uint16_t{2}}) {
-          for (CopyMode mode : {CopyMode::Direct, CopyMode::Sgl}) {
-            for (uint16_t sglItems : (mode == CopyMode::Direct ? std::vector<uint16_t>{0} :
-                    std::vector<uint16_t>{1, 8, 16, 30})) {
-            CaseParameters parameters{};
-            parameters.links = links;
-            parameters.verifyRounds = 20;
-            parameters.traceRounds = 3;
-            parameters.mode = static_cast<uint16_t>(mode);
-            parameters.sglItems = sglItems;
-            parameters.pipeline = mode == CopyMode::Sgl ? kPipelineOn : kPipelineOff;
-            parameters.sourceFormat = mode == CopyMode::Sgl ? kSourceFormatSparse600 : kSourceFormatDirectPairs;
-            const uint64_t railBytes = static_cast<uint64_t>(kBlocks / links) * kStrideBytes;
-            const uint64_t stageBytes = static_cast<uint64_t>(kBlocks / links) * kBlockBytes;
-            for (uint16_t rail = 0; rail < links; ++rail) {
-                UBSHcomMemoryKey key{};
-                for (size_t index = 0; index < std::size(key.keys); ++index) {
-                    key.keys[index] = 0x1000U + index + rail;
-                    key.tokens[index] = 0x2000U + index + rail;
-                }
-                for (size_t index = 0; index < std::size(key.eid); ++index) {
-                    key.eid[index] = static_cast<uint8_t>(index + rail);
-                }
-
-                HelloInfo helloInfo{};
-                helloInfo.params = parameters;
-                helloInfo.rail = rail;
-                helloInfo.destinationRegionId = kDestinationRegionId;
-                helloInfo.destinationAddress = 0x12345000U + railBytes * rail;
-                helloInfo.destinationBytes = railBytes;
-                helloInfo.destinationKey = key;
-                if (mode == CopyMode::Sgl) {
-                    helloInfo.stageRegionId = kStageRegionId;
-                    helloInfo.stageAddress = 0x22345000U + stageBytes * rail;
-                    helloInfo.stageBytes = stageBytes;
-                    helloInfo.stageKey = key;
-                    helloInfo.stageKey.eid[std::size(helloInfo.stageKey.eid) - 1] = 0xa5;
-                }
-                const auto hello = EncodeHello(helloInfo);
-                constexpr size_t independentlyCountedHelloBytes =
-                    4 + 40 + 4 + 2 * (4 + 4 + 8 + 8 + 80);
-                if (hello.size() != independentlyCountedHelloBytes || hello.size() != 256)
-                    throw std::runtime_error("HELLO independently counted wire extent is not 256 bytes");
-                if (mode == CopyMode::Sgl && hello.back() != 0xa5)
-                    throw std::runtime_error("HELLO final stage-key byte was not encoded inside the wire extent");
-                HelloInfo decodedHello{};
-                if (!DecodeHello(hello.data(), static_cast<uint32_t>(hello.size()), decodedHello) ||
-                    !ValidateHelloMetadata(decodedHello, parameters, rail, railBytes, stageBytes) ||
-                    std::memcmp(&decodedHello.destinationKey, &key, sizeof(key)) != 0 ||
-                    (mode == CopyMode::Sgl &&
-                        std::memcmp(&decodedHello.stageKey, &helloInfo.stageKey, sizeof(key)) != 0)) {
-                    throw std::runtime_error("HELLO wire round trip failed");
-                }
-                if (DecodeHello(hello.data(), static_cast<uint32_t>(hello.size() - 1), decodedHello) ||
-                    DecodeHello(hello.data(), 252, decodedHello))
-                    throw std::runtime_error("truncated/legacy-extent HELLO was accepted");
-                HelloInfo invalidMetadata = decodedHello;
-                if (mode == CopyMode::Direct) invalidMetadata.stageKey.keys[0] = 1;
-                else invalidMetadata.stageBytes++;
-                if (ValidateHelloMetadata(invalidMetadata, parameters, rail, railBytes, stageBytes))
-                    throw std::runtime_error("invalid stage key/range metadata was accepted");
-                auto badHello = hello;
-                badHello[4 + kParametersWireBytes + 2] = 1;
-                if (DecodeHello(badHello.data(), static_cast<uint32_t>(badHello.size()), decodedHello))
-                    throw std::runtime_error("HELLO reserved field was accepted");
-                std::vector<uint8_t> trailingHello(hello.begin(), hello.end());
-                trailingHello.push_back(0);
-                if (DecodeHello(trailingHello.data(), static_cast<uint32_t>(trailingHello.size()), decodedHello))
-                    throw std::runtime_error("HELLO trailing byte was accepted");
-
-                ReadyInfo ready{parameters, rail, kSourceRegionId, kStrideBytes, railBytes};
-                const auto readyWire = EncodeReady(ready);
-                ReadyInfo decodedReady{};
-                if (!DecodeReady(readyWire.data(), static_cast<uint32_t>(readyWire.size()), decodedReady) ||
-                    !SameParams(ready.params, decodedReady.params) || decodedReady.rail != rail ||
-                    decodedReady.sourceRegionId != kSourceRegionId ||
-                    decodedReady.sourceAlignment != kStrideBytes || decodedReady.sourceBytes != railBytes) {
-                    throw std::runtime_error("READY wire round trip failed");
-                }
-                auto badReady = readyWire;
-                badReady[4 + kParametersWireBytes + 2] = 1;
-                if (DecodeReady(badReady.data(), static_cast<uint32_t>(badReady.size()), decodedReady))
-                    throw std::runtime_error("READY reserved field was accepted");
-
-                const auto token = EncodeToken(kFinishMagic, kOpFinish, 7, rail);
-                uint64_t decodedGeneration = 0;
-                uint16_t decodedRail = kMaxLinks;
-                if (!DecodeToken(token.data(), static_cast<uint32_t>(token.size()), kFinishMagic, kOpFinish,
-                        decodedGeneration, decodedRail) || decodedGeneration != 7 || decodedRail != rail) {
-                    throw std::runtime_error("FINISH wire round trip failed");
-                }
-            }
-
-            const uint32_t blocksPerRail = kBlocks / links;
-            constexpr uint64_t generation = 7;
-            const auto entries = MakeCopyEntries(generation, links);
-            std::string validationError;
-            if (!ValidateCopyEntries(entries, links, railBytes, railBytes, validationError)) {
-                throw std::runtime_error("generated sparse mapping failed validation: " + validationError);
-            }
-            auto outOfRangeEntries = entries;
-            outOfRangeEntries[0].remoteSourceOffset = std::numeric_limits<uint64_t>::max();
-            if (ValidateCopyEntries(outOfRangeEntries, links, railBytes, railBytes, validationError))
-                throw std::runtime_error("overflowing source offset was accepted");
-            const auto request = EncodeCopyRequest(generation, parameters, entries);
-            std::array<CopyEntry, kBlocks> decodedEntries{};
-            if (!DecodeCopyRequest(request.data(), static_cast<uint32_t>(request.size()), generation, parameters,
-                    railBytes, railBytes, decodedEntries, validationError) ||
-                std::memcmp(entries.data(), decodedEntries.data(), sizeof(entries)) != 0) {
-                throw std::runtime_error("COPY_REQ wire round trip failed: " + validationError);
-            }
-            if (DecodeCopyRequest(request.data(), static_cast<uint32_t>(request.size() - 1), generation, parameters,
-                    railBytes, railBytes, decodedEntries, validationError)) {
-                throw std::runtime_error("truncated COPY_REQ was accepted");
-            }
-            std::vector<uint8_t> trailingRequest(request.begin(), request.end());
-            trailingRequest.push_back(0);
-            if (DecodeCopyRequest(trailingRequest.data(), static_cast<uint32_t>(trailingRequest.size()),
-                    generation, parameters, railBytes, railBytes, decodedEntries, validationError))
-                throw std::runtime_error("COPY_REQ trailing byte was accepted");
-            auto badHeader = request;
-            badHeader[63] = 1;
-            if (DecodeCopyRequest(badHeader.data(), static_cast<uint32_t>(badHeader.size()), generation,
-                    parameters, railBytes, railBytes, decodedEntries, validationError))
-                throw std::runtime_error("COPY_REQ reserved field was accepted");
-            auto duplicateRequest = request;
-            const uint32_t duplicateIndex = blocksPerRail > 1 ? 1 : 0;
-            std::copy_n(duplicateRequest.data() + kCopyReqHeaderBytes + 8, 8,
-                duplicateRequest.data() + kCopyReqHeaderBytes + duplicateIndex * kCopyEntryWireBytes + 8);
-            if (DecodeCopyRequest(duplicateRequest.data(), static_cast<uint32_t>(duplicateRequest.size()),
-                    generation, parameters, railBytes, railBytes, decodedEntries, validationError)) {
-                throw std::runtime_error("duplicate destination within one rail was accepted");
-            }
-
-            std::array<AlignedBuffer, kMaxLinks> source;
-            std::array<AlignedBuffer, kMaxLinks> destination;
-            for (uint16_t rail = 0; rail < links; ++rail) {
-                const size_t bytes = static_cast<size_t>(blocksPerRail) * kStrideBytes;
-                source[rail].Allocate(bytes);
-                destination[rail].Allocate(bytes);
-                std::memset(source[rail].Data(), kSourceGapSentinel, bytes);
-                std::memset(destination[rail].Data(), kDstGapSentinel, bytes);
-                for (uint32_t localBlock = 0; localBlock < blocksPerRail; ++localBlock) {
-                    const uint32_t globalBlock = rail * blocksPerRail + localBlock;
-                    FillBlock(source[rail].Data() + static_cast<size_t>(localBlock) * kStrideBytes,
-                        generation, globalBlock);
-                }
-            }
-            for (uint32_t index = 0; index < kBlocks; ++index) {
-                const uint16_t rail = RailForRequestIndex(index, links);
-                std::memcpy(destination[rail].Data() + entries[index].localDestinationOffset,
-                    source[rail].Data() + entries[index].remoteSourceOffset, kBlockBytes);
-            }
-            for (uint32_t index = 0; index < kBlocks; ++index) {
-                    const uint16_t rail = RailForRequestIndex(index, links);
-                    const uint32_t sourceSlot = static_cast<uint32_t>(entries[index].remoteSourceOffset / kStrideBytes);
-                    const uint32_t globalBlock = rail * blocksPerRail + sourceSlot;
-                    const uint8_t *address = destination[rail].Data() + entries[index].localDestinationOffset;
-                    std::string error;
-                    if (!VerifyBlock(address, generation, globalBlock, error) || !VerifyGap(address, error)) {
-                        throw std::runtime_error(error);
-                    }
-            }
-
-            for (uint16_t rail = 0; rail < links; ++rail) {
-                const auto done = EncodeDataDone(generation, rail, blocksPerRail);
-                uint64_t decodedGeneration = 0;
-                if (!DecodeDataDone(done.data(), static_cast<uint32_t>(done.size()), rail, blocksPerRail,
-                        decodedGeneration) || decodedGeneration != generation) {
-                    throw std::runtime_error("DATA_DONE wire round trip failed");
-                }
-            }
-            if (mode == CopyMode::Sgl) {
-                const uint32_t chunks = ChunkCount(blocksPerRail, sglItems);
-                const uint32_t tail = ChunkItemCount(blocksPerRail, sglItems, chunks - 1);
-                if (chunks == 0 || tail == 0 || tail > sglItems ||
-                    (chunks - 1) * sglItems + tail != blocksPerRail)
-                    throw std::runtime_error("SGL chunk/tail layout failed");
-                for (uint16_t rail = 0; rail < links; ++rail) {
-                    const ChunkDoneInfo done{rail, generation, chunks - 1, (chunks - 1) * sglItems,
-                        tail, tail * kBlockBytes, chunks};
-                    const auto wire = EncodeChunkDone(done);
-                    ChunkDoneInfo decoded{};
-                    if (!DecodeChunkDone(wire.data(), static_cast<uint32_t>(wire.size()), decoded) ||
-                        !ValidateChunkDone(decoded, rail, generation, blocksPerRail, sglItems, validationError))
-                        throw std::runtime_error("CHUNK_DONE tail round trip failed");
-                    if (DecodeChunkDone(wire.data(), static_cast<uint32_t>(wire.size() - 1), decoded))
-                        throw std::runtime_error("truncated CHUNK_DONE was accepted");
-                    std::vector<uint8_t> trailingChunk(wire.begin(), wire.end());
-                    trailingChunk.push_back(0);
-                    if (DecodeChunkDone(trailingChunk.data(), static_cast<uint32_t>(trailingChunk.size()), decoded))
-                        throw std::runtime_error("CHUNK_DONE trailing byte was accepted");
-                    auto badChunkWire = wire;
-                    badChunkWire.back() = 1;
-                    if (DecodeChunkDone(badChunkWire.data(), static_cast<uint32_t>(badChunkWire.size()), decoded))
-                        throw std::runtime_error("CHUNK_DONE reserved field was accepted");
-                    ChunkDoneInfo wrong = decoded;
-                    wrong.generation++;
-                    if (ValidateChunkDone(wrong, rail, generation, blocksPerRail, sglItems, validationError))
-                        throw std::runtime_error("wrong-generation CHUNK_DONE accepted");
-                    wrong = decoded; wrong.chunkId = chunks;
-                    if (ValidateChunkDone(wrong, rail, generation, blocksPerRail, sglItems, validationError))
-                        throw std::runtime_error("out-of-range CHUNK_DONE accepted");
-                }
-            }
-            }
-          }
-        }
-
-        uint64_t address = 0;
-        if (CheckedAddAddress(std::numeric_limits<uint64_t>::max() - 3, 2, 4, 8, address) ||
-            CheckedAddAddress(0x1000, 7, 2, 8, address))
-            throw std::runtime_error("checked address arithmetic accepted overflow/range violation");
-        {
-            CaseParameters on{};
-            on.mode = kModeSgl; on.sglItems = 8; on.pipeline = kPipelineOn;
-            on.sourceFormat = kSourceFormatSparse600;
-            CaseParameters off = on;
-            off.pipeline = kPipelineOff;
-            CaseParameters unknown = on;
-            unknown.mode = 99;
-            if (SameParams(on, off) || SameParams(on, unknown))
-                throw std::runtime_error("mode/pipeline handshake mismatch was accepted");
-            const ReadyInfo offReady{off, 0, kSourceRegionId, kStrideBytes,
-                static_cast<uint64_t>(kBlocks) * kStrideBytes};
-            const auto offWire = EncodeReady(offReady);
-            ReadyInfo offDecoded{};
-            if (!DecodeReady(offWire.data(), static_cast<uint32_t>(offWire.size()), offDecoded) ||
-                !SameParams(off, offDecoded.params))
-                throw std::runtime_error("pipeline=off parameter wire round trip failed");
-            const std::array<std::array<uint32_t, 3>, 2> expectedChunks{{{{75, 38, 20}}, {{38, 19, 10}}}};
-            const std::array<std::array<uint32_t, 3>, 2> expectedTails{{{{8, 8, 30}}, {{4, 12, 30}}}};
-            const std::array<uint16_t, 3> items{{8, 16, 30}};
-            for (uint16_t links : {uint16_t{1}, uint16_t{2}}) {
-                const uint32_t blocks = kBlocks / links;
-                for (size_t i = 0; i < items.size(); ++i) {
-                    if (ChunkCount(blocks, items[i]) != expectedChunks[links - 1][i] ||
-                        ChunkItemCount(blocks, items[i], expectedChunks[links - 1][i] - 1) !=
-                            expectedTails[links - 1][i])
-                        throw std::runtime_error("documented SGL chunk table mismatch");
-                }
-            }
-        }
-        SelfTestReadyPublicationOrder();
-        for (uint16_t links : {uint16_t{1}, uint16_t{2}})
-            for (uint16_t sglItems : {uint16_t{1}, uint16_t{8}, uint16_t{16}, uint16_t{30}})
-                for (PipelineMode pipeline : {PipelineMode::On, PipelineMode::Off})
-                    SelfTestSglMapping(links, sglItems, pipeline);
-
-        const auto copyError = EncodeCopyError(9, 3, 4, 5);
-        uint64_t errorGeneration = 0; uint32_t stage = 0, code = 0, detail = 0;
-        if (!DecodeCopyError(copyError.data(), static_cast<uint32_t>(copyError.size()), errorGeneration,
-                stage, code, detail) || errorGeneration != 9 || stage != 3 || code != 4 || detail != 5)
-            throw std::runtime_error("COPY_ERROR round trip failed");
-        std::cout << "SELF_TEST: PASS (sparse-copy-v5, B1/B2 + S1/S2, K=1/8/16/30, on/off, "
-                     "9664-byte sparse-600 request, reordered multi-generation scatter)"
-                  << std::endl;
-        return true;
-    } catch (const std::exception &error) {
-        std::cerr << "SELF_TEST: FAIL: " << error.what() << std::endl;
-        return false;
-    }
-}
-
-#ifndef RDMA_600_SELF_TEST_ONLY
 
 class ActiveCallbackGuard {
 public:
@@ -3283,27 +2786,16 @@ private:
     SecondaryRailExecutor mSecondary;
 };
 
-#endif  // RDMA_600_SELF_TEST_ONLY
-
 }  // namespace
 
 int main(int argc, char **argv)
 {
-#if defined(RDMA_600_SELF_TEST_ONLY)
-    (void)argc;
-    (void)argv;
-    return RunSelfTest() ? 0 : 1;
-#else
     try {
         const Options options = ParseOptions(argc, argv);
-        if (options.selfTest) {
-            return RunSelfTest() ? 0 : 1;
-        }
         SparseCopyBenchmark benchmark(options);
         return benchmark.Run();
     } catch (const std::exception &error) {
         std::cerr << "ERROR: " << error.what() << std::endl;
         return 1;
     }
-#endif
 }

@@ -115,12 +115,12 @@ schema升5，case保留B1/B2，新增S1-K-on/off、S2-K-on/off。记录mode/K/pi
 
 verify性能字段null。合格measure要求统计有限正值、全部正确性和退出成功，记录sparse_copy avg/p50/p95/p99、有效GBps、block Mops、request GBps、wall。不同主机时间不能相减；不把网络与scatter重叠时间相加。源数据模式沿用基线verify逐代填、warmup/measure稳定种子，内容验证包含src重复、dst非顺序、gap和跨代复用。
 
-本地无需硬件的C++自测至少覆盖：
+阶段开发时的本地 C++ 验证曾要求覆盖（其内嵌入口及专用代码已于2026-09-16删除，以下仅保留设计/验证历史）：
 
 1. B1/B2、S1/S2，K1/8/16/30布局及尾chunk，on/off参数和wire round-trip；坏env/模式/握手不一致、截断/尾随/坏key范围和地址溢出。
 2. 任意合法600对映射；模拟stage gather→按chunk ready乱序，并调用与生产相同的scatter payload、固定起点scheduler及completion gate，比较direct参考结果；on/off完全一致，全部614400B和gap、重复source及重复dst拒绝。
 3. 就绪状态先收到慢rail之外的数据不提前完成；最后chunk、COPY_REQ callback延迟、错代/重复/越界通知不得提前返回；多代复用。
-4. 用当前真实公共头全文件受限语法检查和self-test-only运行，保存命令/结果，明确不是Linux真实库链接或硬件验证；不新增Python。
+4. 当时用当前真实公共头完成全文件受限语法检查和 self-test-only 运行并保存命令/结果；当前仅保留完整生产源码 `-fsyntax-only` 检查，仍明确不是Linux真实库链接或硬件验证；不新增Python。
 
 目标Linux/AArch64另行验收：真实头/静态库一致构建，两端20 verify；实际QP cap和WRITE/Send同QP、每chunk groupCount=1/num_sge/地址验证；双NIC计数各约半payload，NUMA/CPU/MTU记录；单rail延迟、断链、部分post失败、callback/scatter延迟；on/off独立trace；支持的8/16（30当前UNSUPPORTED）各5次1000 warmup+10000 measure。K1用于布局/边界和背压正确性，不作为必做性能主矩阵。不以本地mock声称DMA、NIC或性能通过。
 

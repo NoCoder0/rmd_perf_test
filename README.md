@@ -1,6 +1,6 @@
 # RDMA 600 × 1 KiB：direct 与阶段3 SGL 流水 scatter
 
-本分支 `duo_card_sgl` 在双 rail 固定线程 direct 基线上完成阶段3。local 是调用者、最终 destination/stage 拥有者和唯一主计时端；remote 拥有 sparse source 并发起 RDMA WRITE。状态为 `IMPLEMENTED / LOCAL_SELF_TEST_PASS / TARGET_BUILD_AND_HW_PENDING`，不能据本地检查声称 Linux 链接、真实 QP 顺序、双 NIC 或性能已通过。
+本分支 `duo_card_sgl` 在双 rail 固定线程 direct 基线上完成阶段3。local 是调用者、最终 destination/stage 拥有者和唯一主计时端；remote 拥有 sparse source 并发起 RDMA WRITE。状态为 `IMPLEMENTED / PRODUCTION_SYNTAX_PASS / HISTORICAL_LOCAL_SELF_TEST_PASS / TARGET_BUILD_AND_HW_PENDING`，不能据本地检查声称 Linux 链接、真实 QP 顺序、双 NIC 或性能已通过。
 
 协议统一为 `sparse-copy-v5-dual-rail-sgl`。HELLO 严格为256B（两个104B region descriptor），每次调用都在计时内生成、校验并发送 600 个 source/destination offset，COPY_REQ 始终为 9664B；成功路径没有 round ACK。
 
@@ -9,16 +9,15 @@
 - `RDMA_600_SGL_ITEMS`：严格十进制 1..30，默认 16。当前公共头 `NET_SGE_MAX_IOV=16`，因此 K=30 明确报 `UNSUPPORTED`，不会静默降为 16。
 - `RDMA_600_QP_MAX_SEND_SGE`：每 rail 一个正整数的外部声明，例如 `16,16`。它只登记部署时对真实已创建 QP 的 query 结果来源，不是自动查询。SGL measure 缺失该声明会拒绝；verify/trace 可运行但结果标 `QP_CAP_PENDING`。
 
-## 构建与本地自测
+## 构建
 
 目标 Linux/RDMA 主机：
 
 ```bash
 bash ./build.sh --ubs-root /absolute/path/to/ubs-comm
-./build/rdma_600 --self-test
 ```
 
-本地 self-test 不连接 NIC，覆盖 v5 HELLO 的独立256B/末尾key/截断边界、READY/COPY_REQ/CHUNK_DONE、严格参数、K=1/8/16/30 尾 chunk、direct 映射、生产共用 SGL on/off scheduler/scatter/completion gate、固定起点完整扫描、重复 source、destination 唯一/gap、错代/重复/越界通知、慢尾chunk、乱序多代、observer-before-ready 和延迟 COPY_REQ callback。
+阶段开发时曾以内嵌 C++ self-test 完成协议、映射、调度和边界回归，证据保留在 `STAGE3_REPORT_CN.md`；该宏、CLI 入口和专用测试代码已于2026-09-16删除，当前程序只提供真实 local/remote RDMA 运行模式。无硬件检查使用真实公共头对完整生产源码执行 `-fsyntax-only`。
 
 ## 启动示例
 

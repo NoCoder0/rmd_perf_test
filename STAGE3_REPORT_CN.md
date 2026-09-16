@@ -1,6 +1,6 @@
 # 阶段3 SGL＋流水 scatter 实现报告
 
-日期：2026-09-14。状态：`IMPLEMENTED / LOCAL_SELF_TEST_PASS / TARGET_BUILD_AND_HW_PENDING`。
+日期：2026-09-14；2026-09-16更新。状态：`IMPLEMENTED / PRODUCTION_SYNTAX_PASS / HISTORICAL_LOCAL_SELF_TEST_PASS / TARGET_BUILD_AND_HW_PENDING`。
 
 ## 1. Git 与范围
 
@@ -16,13 +16,13 @@
 2. v5 wire：新协议/magic/version；Parameters 40B、HELLO 256B、READY 64B、COPY_REQ 9664B、CHUNK_DONE 40B。HELLO 的 destination/stage descriptor 都是 `4+4+8+8+80=104B`，Encode/Decode 均检查最终 cursor==buffer end；252B 旧边界、截断和尾随均拒绝。direct 与 SGL 同用 v5；600 source＋600 destination offset 始终在请求内。所有整数显式大端编码，精确长度、reserved、mode/K/format/stage/rail/generation/chunk 元数据均校验。
 3. stage 与 SGL：仅 local/SGL 在各 rail 固定 app 线程分配、触页、注册 `R*1024` stage，并在 HELLO 导出完整 key。remote 按请求索引分 rail，以 `source_base+src_offset` 为本地 SGE、`peer_stage_base+(first+j)*1024` 为连续远端地址；每 chunk 一个 PutV。
 4. 同 QP 通知：每个 PutV 成功返回后立即在同一 channel 发送该 chunk 独立、稳定存储的 CHUNK_DONE；不等待 PutV callback，不批量发送。实际唯一 QP 与 WRITE→SEND 顺序仍需目标机 verbs 证据。
-5. scatter 与原子状态：local 在 COPY_REQ 前 release 发布 expected generation；handler 完整校验后以 CAS 把 ready 槽独占为不可消费哨兵，trace observer 成功后才 release 发布 generation；重复/并发通知不进入 observer，不覆盖已有 trace。measure 的短路分支不读取逐 chunk 时钟。主线程 acquire 后 scatter；ready 不清零，consumed 独立记录 generation。on 每轮以固定起点完整扫描，扫描结束才轮转下轮起点；off 等齐后也调用生产共用 scheduler/scatter payload。累计每256个检查单元执行 fatal/deadline checkpoint，包含有进展的扫描。生产完成条件与自测共用 `SglCompletionReached`，必须同时满足全部 chunk scatter 和 COPY_REQ callback。
+5. scatter 与原子状态：local 在 COPY_REQ 前 release 发布 expected generation；handler 完整校验后以 CAS 把 ready 槽独占为不可消费哨兵，trace observer 成功后才 release 发布 generation；重复/并发通知不进入 observer，不覆盖已有 trace。measure 的短路分支不读取逐 chunk 时钟。主线程 acquire 后 scatter；ready 不清零，consumed 独立记录 generation。on 每轮以固定起点完整扫描，扫描结束才轮转下轮起点；off 等齐后也调用同一 scheduler/scatter payload。累计每256个检查单元执行 fatal/deadline checkpoint，包含有进展的扫描。生产完成条件由 `SglCompletionReached` 统一判断，必须同时满足全部 chunk scatter 和 COPY_REQ callback。
 6. 生命周期与失败：remote pending/active 分离；每 rail iov、PutV request、每 chunk 通知和 active entries 在 data/Send callbacks 全回收前不复用。attempted 在 API 调用前登记，允许 callback 早于返回；失败不 delete/retry callback。不能 drain/quiesce 时保留 `_Exit` 安全边界。成功 JSON 移到 FINISH、drain、teardown、固定线程退出之后。
 7. deadline/result/trace：每次 local SparseCopy 从入口 t0 派生一个绝对 deadline，覆盖地址生成/校验/编码、请求 post、ready、scatter和请求 callback；direct 同步修正。schema=5 记录 mode/K/pipeline、地址与请求成本、stage/chunk、预期 PutV/WRITE/通知、cap 来源/未知边界和构建身份。measure 不采 chunk trace；独立 trace 记录 ready/scatter begin/end 与 remote PutV/通知 post。
 
-## 3. 本地 C++ 自测
+## 3. 阶段性本地 C++ 自测（历史证据，入口已删除）
 
-Windows 编译器：`C:/msys64/ucrt64/bin/g++.exe`，版本 `15.2.0`。ignored `build/stage3_compat/` 只提供 Windows 缺少的 Linux/securec 声明和两个 wrapper；HCOM 类型、`UBSHcomOneSideSglRequest`、`PutV` 及 `NET_SGE_MAX_IOV` 来自当前真实公共头。兼容文件和 exe 不提交。
+Windows 编译器：`C:/msys64/ucrt64/bin/g++.exe`，版本 `15.2.0`。ignored `build/stage3_compat/` 只提供 Windows 缺少的 Linux/securec 声明和两个 wrapper；HCOM 类型、`UBSHcomOneSideSglRequest`、`PutV` 及 `NET_SGE_MAX_IOV` 来自当前真实公共头。以下命令与结果是2026-09-14阶段性验证的真实证据；`RDMA_600_SELF_TEST_ONLY`、`--self-test`、`RunSelfTest/SelfTest*` 及相关专用源码已于2026-09-16删除，不应再运行该命令。
 
 自测专用编译并运行：
 

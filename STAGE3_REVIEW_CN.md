@@ -38,6 +38,8 @@ declared=252 encoded_fields=256 accepted=1 consumed_outside_wire=1
 
 本次不把源码审阅和本地模拟等同Linux/AArch64链接或双机RDMA。实际QP cap、WRITE与通知同真实QP、DMA可见性、双NIC流量、部分post错误/库callback重试、TLS缓存与多service契约及性能仍需目标机证据。当前共享库16项上限下K30为UNSUPPORTED，外部cap声明不等于自动查询结果。
 
+2026-09-16代码清理说明：本文件中的 self-test 叙述均是独立检视当时的真实历史证据。后续已删除 `RDMA_600_SELF_TEST_ONLY`、`--self-test`、`RunSelfTest/SelfTest*` 及专用源码；生产使用的 HELLO 校验、ready publication helper、scatter/scheduler、all-ready/completion gate 保留不变。
+
 ## 回修与最终复核
 
 原实现会话已按本文件要求完成回修：HELLO 保留 reserved 并统一为256B，Encode/Decode 校验最终 cursor；新增独立字段计数、末尾非零 key、252/255/尾随边界测试。CHUNK_DONE 改为原子哨兵独占槽位，在可消费 generation 前运行 trace observer，重复通知不进入 observer；measure 短路不采时间。生产与 self-test 共用 ready 发布、固定起点完整扫描 scheduler、scatter payload、all-ready/completion gate，并覆盖慢 rail/末尾 chunk、乱序两代及 callback 延迟。流水有无进展均累计检查单元，每256个调用 fatal/deadline checkpoint。

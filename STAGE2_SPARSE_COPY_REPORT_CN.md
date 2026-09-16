@@ -25,7 +25,7 @@
 
 1. `git diff --check`：最终复核见交付摘要。
 2. 使用当前 ubs-comm 公共头的 Windows/MSYS2 受限全文件语法检查：PASS。临时兼容层只补本机缺少的 Linux 声明，未进入目标 worktree。
-3. 以 `RDMA_600_SELF_TEST_ONLY` 编译并运行：PASS。覆盖 B1/B2 wire round-trip、截断拒绝、每 rail destination 重复拒绝、非顺序映射、DATA_DONE 和数据/gap 校验。
+3. 阶段2当时以 `RDMA_600_SELF_TEST_ONLY` 编译并运行：PASS。覆盖 B1/B2 wire round-trip、截断拒绝、每 rail destination 重复拒绝、非顺序映射、DATA_DONE 和数据/gap 校验；该宏、CLI入口和专用源码已于2026-09-16从当前程序删除，本条仅保留历史证据。
 
 这些检查不等于目标 Linux/AArch64 构建，更不能证明 RDMA 硬件正确性。
 
@@ -38,4 +38,3 @@
 - HCOM 同协议多 Service 的目标机行为；B2 仍是诊断穿刺。
 
 因此本报告不提供迁移后 B2 性能数字。旧 `38e6637` sender-driven 数据和 main 单卡数据只作历史背景，不能作为双 rail 收益。
-
