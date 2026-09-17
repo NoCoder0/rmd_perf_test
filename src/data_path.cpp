@@ -23,7 +23,9 @@ bool ValidateCopyEntries(const std::vector<CopyEntry> &entries, const CaseParame
     uint64_t sourceBytesPerRail, uint64_t destinationBytesPerRail, std::string &error)
 {
     if (entries.size() != params.blocks) { error = "entry count mismatch"; return false; }
-    std::array<std::array<bool, kMaxBlocksPerRail>, kMaxLinks> destinationsSeen{};
+    // Keep validation inside each request, with one bit per destination slot.
+    constexpr size_t wordsPerRail = (kMaxBlocksPerRail + 63U) / 64U;
+    std::array<std::array<uint64_t, wordsPerRail>, kMaxLinks> destinationsSeen{};
     for (uint32_t index = 0; index < params.blocks; ++index) {
         const uint16_t rail = RailForRequestIndex(index, params);
         const CopyEntry &entry = entries[index];
@@ -39,8 +41,10 @@ bool ValidateCopyEntries(const std::vector<CopyEntry> &entries, const CaseParame
             error = "destination offset unaligned/out of range at request " + std::to_string(index); return false;
         }
         const size_t slot = static_cast<size_t>(entry.localDestinationOffset / kStrideBytes);
-        if (destinationsSeen[rail][slot]) { error = "duplicate destination slot"; return false; }
-        destinationsSeen[rail][slot] = true;
+        uint64_t &word = destinationsSeen[rail][slot / 64U];
+        const uint64_t mask = uint64_t{1} << (slot % 64U);
+        if ((word & mask) != 0) { error = "duplicate destination slot"; return false; }
+        word |= mask;
     }
     return true;
 }

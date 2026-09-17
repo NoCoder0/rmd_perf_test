@@ -1,5 +1,7 @@
 # 实施进度
 
+> 2026-09-17后续：已完成独立C++模块拆分（纯拆分提交 `bbf59d7`）及measure开销审计；仅落地目标去重位图优化，通知协议和调度保持v6。拆分检查见 [MODULARIZATION_REPORT_CN.md](MODULARIZATION_REPORT_CN.md)，优化证据、库日志/trace和硬件A/B计划见 [MEASURE_AUDIT_CN.md](MEASURE_AUDIT_CN.md)。目标Linux构建和RDMA性能仍待验证。
+
 > 2026-09-17更新：当前已实现v6批量case，默认100～9600/步长100，1024B与656B，每case 100 warmup/1000 measure。现行规范和验证见 [BATCH_DESIGN_CN.md](BATCH_DESIGN_CN.md)、[BATCH_REPORT_CN.md](BATCH_REPORT_CN.md) 及 [README.md](README.md)。下文的固定600/v5描述保留为阶段3历史基线。
 
 
