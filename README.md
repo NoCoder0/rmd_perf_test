@@ -4,6 +4,8 @@
 
 当前状态：`IMPLEMENTED / LOCAL_CPP_VALIDATION_PASS / TARGET_BUILD_AND_HW_PENDING`。本地检查不代表Linux链接、QP/DMA顺序、双NIC路由或真实性能通过。设计见 [BATCH_DESIGN_CN.md](BATCH_DESIGN_CN.md)，验证见 [BATCH_REPORT_CN.md](BATCH_REPORT_CN.md)。
 
+源码已按local、remote、传输、协议、配置、数据路径和结果输出拆至 `src/`；入口保留在 `rdma_600.cpp`。职责映射与独立编译单元回归记录见 [MODULARIZATION_REPORT_CN.md](MODULARIZATION_REPORT_CN.md)。
+
 ## 默认矩阵与配置
 
 默认先运行全部1024B case，再运行全部656B case；每种长度遍历块数100、200、…、9600，共192个case。每case默认 **20 verify、100 warmup、1000 measure**。连接、source/destination MR、SGL stage及最大请求存储只建立一次，所有case复用。每case独立清空样本、校验并在所有rail安全完成后切换。

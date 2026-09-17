@@ -77,7 +77,18 @@ else()
     endif()
 endif()
 
-add_executable(rdma_600 rdma_600.cpp)
+add_executable(rdma_600
+    rdma_600.cpp
+    src/config.cpp
+    src/support.cpp
+    src/protocol.cpp
+    src/data_path.cpp
+    src/benchmark.cpp
+    src/local.cpp
+    src/remote.cpp
+    src/control.cpp
+    src/transport.cpp
+    src/results.cpp)
 target_compile_features(rdma_600 PRIVATE cxx_std_17)
 target_compile_options(rdma_600 PRIVATE -Wall -Wextra -Wpedantic -Werror=return-type)
 target_compile_definitions(rdma_600 PRIVATE
