@@ -26,14 +26,15 @@
     "app_cpus": [2, 5],
     "worker_cpus": [3, 4]
   },
+  "matrix": {"block_start": 100, "block_end": 9600, "block_step": 100, "block_bytes": [1024, 656], "case_count": 192},
   "direct": {
     "cases": {
       "B1": {"links": 1},
       "B2": {"links": 2}
     },
     "verify_rounds": 20,
-    "warmup_rounds": 1000,
-    "measure_rounds": 10000,
+    "warmup_rounds": 100,
+    "measure_rounds": 1000,
     "trace_rounds": 32,
     "timeout_sec": 10,
     "process_timeout_sec": 600
@@ -49,8 +50,8 @@
     },
     "current_k30_status": "UNSUPPORTED: public/library cap is 16",
     "verify_rounds": 20,
-    "warmup_rounds": 1000,
-    "measure_rounds": 10000,
+    "warmup_rounds": 100,
+    "measure_rounds": 1000,
     "trace_rounds": 32,
     "timeout_sec": 10,
     "hardware_status": "TARGET_BUILD_AND_HW_PENDING"

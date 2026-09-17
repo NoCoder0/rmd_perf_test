@@ -1,5 +1,8 @@
 # 阶段3实施与目标机验收计划
 
+> 2026-09-17更新：当前已实现v6批量case，默认100～9600/步长100，1024B与656B，每case 100 warmup/1000 measure。现行规范和验证见 [BATCH_DESIGN_CN.md](BATCH_DESIGN_CN.md)、[BATCH_REPORT_CN.md](BATCH_REPORT_CN.md) 及 [README.md](README.md)。下文的固定600/v5描述保留为阶段3历史基线。
+
+
 更新日期：2026-09-14。
 
 ## 已完成实现

@@ -1,5 +1,8 @@
 # 阶段3：SGL gather + 流水 scatter 设计
 
+> 2026-09-17更新：当前已实现v6批量case，默认100～9600/步长100，1024B与656B，每case 100 warmup/1000 measure。现行规范和验证见 [BATCH_DESIGN_CN.md](BATCH_DESIGN_CN.md)、[BATCH_REPORT_CN.md](BATCH_REPORT_CN.md) 及 [README.md](README.md)。下文的固定600/v5描述保留为阶段3历史基线。
+
+
 日期：2026-09-14。状态：DESIGN_COMPLETE；实现已落地，见 `STAGE3_REPORT_CN.md`。硬件能力与性能仍未验收。
 
 ## 1. 精确基线、文档及范围
