@@ -12,7 +12,7 @@ measure开销、HCOM日志/trace实际控制条件、已验证的去重位图优
 
 ## 默认矩阵与配置
 
-默认先运行全部1024B case，再运行全部656B case；每种长度按顺序遍历块数 **100、200、400、600、800、1200、1600、2400、4800、6400、9600**，共 **22个case**。每case默认 **20 verify、100 warmup、1000 measure**。连接、source/destination MR、SGL stage及最大请求存储只建立一次，所有case复用。每case独立清空样本、校验并在所有rail安全完成后切换。
+默认先运行全部1024B case，再运行全部656B case；每种长度按顺序遍历块数 **100、200、400、600、800、1200、1600、2400、3200、4800、6400、9600**，共 **24个case**。每case默认 **20 verify、100 warmup、1000 measure**。连接、source/destination MR、SGL stage及最大请求存储只建立一次，所有case复用。每case独立清空样本、校验并在所有rail安全完成后切换。
 
 | 参数 | 含义 |
 |---|---|
@@ -42,7 +42,7 @@ SGL measure要求`RDMA_600_QP_MAX_SEND_SGE=<cap0[,cap1]>`，每rail一项，且�
 
 ## 启动
 
-先启动remote，随后local。以下是一条固定S2/K16/on配置的默认22-case measure。示例IP/CPU须替换为实际环境，QP cap必须来自实际证据。两个app CPU互不相同、两个worker CPU互不相同、任何app与worker不能重合。
+先启动remote，随后local。以下是一条固定S2/K16/on配置的默认24-case measure。示例IP/CPU须替换为实际环境，QP cap必须来自实际证据。两个app CPU互不相同、两个worker CPU互不相同、任何app与worker不能重合。
 
 remote：
 
