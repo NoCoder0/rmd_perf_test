@@ -1,5 +1,7 @@
 # 实施进度
 
+> 2026-09-18默认矩阵调整：块数改为100、200、400、600、800、1200、1600、2400、4800、6400、9600，分别运行1024B和656B，共22个case；显式列表及范围扫描保留。下文192-case默认矩阵属于历史记录。
+
 > 2026-09-18：请求rail0服务段扩为256KiB，v7当前N≤9600每轮COPY_REQ均一次Send；依据、内存成本、依赖外部修改状态及验证见 [LARGE_REQUEST_REPORT_CN.md](LARGE_REQUEST_REPORT_CN.md)。以下v6与cap16结论保留为对应日期的历史记录。
 
 > 2026-09-17后续：已完成独立C++模块拆分（纯拆分提交 `bbf59d7`）及measure开销审计；仅落地目标去重位图优化，通知协议和调度保持v6。拆分检查见 [MODULARIZATION_REPORT_CN.md](MODULARIZATION_REPORT_CN.md)，优化证据、库日志/trace和硬件A/B计划见 [MEASURE_AUDIT_CN.md](MEASURE_AUDIT_CN.md)。目标Linux构建和RDMA性能仍待验证。

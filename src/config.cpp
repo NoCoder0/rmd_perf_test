@@ -172,6 +172,7 @@ void PrintUsage(std::ostream &stream)
            << "         --app-cpus <cpu0[,cpu1]> --worker-cpus <cpu0[,cpu1]>\n"
            << "         --blocks N[,N...] OR --block-start 100 --block-end 9600 --block-step 100\n"
            << "         --block-bytes 1024,656 (default; one length selects a single scenario)\n"
+           << "Default blocks: 100,200,400,600,800,1200,1600,2400,4800,6400,9600 (22 cases with both lengths).\n"
            << "Default: complete count list for each length; per case verify=20 warmup=100 measure=1000.\n"
            << "Single case: --blocks 600 --block-bytes 1024. Connections/MRs reused across cases.\n"
            << "B2 uses two persistent rail-affine application threads; each app CPU must be distinct.\n";
@@ -228,12 +229,14 @@ Options ParseOptions(int argc, char **argv)
             throw std::runtime_error("--blocks cannot be combined with block range options");
         for (const auto &item : SplitCsv("--blocks", values.at("--blocks")))
             options.blockCounts.push_back(static_cast<uint32_t>(ParseStrictDecimal("--blocks", item, 100, kMaxBlocks)));
-    } else {
+    } else if (values.count("--block-start") || values.count("--block-end") || values.count("--block-step")) {
         const uint32_t first = static_cast<uint32_t>(ParseStrictDecimal("--block-start", optional("--block-start", "100"), 100, kMaxBlocks));
         const uint32_t last = static_cast<uint32_t>(ParseStrictDecimal("--block-end", optional("--block-end", "9600"), 100, kMaxBlocks));
         const uint32_t step = static_cast<uint32_t>(ParseStrictDecimal("--block-step", optional("--block-step", "100"), 1, kMaxBlocks));
         if (last < first) throw std::runtime_error("--block-end must be >= --block-start");
         for (uint32_t count = first; count <= last; count += step) options.blockCounts.push_back(count);
+    } else {
+        options.blockCounts = {100, 200, 400, 600, 800, 1200, 1600, 2400, 4800, 6400, 9600};
     }
     for (const auto &item : SplitCsv("--block-bytes", optional("--block-bytes", "1024,656"))) {
         const auto bytes = static_cast<uint32_t>(ParseStrictDecimal("--block-bytes", item, 656, 1024));

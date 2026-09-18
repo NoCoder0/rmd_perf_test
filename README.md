@@ -12,12 +12,12 @@ measure开销、HCOM日志/trace实际控制条件、已验证的去重位图优
 
 ## 默认矩阵与配置
 
-默认先运行全部1024B case，再运行全部656B case；每种长度遍历块数100、200、…、9600，共192个case。每case默认 **20 verify、100 warmup、1000 measure**。连接、source/destination MR、SGL stage及最大请求存储只建立一次，所有case复用。每case独立清空样本、校验并在所有rail安全完成后切换。
+默认先运行全部1024B case，再运行全部656B case；每种长度按顺序遍历块数 **100、200、400、600、800、1200、1600、2400、4800、6400、9600**，共 **22个case**。每case默认 **20 verify、100 warmup、1000 measure**。连接、source/destination MR、SGL stage及最大请求存储只建立一次，所有case复用。每case独立清空样本、校验并在所有rail安全完成后切换。
 
 | 参数 | 含义 |
 |---|---|
 | `--blocks 100,601,9600` | 按给定顺序运行块数列表；每项100～9600，支持奇数，不允许重复 |
-| `--block-start 100 --block-end 9600 --block-step 100` | 默认扫描；end为包含上界，不强行加入未被步长命中的end；不能与`--blocks`并用 |
+| `--block-start 100 --block-end 9600 --block-step 100` | 显式范围扫描；提供任一范围参数即启用，未提供的start/end/step分别取100/9600/100；end为包含上界，不强行加入未被步长命中的end；不能与`--blocks`并用 |
 | `--block-bytes 1024,656` | 默认两种真实块长，也可只选1024或656；按长度列表顺序遍历完整块数列表 |
 | `--warmup 100 --rounds 1000 --verify-rounds 20` | 每case轮数，可覆盖默认；verify必须大于0，measure的rounds必须大于0 |
 | `--mode direct --links 1或2` | B1/B2，N个普通Put，无scatter，K=0，不接受`--pipeline` |
@@ -42,7 +42,7 @@ SGL measure要求`RDMA_600_QP_MAX_SEND_SGE=<cap0[,cap1]>`，每rail一项，且�
 
 ## 启动
 
-先启动remote，随后local。以下是一条固定S2/K16/on配置的默认192-case measure。示例IP/CPU须替换为实际环境，QP cap必须来自实际证据。两个app CPU互不相同、两个worker CPU互不相同、任何app与worker不能重合。
+先启动remote，随后local。以下是一条固定S2/K16/on配置的默认22-case measure。示例IP/CPU须替换为实际环境，QP cap必须来自实际证据。两个app CPU互不相同、两个worker CPU互不相同、任何app与worker不能重合。
 
 remote：
 
