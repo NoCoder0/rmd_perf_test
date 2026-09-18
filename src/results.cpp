@@ -19,7 +19,7 @@ bool SparseCopyBenchmark::PublishCallbackTrace(uint64_t generation, TracePoint &
 void SparseCopyBenchmark::EmitTracePoint(const char *event, uint64_t generation, int rail, const TracePoint &point,
     int chunk) const
 {
-    std::cout << "{\"record_type\":\"trace\",\"trace_schema\":\"sparse-copy-v6-batch-fragmented-v1\","
+    std::cout << "{\"record_type\":\"trace\",\"trace_schema\":\"sparse-copy-v7-large-request-v1\","
               << "\"host_role\":\"" << RoleName(mOptions.role) << "\",\"case\":\""
               << CaseName(mOptions.mode, mOptions.links, mOptions.sglItems, mOptions.pipeline)
               << "\",\"case_index\":" << mCaseIndex + 1 << ",\"blocks\":" << mParams.blocks
@@ -76,7 +76,7 @@ std::string SparseCopyBenchmark::FormatLocalResult() const
 {
     std::ostringstream out;
     out << std::fixed << std::setprecision(3)
-        << "{\"schema_version\":6,\"protocol\":\"sparse-copy-v6-batch-fragmented\""
+        << "{\"schema_version\":7,\"protocol\":\"sparse-copy-v7-large-request\""
         << ",\"measurement\":\"local-sparse-copy\",\"role\":\"local\",\"status\":\"ok\",\"case_index\":" << mCaseIndex + 1
         << ",\"case_count\":" << mCases.size() << ",\"case\":\""
         << CaseName(mOptions.mode, mOptions.links, mOptions.sglItems, mOptions.pipeline)
@@ -97,6 +97,9 @@ std::string SparseCopyBenchmark::FormatLocalResult() const
         << ",\"request_logical_bytes\":" << mParams.RequestBytes()
         << ",\"request_transport_payload_bytes\":" << mParams.RequestBytes() + mParams.Fragments() * kFragmentHeaderBytes
         << ",\"request_send_calls_per_round\":" << mParams.Fragments()
+        << ",\"request_fragment_data_capacity\":" << kFragmentDataBytes
+        << ",\"request_service_segment_bytes\":" << kRequestServiceMessageBytes
+        << ",\"control_service_segment_bytes\":" << kControlServiceMessageBytes
         << ",\"stage_active_bytes\":" << (mOptions.mode == CopyMode::Sgl ? mParams.PayloadBytes() : 0)
         << ",\"stage_registered_bytes\":" << (mOptions.mode == CopyMode::Sgl ? mMaxStageBytes * mOptions.links : 0)
         << ",\"sparse_registered_bytes\":" << static_cast<uint64_t>(mMaxRailBlocks) * kStrideBytes * mOptions.links
@@ -182,7 +185,7 @@ void SparseCopyBenchmark::PrintBatchResult() const
 void SparseCopyBenchmark::PrintRemoteStatus() const
 {
     std::ostringstream out;
-    out << "{\"schema_version\":6,\"protocol\":\"sparse-copy-v6-batch-fragmented\",\"case\":\""
+    out << "{\"schema_version\":7,\"protocol\":\"sparse-copy-v7-large-request\",\"case\":\""
         << CaseName(mOptions.mode, mOptions.links, mOptions.sglItems, mOptions.pipeline)
         << "\",\"role\":\"remote\",\"status\":\"ok\",\"commit\":\""
         << RDMA_600_GIT_COMMIT << "\",\"build_type\":\"" << RDMA_600_BUILD_TYPE

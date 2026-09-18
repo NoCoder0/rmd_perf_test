@@ -102,7 +102,8 @@ void SparseCopyBenchmark::SetupRail(uint16_t rail)
     RailState &state = mRails[rail];
     state.serviceName = "rdma600_" + RoleName(mOptions.role) + "_" + std::to_string(rail);
     UBSHcomServiceOptions options{};
-    options.maxSendRecvDataSize = 16384;
+    // COPY_REQ travels only on rail 0; other rails carry small control messages.
+    options.maxSendRecvDataSize = rail == 0 ? kRequestServiceMessageBytes : kControlServiceMessageBytes;
     options.workerGroupThreadCount = 1;
     options.workerGroupMode = ock::hcom::NET_BUSY_POLLING;
     if (mOptions.workerCpus[rail] >= 0) {

@@ -77,9 +77,9 @@ using ock::hcom::UBSHcomServiceProtocol;
 using ock::hcom::UBSHcomTlsOptions;
 using ock::hcom::UBSHcomTwoSideThreshold;
 
-// Version 6 deliberately rejects every older direct or sender-driven wire
-// format. Direct and SGL use the same parameterized protocol.
-constexpr uint16_t kProtocolVersion = 6;
+// Version 7 changes COPY_REQ fragment capacity; reject v6 during negotiation
+// before either peer can send a request exceeding the other's receive buffer.
+constexpr uint16_t kProtocolVersion = 7;
 constexpr uint16_t kMaxLinks = 2;
 constexpr uint32_t kMaxBlocks = 9600;
 constexpr uint32_t kMaxBlocksPerRail = kMaxBlocks;
@@ -144,7 +144,12 @@ constexpr size_t kCopyEntryWireBytes = 16;
 constexpr size_t kMaxCopyReqDescriptorBytes = static_cast<size_t>(kMaxBlocks) * kCopyEntryWireBytes;
 constexpr size_t kMaxCopyReqWireBytes = kCopyReqHeaderBytes + kMaxCopyReqDescriptorBytes;
 constexpr uint32_t kFragmentHeaderBytes = 32;
-constexpr uint32_t kFragmentDataBytes = 16000;
+constexpr uint32_t kRequestServiceMessageBytes = 256U * 1024U;
+constexpr uint32_t kControlServiceMessageBytes = 16U * 1024U;
+// HCOM's segment includes its transport header. TLS and internal split/RNDV
+// are disabled in this benchmark; reserve the actual public-header size.
+constexpr uint32_t kFragmentDataBytes = kRequestServiceMessageBytes -
+    sizeof(ock::hcom::UBSHcomNetTransHeader) - kFragmentHeaderBytes;
 constexpr uint32_t kFragmentWireBytes = kFragmentHeaderBytes + kFragmentDataBytes;
 constexpr uint32_t kMaxFragments = (kMaxCopyReqWireBytes + kFragmentDataBytes - 1) / kFragmentDataBytes;
 constexpr uint16_t kOpMatrix = 708;
@@ -162,7 +167,11 @@ constexpr size_t kChunkDoneWireBytes = 40;
 
 static_assert(kHelloWireBytes == 256, "HELLO wire size must include both complete region descriptors");
 static_assert(kReadyWireBytes == 64, "READY wire size is fixed");
-static_assert(kFragmentWireBytes <= 16384, "fragment must fit the service message capacity");
+static_assert(kFragmentWireBytes + sizeof(ock::hcom::UBSHcomNetTransHeader) <= kRequestServiceMessageBytes,
+    "fragment and HCOM header must fit the service segment");
+static_assert(kMaxCopyReqWireBytes <= kFragmentDataBytes, "current matrix must fit one COPY_REQ Send");
+static_assert(kHelloWireBytes + sizeof(ock::hcom::UBSHcomNetTransHeader) <= kControlServiceMessageBytes,
+    "control messages must fit the smaller service segment");
 static_assert(kChunkDoneWireBytes == 40, "CHUNK_DONE wire size is fixed");
 
 enum class Role { Local, Remote };

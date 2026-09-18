@@ -1,12 +1,14 @@
 # RDMA sparse_copy：可配置块数/块长与连接复用批量测试
 
-在 `duo_card_sgl` 分支阶段3上扩展。local拥有最终destination/stage并统计完整请求往返和scatter；remote拥有稀疏source并发起WRITE。协议升级为 `sparse-copy-v6-batch-fragmented`，两端必须使用同版二进制，不能混用v5、duo或main的旧程序。
+在 `duo_card_sgl` 分支阶段3上扩展。local拥有最终destination/stage并统计完整请求往返和scatter；remote拥有稀疏source并发起WRITE。当前协议为 `sparse-copy-v7-large-request`，两端必须使用同版二进制，不能混用v6、v5、duo或main的旧程序。
 
 当前状态：`IMPLEMENTED / LOCAL_CPP_VALIDATION_PASS / TARGET_BUILD_AND_HW_PENDING`。本地检查不代表Linux链接、QP/DMA顺序、双NIC路由或真实性能通过。设计见 [BATCH_DESIGN_CN.md](BATCH_DESIGN_CN.md)，验证见 [BATCH_REPORT_CN.md](BATCH_REPORT_CN.md)。
 
 源码已按local、remote、传输、协议、配置、数据路径和结果输出拆至 `src/`；入口保留在 `rdma_600.cpp`。职责映射与独立编译单元回归记录见 [MODULARIZATION_REPORT_CN.md](MODULARIZATION_REPORT_CN.md)。
 
 measure开销、HCOM日志/trace实际控制条件、已验证的去重位图优化及尚未实施的CHUNK_DONE合并A/B方案见 [MEASURE_AUDIT_CN.md](MEASURE_AUDIT_CN.md)。当前没有硬件加速比结论。
+
+2026-09-18：COPY_REQ所在rail 0服务段从16KiB扩大到256KiB，当前N≤9600均一次Send。ubs-comm限制依据、发送池内存成本与验证见 [LARGE_REQUEST_REPORT_CN.md](LARGE_REQUEST_REPORT_CN.md)；此前批量/审计报告中的16000B和10片数据属于v6历史基线。
 
 ## 默认矩阵与配置
 
@@ -32,7 +34,7 @@ mode、links、K、pipeline在一次运行中固定，程序不扫描它们的�
 bash ./build.sh --ubs-root /absolute/path/to/ubs-comm
 ```
 
-`RDMA_600_SGL_ITEMS`控制K，默认16，严格十进制1..30。当前只读依赖`ubs-comm@e709a37`的公共头/内部上限16，因此K30报UNSUPPORTED，不自动降级，也不修改共享库。
+`RDMA_600_SGL_ITEMS`控制K，默认16，严格十进制1..30。原始`ubs-comm@e709a37`公共头上限16；2026-09-18发现共享依赖已有未提交修改，公共头上限为30。本程序仍按实际编译头和声明QP cap检查，不自动降级；头文件允许30不能证明部署静态库和真实QP支持30。本次只读取并保留这些依赖修改。
 
 SGL measure要求`RDMA_600_QP_MAX_SEND_SGE=<cap0[,cap1]>`，每rail一项，且至少为K。值必须来自本次部署真实QP创建后的query；程序只记录为 `external-declaration / declared-not-programmatically-verified`，环境变量不能证明硬件通过。verify/trace可不提供，标记`QP_CAP_PENDING`。
 
@@ -70,17 +72,17 @@ export RDMA_600_QP_MAX_SEND_SGE=16,16
   --warmup 100 --rounds 1000 --timeout-sec 30
 ```
 
-先做小规模正确性检查时，两端追加/替换为 `--kind verify --blocks 100,101,997,9600 --block-bytes 1024,656`。101检查不均匀rail及尾chunk，997检查跨16000B逻辑请求分片边界。单case性能在两端追加 `--blocks 600 --block-bytes 656`。
+先做小规模正确性检查时，两端追加/替换为 `--kind verify --blocks 100,101,997,9600 --block-bytes 1024,656`。101检查不均匀rail及尾chunk，997覆盖原16000B阈值以上的请求，9600检查最大单次Send。单case性能在两端追加 `--blocks 600 --block-bytes 656`。
 
 单rail使用`--links 1`，各IP/endpoint/CPU列表只提供一个值，cap也只一项；可以使用`--rdma-ip/--app-cpu/--worker-cpu`别名。direct改为`--mode direct`并去掉`--pipeline`，SGL环境变量不改变direct工作量。独立trace建议明确指定单case，避免默认矩阵产生大量逐chunk日志。
 
 ## 计时、结果和失败
 
-每次logical COPY_REQ为`64+16N`字节，真实携带N个源偏移及N个目标偏移；最大153664B，通过最多10条Send分片发送。每片额外32B头，单消息最大16032B，小于16384B服务容量。构造、复制、Send、重组、解析的逐轮成本都在完整sparse_copy时延内。
+每次logical COPY_REQ为`64+16N`字节，真实携带N个源偏移及N个目标偏移；最大153664B，当前矩阵每轮只需一次Send。保留32B应用分片头，最大Send为153696B。rail 0服务段为262144B，分片正文上限按`段大小−sizeof(HCOM传输头)−32`计算；另一rail仅收发控制消息，仍为16384B。构造、复制、Send、接收重组、解析的逐轮成本都在完整sparse_copy时延内。
 
 每轮从请求准备前取local `CLOCK_MONOTONIC_RAW`，直到全部rail通知、全部CPU scatter（SGL）和全部请求Send callback完成后结束。不跨主机相减时钟。源端每块头尾generation标记每轮更新，**更新成本在延迟内**。每轮local头尾标记校验在样本外、measure loop wall内；verify轮和case结束做完整有效内容及stride gap校验。主体在warmup/measure期间固定，头尾标记可以发现整块旧代/漏写，不能证明任意局部DMA故障或缓存一致性。
 
-全部case及最终drain/teardown成功后，local先输出每case一条schema6 JSON，再打印汇总表，每case一行，列为：
+全部case及最终drain/teardown成功后，local先输出每case一条schema7 JSON，再打印汇总表，每case一行，列为：
 
 ```text
 case blocks bytes payload_B mode links K pipeline verify warmup measure avg_us p50_us p95_us p99_us GB/s wall_GB/s status
