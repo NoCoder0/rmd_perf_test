@@ -79,6 +79,24 @@ inline uint32_t ChunkItemCount(uint32_t blocksPerRail, uint16_t sglItems, uint32
     return first >= blocksPerRail ? 0 : std::min<uint32_t>(sglItems, blocksPerRail - static_cast<uint32_t>(first));
 }
 
+inline uint32_t NotificationCount(uint32_t chunks, uint32_t notifyEveryWrs)
+{
+    return notifyEveryWrs == 0 ? 0 : (chunks + notifyEveryWrs - 1U) / notifyEveryWrs;
+}
+
+inline uint32_t NotificationFirstChunk(uint32_t chunk, uint32_t notifyEveryWrs)
+{
+    return (chunk / notifyEveryWrs) * notifyEveryWrs;
+}
+
+inline bool EndsNotificationGroup(uint32_t chunk, uint32_t chunks, uint32_t notifyEveryWrs)
+{
+    return (chunk + 1U) % notifyEveryWrs == 0 || chunk + 1U == chunks;
+}
+
+ChunkDoneInfo MakeChunkDone(uint16_t rail, uint64_t generation, uint32_t firstChunk,
+    uint32_t blocksPerRail, uint16_t sglItems, uint32_t blockBytes, uint32_t notifyEveryWrs);
+
 void EncodeMemoryKey(uint8_t *&cursor, const UBSHcomMemoryKey &key);
 
 UBSHcomMemoryKey DecodeMemoryKey(const uint8_t *&cursor);
@@ -109,7 +127,8 @@ std::array<uint8_t, kChunkDoneWireBytes> EncodeChunkDone(const ChunkDoneInfo &in
 bool DecodeChunkDone(const void *data, uint32_t size, ChunkDoneInfo &info);
 
 bool ValidateChunkDone(const ChunkDoneInfo &info, uint16_t expectedRail, uint64_t expectedGeneration,
-    uint32_t blocksPerRail, uint16_t sglItems, uint32_t blockBytes, std::string &error);
+    uint32_t blocksPerRail, uint16_t sglItems, uint32_t blockBytes, std::string &error,
+    uint32_t notifyEveryWrs = 1);
 
 template <typename Observer>
 bool PublishChunkReadyAfterObserver(

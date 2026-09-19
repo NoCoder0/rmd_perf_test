@@ -19,11 +19,12 @@ bool SparseCopyBenchmark::PublishCallbackTrace(uint64_t generation, TracePoint &
 void SparseCopyBenchmark::EmitTracePoint(const char *event, uint64_t generation, int rail, const TracePoint &point,
     int chunk) const
 {
-    std::cout << "{\"record_type\":\"trace\",\"trace_schema\":\"sparse-copy-v7-large-request-v1\","
+    std::cout << "{\"record_type\":\"trace\",\"trace_schema\":\"sparse-copy-v8-group-notify-v1\","
               << "\"host_role\":\"" << RoleName(mOptions.role) << "\",\"case\":\""
               << CaseName(mOptions.mode, mOptions.links, mOptions.sglItems, mOptions.pipeline)
               << "\",\"case_index\":" << mCaseIndex + 1 << ",\"blocks\":" << mParams.blocks
-              << ",\"block_bytes\":" << mParams.blockBytes << ",\"generation\":" << generation << ",\"rail\":";
+              << ",\"block_bytes\":" << mParams.blockBytes << ",\"notify_every_wrs\":" << mParams.notifyEveryWrs
+              << ",\"generation\":" << generation << ",\"rail\":";
     if (rail < 0) std::cout << "null"; else std::cout << rail;
     std::cout << ",\"chunk_id\":";
     if (chunk < 0) std::cout << "null"; else std::cout << chunk;
@@ -62,8 +63,9 @@ void SparseCopyBenchmark::EmitTrace() const
                     for (uint32_t chunk = 0; chunk < RailChunks(rail); ++chunk) {
                         EmitTracePoint("remote_chunk_posted", t.generation, rail,
                             t.remoteChunkPosted[rail][chunk], chunk);
-                        EmitTracePoint("remote_chunk_done_posted", t.generation, rail,
-                            t.remoteChunkDonePosted[rail][chunk], chunk);
+                        if (chunk % mOptions.notifyEveryWrs == 0)
+                            EmitTracePoint("remote_chunk_group_done_posted", t.generation, rail,
+                                t.remoteChunkDonePosted[rail][chunk], chunk);
                     }
                 }
                 EmitTracePoint("remote_data_callbacks_done", t.generation, rail, t.remoteDataCallbacksDone[rail]);
@@ -76,7 +78,7 @@ std::string SparseCopyBenchmark::FormatLocalResult() const
 {
     std::ostringstream out;
     out << std::fixed << std::setprecision(3)
-        << "{\"schema_version\":7,\"protocol\":\"sparse-copy-v7-large-request\""
+        << "{\"schema_version\":8,\"protocol\":\"sparse-copy-v8-group-notify\""
         << ",\"measurement\":\"local-sparse-copy\",\"role\":\"local\",\"status\":\"ok\",\"case_index\":" << mCaseIndex + 1
         << ",\"case_count\":" << mCases.size() << ",\"case\":\""
         << CaseName(mOptions.mode, mOptions.links, mOptions.sglItems, mOptions.pipeline)
@@ -84,6 +86,7 @@ std::string SparseCopyBenchmark::FormatLocalResult() const
         << "\",\"kind\":\"" << KindName(mOptions.kind) << "\",\"mode\":\""
         << (mOptions.mode == CopyMode::Sgl ? "sgl" : "direct")
         << "\",\"links\":" << mOptions.links << ",\"sgl_items\":" << mOptions.sglItems
+        << ",\"notify_every_wrs\":" << mParams.notifyEveryWrs
         << ",\"pipeline\":\"" << (mOptions.pipeline == PipelineMode::On ? "on" : "off")
         << "\",\"blocks\":" << mParams.blocks << ",\"block_bytes\":" << mParams.blockBytes
         << ",\"payload_bytes_per_call\":" << mParams.PayloadBytes()
@@ -113,8 +116,13 @@ std::string SparseCopyBenchmark::FormatLocalResult() const
         if (rail) out << ',';
         out << RailChunks(rail);
     }
+    out << "],\"notifications_per_rail\":[";
+    for (uint16_t rail = 0; rail < mOptions.links; ++rail) {
+        if (rail) out << ',';
+        out << (mOptions.mode == CopyMode::Sgl ? RailNotifications(rail) : 1);
+    }
     out << "],\"data_wr_per_round_expected\":" << (mOptions.mode == CopyMode::Sgl ? TotalChunks() : mParams.blocks)
-        << ",\"completion_send_wr_per_round_expected\":" << (mOptions.mode == CopyMode::Sgl ? TotalChunks() : mOptions.links)
+        << ",\"completion_send_wr_per_round_expected\":" << (mOptions.mode == CopyMode::Sgl ? TotalNotifications() : mOptions.links)
         << ",\"round_success_ack_count\":0,\"case_boundary_barrier\":true,\"connections_reused\":true"
         << ",\"data_wait\":\"busy-poll-relax\",\"deadline_check_interval\":256"
         << ",\"callback_allocation\":\"per-request\",\"internal_multirail\":false,\"channel_link_count\":1"
@@ -166,13 +174,14 @@ void SparseCopyBenchmark::PrintBatchResult() const
         << " latency=local_sparse_copy_us throughput=decimal_GB/s\n"
         << "# sparse_copy: request preparation through all scatter and request Send callbacks.\n"
         << "# GB/s=effective bytes/sum(latency); wall_GB/s includes per-round marker validation.\n"
-        << "case blocks bytes payload_B mode links K pipeline verify warmup measure avg_us p50_us p95_us p99_us GB/s wall_GB/s status\n";
+        << "case blocks bytes payload_B mode links K notify_every_wrs pipeline verify warmup measure avg_us p50_us p95_us p99_us GB/s wall_GB/s status\n";
     for (size_t index = 0; index < mSummary.size(); ++index) {
         const auto &s = mSummary[index];
         std::cout << std::fixed << std::setprecision(3) << index + 1 << ' ' << s.params.blocks << ' '
             << s.params.blockBytes << ' ' << s.params.PayloadBytes() << ' '
             << (mOptions.mode == CopyMode::Sgl ? "sgl" : "direct") << ' ' << mOptions.links << ' '
-            << mOptions.sglItems << ' ' << (mOptions.pipeline == PipelineMode::On ? "on" : "off") << ' '
+            << mOptions.sglItems << ' ' << s.params.notifyEveryWrs << ' '
+            << (mOptions.pipeline == PipelineMode::On ? "on" : "off") << ' '
             << s.params.verifyRounds << ' ' << s.params.warmupRounds << ' ' << s.params.measureRounds << ' ';
         if (s.params.measureRounds)
             std::cout << s.avg << ' ' << s.p50 << ' ' << s.p95 << ' ' << s.p99 << ' ' << s.gbps << ' ' << s.wallGbps;
@@ -185,13 +194,14 @@ void SparseCopyBenchmark::PrintBatchResult() const
 void SparseCopyBenchmark::PrintRemoteStatus() const
 {
     std::ostringstream out;
-    out << "{\"schema_version\":7,\"protocol\":\"sparse-copy-v7-large-request\",\"case\":\""
+    out << "{\"schema_version\":8,\"protocol\":\"sparse-copy-v8-group-notify\",\"case\":\""
         << CaseName(mOptions.mode, mOptions.links, mOptions.sglItems, mOptions.pipeline)
         << "\",\"role\":\"remote\",\"status\":\"ok\",\"commit\":\""
         << RDMA_600_GIT_COMMIT << "\",\"build_type\":\"" << RDMA_600_BUILD_TYPE
         << "\",\"processed_calls\":" << mCaseLastGeneration << ",\"case_count\":" << mCases.size() << ",\"links\":" << mOptions.links
         << ",\"mode\":\"" << (mOptions.mode == CopyMode::Direct ? "direct" : "sgl")
-        << "\",\"sgl_items\":" << mOptions.sglItems << ",\"pipeline\":\""
+        << "\",\"sgl_items\":" << mOptions.sglItems
+        << ",\"notify_every_wrs\":" << mOptions.notifyEveryWrs << ",\"pipeline\":\""
         << (mOptions.pipeline == PipelineMode::On ? "on" : "off")
         << "\",\"hcom_multiservice_contract\":\""
         << (mOptions.links == 2 ? "diagnostic-unsupported-by-hcom-contract" : "not-applicable")

@@ -166,6 +166,7 @@ void PrintUsage(std::ostream &stream)
            << "Modes: --mode direct (B1/B2), or --mode sgl --pipeline on|off (S1/S2).\n"
            << "SGL K comes from RDMA_600_SGL_ITEMS (default 16, design range 1..30).\n"
            << "SGL measure also requires RDMA_600_QP_MAX_SEND_SGE=<cap0[,cap1]>.\n"
+           << "SGL: --notify-every-wrs G (default 1, range 1..9600), per rail; flush the tail group.\n"
            << "Singular --rdma-ip/--app-cpu/--worker-cpu remain aliases for links=1.\n"
            << "Options: --kind verify|measure|trace --verify-rounds N --warmup N --rounds N\n"
            << "         --trace-rounds N (1..64 for trace) --timeout-sec N\n"
@@ -197,11 +198,11 @@ Options ParseOptions(int argc, char **argv)
     }
 
     Options options;
-    static const std::array<std::string, 23> kAllowedOptions = {
+    static const std::array<std::string, 24> kAllowedOptions = {
         "--role", "--rdma-ip", "--rdma-ips", "--listen", "--peer", "--kind", "--verify-rounds", "--warmup",
         "--rounds", "--trace-rounds", "--timeout-sec", "--app-cpu", "--app-cpus", "--worker-cpu",
         "--worker-cpus", "--links", "--mode", "--pipeline", "--blocks", "--block-bytes",
-        "--block-start", "--block-end", "--block-step"};
+        "--block-start", "--block-end", "--block-step", "--notify-every-wrs"};
     for (const auto &entry : values) {
         if (std::find(kAllowedOptions.begin(), kAllowedOptions.end(), entry.first) == kAllowedOptions.end()) {
             throw std::runtime_error("unknown option: " + entry.first);
@@ -251,7 +252,11 @@ Options ParseOptions(int argc, char **argv)
     ResolveModeAndPipeline(options, optional("--mode", "direct"), values.count("--pipeline") != 0,
         optional("--pipeline", "on"));
     options.sglItems = ResolveSglItems(options.mode, std::getenv("RDMA_600_SGL_ITEMS"));
+    if (options.mode == CopyMode::Direct && values.count("--notify-every-wrs"))
+        throw std::runtime_error("--notify-every-wrs is only applicable to --mode sgl");
     if (options.mode == CopyMode::Sgl) {
+        options.notifyEveryWrs = static_cast<uint32_t>(ParseStrictDecimal(
+            "--notify-every-wrs", optional("--notify-every-wrs", "1"), 1, kMaxBlocks));
         options.qpMaxSendSge = ParseQpCaps(std::getenv("RDMA_600_QP_MAX_SEND_SGE"), options.links,
             options.qpCapDeclared);
     }

@@ -1,5 +1,7 @@
 # measure路径开销审计与后续A/B方案
 
+> 2026-09-19：通知合并现已按v8实现为 `--notify-every-wrs G`，说明与验证见 [NOTIFY_GROUP_REPORT_CN.md](NOTIFY_GROUP_REPORT_CN.md)。下文“未实施”与v7候选命名是此前审计记录。
+
 > 2026-09-18后续：本报告保留v6基线开销；当前rail0容量、单Send请求和依赖cap变化见 [LARGE_REQUEST_REPORT_CN.md](LARGE_REQUEST_REPORT_CN.md)。下文提议的“v7范围通知”未实施；版本7已用于大请求协议，未来合并通知需使用新版本。
 
 日期：2026-09-17。审计对象：批量功能基线 `7d6e72a`、纯模块拆分 `bbf59d7`，只读依赖 `ubs-comm@e709a37`。本报告区分源码可确认的工作量、本地检查结果和未取得的硬件证据，不给出模拟加速比。

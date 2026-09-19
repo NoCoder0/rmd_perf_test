@@ -34,16 +34,20 @@ int SparseCopyBenchmark::OnChunkDone(uint16_t rail, UBSHcomServiceContext &conte
     }
     const uint64_t expectedGeneration = mExpectedGeneration.load(std::memory_order_acquire);
     std::string error;
-    if (!ValidateChunkDone(info, rail, expectedGeneration, mParams.RailBlocks(rail), mOptions.sglItems, mParams.blockBytes, error)) {
+    if (!ValidateChunkDone(info, rail, expectedGeneration, mParams.RailBlocks(rail), mOptions.sglItems,
+        mParams.blockBytes, error, mOptions.notifyEveryWrs)) {
         RecordFailure(error + " rail=" + std::to_string(rail)); return -1;
     }
-    std::atomic<uint64_t> &slot = mRails[rail].chunkReadyGeneration[info.chunkId];
+    std::atomic<uint64_t> &slot = mRails[rail].groupReadyGeneration[info.chunkId];
     size_t trace = 0;
     const bool traceEnabled = TraceIndex(info.generation, trace);
     if (!PublishChunkReadyAfterOptionalObserver(slot, info.generation, traceEnabled,
         [this, &info, rail, trace] {
-            return PublishCallbackTrace(info.generation,
-                mTrace[trace].localChunkReady[rail][info.chunkId], "local_chunk_ready");
+            const uint32_t end = std::min(info.chunkId + mOptions.notifyEveryWrs, RailChunks(rail));
+            for (uint32_t chunk = info.chunkId; chunk < end; ++chunk)
+                if (!PublishCallbackTrace(info.generation,
+                    mTrace[trace].localChunkReady[rail][chunk], "local_chunk_ready")) return false;
+            return true;
         }, error)) {
         RecordFailure(error + " rail=" + std::to_string(rail) +
             " chunk=" + std::to_string(info.chunkId));
@@ -170,7 +174,8 @@ void SparseCopyBenchmark::ScatterChunk(uint16_t rail, uint32_t chunk, uint64_t g
 bool SparseCopyBenchmark::AllChunksReady(uint64_t generation) const noexcept
 {
     return AllSglChunksReady(mOptions.links, mChunksPerRail, [this, generation](uint16_t rail, uint32_t chunk) {
-        return chunk >= RailChunks(rail) || mRails[rail].chunkReadyGeneration[chunk].load(std::memory_order_acquire) == generation;
+        return chunk >= RailChunks(rail) || mRails[rail].groupReadyGeneration[
+            NotificationFirstChunk(chunk, mOptions.notifyEveryWrs)].load(std::memory_order_acquire) == generation;
     });
 }
 
@@ -181,7 +186,8 @@ void SparseCopyBenchmark::WaitAndScatterSgl(uint64_t generation, uint64_t expect
     auto ready = [this, generation](uint16_t rail, uint32_t chunk) {
         const RailState &state = mRails[rail];
         return chunk < RailChunks(rail) && state.chunkConsumedGeneration[chunk] != generation &&
-            state.chunkReadyGeneration[chunk].load(std::memory_order_acquire) == generation;
+            state.groupReadyGeneration[NotificationFirstChunk(chunk, mOptions.notifyEveryWrs)].load(
+                std::memory_order_acquire) == generation;
     };
     auto scatter = [this, generation](uint16_t rail, uint32_t chunk) {
         ScatterChunk(rail, chunk, generation);

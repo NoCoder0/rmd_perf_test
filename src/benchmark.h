@@ -67,6 +67,18 @@ private:
         return total;
     }
 
+    uint32_t RailNotifications(uint16_t rail) const
+    {
+        return NotificationCount(RailChunks(rail), mOptions.notifyEveryWrs);
+    }
+
+    uint32_t TotalNotifications() const
+    {
+        uint32_t total = 0;
+        for (uint16_t rail = 0; rail < mOptions.links; ++rail) total += RailNotifications(rail);
+        return total;
+    }
+
     uint64_t BodySeed(uint64_t generation) const
     {
         return std::min(generation, mCaseFirstGeneration + mParams.verifyRounds - 1);

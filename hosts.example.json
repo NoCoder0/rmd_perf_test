@@ -42,6 +42,7 @@
   "sgl": {
     "mode": "sgl",
     "pipeline": ["on", "off"],
+    "notify_every_wrs": [1, 4, 8],
     "RDMA_600_SGL_ITEMS": [8, 16],
     "RDMA_600_QP_MAX_SEND_SGE": {
       "local": [16, 16],

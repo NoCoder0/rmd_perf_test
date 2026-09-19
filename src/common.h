@@ -77,9 +77,9 @@ using ock::hcom::UBSHcomServiceProtocol;
 using ock::hcom::UBSHcomTlsOptions;
 using ock::hcom::UBSHcomTwoSideThreshold;
 
-// Version 7 changes COPY_REQ fragment capacity; reject v6 during negotiation
-// before either peer can send a request exceeding the other's receive buffer.
-constexpr uint16_t kProtocolVersion = 7;
+// Version 8 negotiates notification grouping and gives CHUNK_DONE range semantics.
+// Older peers must fail negotiation before any data request is accepted.
+constexpr uint16_t kProtocolVersion = 8;
 constexpr uint16_t kMaxLinks = 2;
 constexpr uint32_t kMaxBlocks = 9600;
 constexpr uint32_t kMaxBlocksPerRail = kMaxBlocks;
@@ -131,9 +131,9 @@ constexpr uint32_t kFinishMagic = 0x53434636U;     // "SCF6"
 constexpr uint32_t kFinishAckMagic = 0x53434136U;  // "SCA6"
 constexpr uint32_t kChunkDoneMagic = 0x53434336U;  // "SCC6"
 
-// Params are 40 bytes in protocol v6. HELLO carries this rail's local
+// Params are 44 bytes in protocol v8. HELLO carries this rail's local
 // destination and optional stage registrations; READY describes its source.
-constexpr size_t kParametersWireBytes = 40;
+constexpr size_t kParametersWireBytes = 44;
 constexpr size_t kMemoryKeyWireBytes = 80;
 constexpr size_t kHelloPreambleWireBytes = 4 + kParametersWireBytes + 4;
 constexpr size_t kHelloRegionWireBytes = 4 + 4 + 8 + 8 + kMemoryKeyWireBytes;
@@ -165,8 +165,8 @@ constexpr size_t kCopyErrorWireBytes = 32;
 constexpr size_t kTokenWireBytes = 24;
 constexpr size_t kChunkDoneWireBytes = 40;
 
-static_assert(kHelloWireBytes == 256, "HELLO wire size must include both complete region descriptors");
-static_assert(kReadyWireBytes == 64, "READY wire size is fixed");
+static_assert(kHelloWireBytes == 260, "HELLO wire size must include both complete region descriptors");
+static_assert(kReadyWireBytes == 68, "READY wire size is fixed");
 static_assert(kFragmentWireBytes + sizeof(ock::hcom::UBSHcomNetTransHeader) <= kRequestServiceMessageBytes,
     "fragment and HCOM header must fit the service segment");
 static_assert(kMaxCopyReqWireBytes <= kFragmentDataBytes, "current matrix must fit one COPY_REQ Send");
@@ -186,6 +186,7 @@ struct Options {
     CopyMode mode = CopyMode::Direct;
     PipelineMode pipeline = PipelineMode::Off;
     uint16_t sglItems = 0;
+    uint32_t notifyEveryWrs = 0; // SGL: 1..kMaxBlocks; direct: 0 (not applicable).
     std::vector<uint32_t> qpMaxSendSge;
     bool qpCapDeclared = false;
     std::vector<std::string> rdmaIps;
@@ -215,6 +216,7 @@ struct CaseParameters {
     uint16_t sglItems = 0;
     uint16_t pipeline = kPipelineOff;
     uint16_t sourceFormat = kSourceFormatDirectPairs;
+    uint32_t notifyEveryWrs = 0;
 
     uint32_t RailCapacity() const { return (blocks + links - 1) / links; }
     uint32_t RailBlocks(uint16_t rail) const { return std::min(RailCapacity(), blocks - rail * RailCapacity()); }
@@ -256,7 +258,7 @@ struct CopyEntry {
 struct ChunkDoneInfo {
     uint16_t rail = 0;
     uint64_t generation = 0;
-    uint32_t chunkId = 0;
+    uint32_t chunkId = 0; // First chunk in this notification group, not a cumulative watermark.
     uint32_t firstItem = 0;
     uint32_t itemCount = 0;
     uint32_t payloadBytes = 0;
@@ -420,7 +422,8 @@ struct RailState {
     std::atomic<bool> helloClaimed{false};
     std::atomic<bool> helloSeen{false};
     std::atomic<uint64_t> dataDoneGeneration{0};
-    std::array<std::atomic<uint64_t>, kMaxBlocksPerRail> chunkReadyGeneration{};
+    // Only the first chunk index of each notification group owns a ready slot.
+    std::array<std::atomic<uint64_t>, kMaxBlocksPerRail> groupReadyGeneration{};
     std::array<uint64_t, kMaxBlocksPerRail> chunkConsumedGeneration{};
     std::atomic<uint64_t> finishGeneration{0};
     std::atomic<uint64_t> finishAckGeneration{0};

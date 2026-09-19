@@ -19,6 +19,7 @@ void EncodeParams(uint8_t *&cursor, const CaseParameters &params)
     PutU16(cursor, params.sglItems);
     PutU16(cursor, params.pipeline);
     PutU16(cursor, params.sourceFormat);
+    PutU32(cursor, params.notifyEveryWrs);
 }
 
 CaseParameters DecodeParams(const uint8_t *&cursor)
@@ -37,6 +38,7 @@ CaseParameters DecodeParams(const uint8_t *&cursor)
     params.sglItems = GetU16(cursor);
     params.pipeline = GetU16(cursor);
     params.sourceFormat = GetU16(cursor);
+    params.notifyEveryWrs = GetU32(cursor);
     return params;
 }
 
@@ -47,7 +49,7 @@ bool SameParams(const CaseParameters &left, const CaseParameters &right)
         left.verifyRounds == right.verifyRounds && left.warmupRounds == right.warmupRounds &&
         left.measureRounds == right.measureRounds && left.traceRounds == right.traceRounds &&
         left.mode == right.mode && left.sglItems == right.sglItems && left.pipeline == right.pipeline &&
-        left.sourceFormat == right.sourceFormat;
+        left.sourceFormat == right.sourceFormat && left.notifyEveryWrs == right.notifyEveryWrs;
 }
 
 bool IsZeroMemoryKey(const UBSHcomMemoryKey &key)
@@ -191,7 +193,7 @@ void EncodeCopyRequest(uint64_t generation, const CaseParameters &params,
     PutU32(cursor, kCopyReqHeaderBytes);
     PutU32(cursor, params.blocks * kCopyEntryWireBytes);
     PutU32(cursor, static_cast<uint32_t>(params.PayloadBytes()));
-    PutU32(cursor, 0);
+    PutU32(cursor, params.notifyEveryWrs);
     for (const CopyEntry &entry : entries) {
         PutU64(cursor, entry.remoteSourceOffset);
         PutU64(cursor, entry.localDestinationOffset);
@@ -215,7 +217,7 @@ bool DecodeCopyRequest(const void *data, uint32_t size, uint64_t expectedGenerat
         GetU32(cursor) != kSourceRegionId || GetU32(cursor) != kDestinationRegionId ||
         GetU32(cursor) != (params.mode == kModeSgl ? kStageRegionId : 0) || GetU32(cursor) != kCopyReqHeaderBytes ||
         GetU32(cursor) != params.blocks * kCopyEntryWireBytes || GetU32(cursor) != params.PayloadBytes() ||
-        GetU32(cursor) != 0) return fail("COPY_REQ fields differ from negotiated case");
+        GetU32(cursor) != params.notifyEveryWrs) return fail("COPY_REQ fields differ from negotiated case");
     for (CopyEntry &entry : entries) {
         entry.remoteSourceOffset = GetU64(cursor);
         entry.localDestinationOffset = GetU64(cursor);
@@ -293,16 +295,40 @@ bool DecodeChunkDone(const void *data, uint32_t size, ChunkDoneInfo &info)
     return GetU32(cursor) == 0;
 }
 
-bool ValidateChunkDone(const ChunkDoneInfo &info, uint16_t expectedRail, uint64_t expectedGeneration,
-    uint32_t blocksPerRail, uint16_t sglItems, uint32_t blockBytes, std::string &error)
+ChunkDoneInfo MakeChunkDone(uint16_t rail, uint64_t generation, uint32_t firstChunk,
+    uint32_t blocksPerRail, uint16_t sglItems, uint32_t blockBytes, uint32_t notifyEveryWrs)
 {
+    if (sglItems == 0)
+        throw std::logic_error("invalid CHUNK_DONE SGL width");
     const uint32_t chunks = ChunkCount(blocksPerRail, sglItems);
-    const uint32_t count = ChunkItemCount(blocksPerRail, sglItems, info.chunkId);
-    const uint64_t first = static_cast<uint64_t>(info.chunkId) * sglItems;
+    if (notifyEveryWrs == 0 || notifyEveryWrs > kMaxBlocks || firstChunk >= chunks ||
+        firstChunk % notifyEveryWrs != 0)
+        throw std::logic_error("invalid CHUNK_DONE group layout");
+    const uint32_t groupChunks = std::min(notifyEveryWrs, chunks - firstChunk);
+    const uint32_t first = firstChunk * sglItems;
+    const uint32_t count = std::min(groupChunks * sglItems, blocksPerRail - first);
+    return {rail, generation, firstChunk, first, count, count * blockBytes, chunks};
+}
+
+bool ValidateChunkDone(const ChunkDoneInfo &info, uint16_t expectedRail, uint64_t expectedGeneration,
+    uint32_t blocksPerRail, uint16_t sglItems, uint32_t blockBytes, std::string &error,
+    uint32_t notifyEveryWrs)
+{
+    if (sglItems == 0 || notifyEveryWrs == 0 || notifyEveryWrs > kMaxBlocks) {
+        error = "invalid CHUNK_DONE notification configuration";
+        return false;
+    }
+    const uint32_t chunks = ChunkCount(blocksPerRail, sglItems);
     if (info.rail != expectedRail || info.generation != expectedGeneration || info.generation == 0 ||
-        info.chunkId >= chunks || count == 0 || info.firstItem != first || info.itemCount != count ||
-        info.payloadBytes != count * blockBytes || info.chunkCount != chunks) {
-        error = "CHUNK_DONE fields do not match the current generation/chunk layout";
+        info.chunkId >= chunks || info.chunkId % notifyEveryWrs != 0) {
+        error = "CHUNK_DONE fields do not match the current generation/group layout";
+        return false;
+    }
+    const auto expected = MakeChunkDone(expectedRail, expectedGeneration, info.chunkId,
+        blocksPerRail, sglItems, blockBytes, notifyEveryWrs);
+    if (info.firstItem != expected.firstItem || info.itemCount != expected.itemCount ||
+        info.payloadBytes != expected.payloadBytes || info.chunkCount != expected.chunkCount) {
+        error = "CHUNK_DONE range differs from the negotiated notification group";
         return false;
     }
     return true;

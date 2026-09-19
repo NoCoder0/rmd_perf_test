@@ -12,6 +12,7 @@ SparseCopyBenchmark::SparseCopyBenchmark(Options options) : mOptions(std::move(o
     mParams.traceRounds = mOptions.traceRounds;
     mParams.mode = static_cast<uint16_t>(mOptions.mode);
     mParams.sglItems = mOptions.sglItems;
+    mParams.notifyEveryWrs = mOptions.notifyEveryWrs;
     mParams.pipeline = static_cast<uint16_t>(mOptions.pipeline);
     mParams.sourceFormat = mOptions.mode == CopyMode::Direct ? kSourceFormatDirectPairs : kSourceFormatSparsePairs;
     for (const uint32_t bytes : mOptions.blockLengths) {

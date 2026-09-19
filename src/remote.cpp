@@ -115,7 +115,7 @@ void SparseCopyBenchmark::ProcessRemoteSglRail(uint16_t rail, uint64_t generatio
     RailState &state = mRails[rail];
     BuildRemoteSglRequests(rail);
     const uint64_t expectedData = state.appCounters.attemptedDataCallbacks + RailChunks(rail);
-    const uint64_t expectedSend = ExpectedSendCallbacks(rail) + RailChunks(rail);
+    const uint64_t expectedSend = ExpectedSendCallbacks(rail) + RailNotifications(rail);
     const UBSHcomChannelPtr channel = ChannelCopyRequired(rail, "remote SGL copy");
     for (uint32_t chunk = 0; chunk < RailChunks(rail); ++chunk) {
         Callback *callback = NewDataCallback(rail, generation, expectedData);
@@ -126,13 +126,16 @@ void SparseCopyBenchmark::ProcessRemoteSglRail(uint16_t rail, uint64_t generatio
         size_t trace = 0;
         if (TraceIndex(generation, trace))
             mTrace[trace].remoteChunkPosted[rail][chunk].Publish(NowNs());
-        const uint32_t count = ChunkItemCount(mParams.RailBlocks(rail), mOptions.sglItems, chunk);
-        const ChunkDoneInfo done{rail, generation, chunk, chunk * mOptions.sglItems, count,
-            count * mParams.blockBytes, RailChunks(rail)};
-        state.chunkDonePayloads[chunk] = EncodeChunkDone(done);
-        PostAsyncSend(rail, channel, state.chunkDonePayloads[chunk].data(), kChunkDoneWireBytes, kOpChunkDone);
-        if (TraceIndex(generation, trace))
-            mTrace[trace].remoteChunkDonePosted[rail][chunk].Publish(NowNs());
+        if (EndsNotificationGroup(chunk, RailChunks(rail), mOptions.notifyEveryWrs)) {
+            const uint32_t first = NotificationFirstChunk(chunk, mOptions.notifyEveryWrs);
+            const ChunkDoneInfo done = MakeChunkDone(rail, generation, first, mParams.RailBlocks(rail),
+                mOptions.sglItems, mParams.blockBytes, mOptions.notifyEveryWrs);
+            state.chunkDonePayloads[first] = EncodeChunkDone(done);
+            // Ordered after all data WRs in this group on the same channel/QP.
+            PostAsyncSend(rail, channel, state.chunkDonePayloads[first].data(), kChunkDoneWireBytes, kOpChunkDone);
+            if (TraceIndex(generation, trace))
+                mTrace[trace].remoteChunkDonePosted[rail][first].Publish(NowNs());
+        }
         if (((chunk + 1) & (kDataDeadlineCheckInterval - 1)) == 0 && NowNs() >= deadlineNs)
             throw std::runtime_error("deadline exceeded while posting SGL chunks");
     }
