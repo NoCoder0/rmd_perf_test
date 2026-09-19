@@ -181,15 +181,40 @@ bool SparseCopyBenchmark::AllChunksReady(uint64_t generation) const noexcept
 
 void SparseCopyBenchmark::WaitAndScatterSgl(uint64_t generation, uint64_t expectedRequestSend, uint64_t deadlineNs)
 {
-    const uint32_t totalChunks = TotalChunks();
+    // Preserve the global all-ready barrier for pipeline=off. Releasing rail 1
+    // before it would accidentally overlap that rail's scatter with other data.
+    if (mOptions.pipeline == PipelineMode::Off)
+        WaitDataUntil("all SGL chunks ready", deadlineNs, [this, generation] { return AllChunksReady(generation); });
+
+    uint64_t sequence = 0;
+    if (mOptions.links == 2)
+        sequence = IssueSecondaryRailCommand(RailCommand::ScatterLocalRound, generation, deadlineNs);
+    ScatterSglRail(0, generation, deadlineNs);
+    if (mOptions.links == 2)
+        WaitDataUntil("rail 1 local scatter", deadlineNs, [this, sequence] {
+            return mSecondary.completed.load(std::memory_order_acquire) >= sequence;
+        });
+
+    // Both per-rail schedulers have finished. The acquire above also makes
+    // rail 1's destination, consumed generations and trace visible to the caller.
+    WaitDataUntil("SGL completion gate", deadlineNs, [this, expectedRequestSend] {
+        return mRails[0].callbackCounters.sendDoneCallbacks.load(std::memory_order_acquire) >= expectedRequestSend;
+    });
+}
+
+void SparseCopyBenchmark::ScatterSglRail(uint16_t rail, uint64_t generation, uint64_t deadlineNs)
+{
+    if (mOptions.role != Role::Local || mOptions.mode != CopyMode::Sgl || rail >= mOptions.links)
+        throw std::logic_error("local scatter on wrong role/mode/rail");
+    const uint32_t chunks = RailChunks(rail);
     SglSchedulerState scheduler{};
-    auto ready = [this, generation](uint16_t rail, uint32_t chunk) {
+    auto ready = [this, rail, generation](uint16_t, uint32_t chunk) {
         const RailState &state = mRails[rail];
-        return chunk < RailChunks(rail) && state.chunkConsumedGeneration[chunk] != generation &&
+        return state.chunkConsumedGeneration[chunk] != generation &&
             state.groupReadyGeneration[NotificationFirstChunk(chunk, mOptions.notifyEveryWrs)].load(
                 std::memory_order_acquire) == generation;
     };
-    auto scatter = [this, generation](uint16_t rail, uint32_t chunk) {
+    auto scatter = [this, rail, generation](uint16_t, uint32_t chunk) {
         ScatterChunk(rail, chunk, generation);
     };
     auto checkpoint = [this, deadlineNs] {
@@ -197,23 +222,14 @@ void SparseCopyBenchmark::WaitAndScatterSgl(uint64_t generation, uint64_t expect
         if (NowNs() >= deadlineNs)
             throw std::runtime_error("timed out waiting for SGL scatter scheduler");
     };
-    if (mOptions.pipeline == PipelineMode::Off) {
-        WaitDataUntil("all SGL chunks ready", deadlineNs, [this, generation] { return AllChunksReady(generation); });
-        if (!ScanReadySglChunks(mOptions.links, mChunksPerRail, scheduler, ready, scatter, checkpoint))
-            throw std::runtime_error("all-ready SGL scan made no progress");
-    } else {
-        while (scheduler.scattered < totalChunks) {
-            const bool progress = ScanReadySglChunks(
-                mOptions.links, mChunksPerRail, scheduler, ready, scatter, checkpoint);
-            if (!progress) CpuRelax();
-        }
+    checkpoint();
+    while (scheduler.scattered < chunks) {
+        const bool progress = ScanReadySglChunks(1, chunks, scheduler, ready, scatter, checkpoint);
+        if (!progress) CpuRelax();
     }
-    if (scheduler.scattered != totalChunks)
+    if (scheduler.scattered != chunks)
         throw std::runtime_error("scatter completed with wrong chunk count");
-    WaitDataUntil("SGL completion gate", deadlineNs, [this, expectedRequestSend, &scheduler, totalChunks] {
-        return SglCompletionReached(scheduler.scattered, totalChunks,
-            mRails[0].callbackCounters.sendDoneCallbacks.load(std::memory_order_acquire) >= expectedRequestSend);
-    });
+    checkpoint();
 }
 
 void SparseCopyBenchmark::VerifyLocalMarkers(uint64_t generation)

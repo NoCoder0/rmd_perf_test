@@ -128,6 +128,9 @@ std::string SparseCopyBenchmark::FormatLocalResult() const
         << ",\"callback_allocation\":\"per-request\",\"internal_multirail\":false,\"channel_link_count\":1"
         << ",\"receive_handler_case_lock\":true"
         << ",\"tls_enabled\":false,\"application_submit_threads\":" << mOptions.links
+        << ",\"scatter_threads\":" << (mOptions.mode == CopyMode::Sgl ? mOptions.links : 0)
+        << ",\"scatter_policy\":\"" << (mOptions.mode == CopyMode::Sgl ? "per-rail-app-thread" : "none")
+        << "\",\"scatter_off_barrier\":\"all-rails-ready\""
         << ",\"hcom_multiservice_contract\":\""
         << (mOptions.links == 2 ? "diagnostic-unsupported-by-hcom-contract" : "not-applicable")
         << "\",\"compiled_sge_cap\":" << kCompiledSgeMax
@@ -174,6 +177,7 @@ void SparseCopyBenchmark::PrintBatchResult() const
         << " latency=local_sparse_copy_us throughput=decimal_GB/s\n"
         << "# sparse_copy: request preparation through all scatter and request Send callbacks.\n"
         << "# GB/s=effective bytes/sum(latency); wall_GB/s includes per-round marker validation.\n"
+        << "# SGL scatter uses one persistent application thread per rail; off waits for all rails ready.\n"
         << "case blocks bytes payload_B mode links K notify_every_wrs pipeline verify warmup measure avg_us p50_us p95_us p99_us GB/s wall_GB/s status\n";
     for (size_t index = 0; index < mSummary.size(); ++index) {
         const auto &s = mSummary[index];

@@ -8,6 +8,8 @@
 
 measure开销、HCOM日志/trace实际控制条件及去重位图优化见 [MEASURE_AUDIT_CN.md](MEASURE_AUDIT_CN.md)。2026-09-19已实现可配置CHUNK_DONE分组通知，使用方法和验证见 [NOTIFY_GROUP_REPORT_CN.md](NOTIFY_GROUP_REPORT_CN.md)。当前没有本次分组优化的硬件加速比结论。
 
+SGL scatter现在由每条链接的固定应用线程独立执行：rail 0使用主线程，rail 1复用已有的第二应用线程。设计、完成条件和并发验证见 [PARALLEL_SCATTER_REPORT_CN.md](PARALLEL_SCATTER_REPORT_CN.md)。
+
 2026-09-18：COPY_REQ所在rail 0服务段从16KiB扩大到256KiB，当前N≤9600均一次Send。ubs-comm限制依据、发送池内存成本与验证见 [LARGE_REQUEST_REPORT_CN.md](LARGE_REQUEST_REPORT_CN.md)；此前批量/审计报告中的16000B和10片数据属于v6历史基线。
 
 ## 默认矩阵与配置
@@ -81,6 +83,8 @@ export RDMA_600_QP_MAX_SEND_SGE=16,16
 
 G按每条rail的数据PutV调用计数，每个PutV在当前预期SGL路径对应一个数据WR；它不控制post链表批量或CQ信号频率。N9600/K30时总计320次PutV，G=1/4/8分别产生320/80/40次CHUNK_DONE（单/双rail均如此）。尾组各rail独立计算，例如N600/双rail/K30/G4为每rail10次PutV、3次通知，共6次通知。G超过本rail的chunk数时，该rail整轮只有一次通知；增大G会推迟该组scatter的开始，实际收益需实测。
 
+并行scatter自动随 `--links` 生效，无需新增参数。local的 `--app-cpus A,B` 分别绑定rail 0/1的scatter线程，`--worker-cpus`继续用于HCOM通知处理。每个线程只扫描和复制自己的rail，使用已有的独立stage/destination；CPU应按对应NIC/内存的NUMA位置选择。`pipeline=on`下各rail独立处理已ready的chunk；`pipeline=off`仍先等待**全部rail**就绪，再并行scatter。建议先保持 `--pipeline on --notify-every-wrs 1` 和原有K，与修改前的 `e831745` 对比，再单独测试其他G。
+
 ## 计时、结果和失败
 
 每次logical COPY_REQ为`64+16N`字节，真实携带N个源偏移及N个目标偏移；最大153664B，当前矩阵每轮只需一次Send。保留32B应用分片头，最大Send为153696B。rail 0服务段为262144B，分片正文上限按`段大小−sizeof(HCOM传输头)−32`计算；另一rail仅收发控制消息，仍为16384B。构造、复制、Send、接收重组、解析的逐轮成本都在完整sparse_copy时延内。
@@ -94,6 +98,8 @@ case blocks bytes payload_B mode links K notify_every_wrs pipeline verify warmup
 ```
 
 这里只展示表头，不提供模拟性能数值。JSON包含相同指标及协议/提交身份、首末generation、每rail块数/chunk数/通知数、`notify_every_wrs`、请求逻辑/传输字节、MR/stage容量、预期WR数、QP cap声明与验证状态。`completion_send_wr_per_round_expected`按分组后的通知数计算；direct的`notify_every_wrs`为0，仍每rail一次DATA_DONE。
+
+local JSON新增 `scatter_threads`（SGL为links，direct为0）、`scatter_policy`（SGL为`per-rail-app-thread`）及 `scatter_off_barrier`。协议和schema保持v8，消息格式与通知数量保持原定义；用提交身份及scatter字段区分串行基线与并行结果。
 
 - `avg/p50/p95/p99`：单次sparse_copy的微秒；分位取升序样本的`floor(p*(n-1))`下标。
 - `GB/s` / `effective_GBps`：`measure次数 × N × B / 所有延迟样本之和`，十进制GB/s，与平均单次时延同一分母。656B按656B计算。

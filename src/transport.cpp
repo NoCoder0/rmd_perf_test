@@ -28,6 +28,7 @@ void SparseCopyBenchmark::SecondaryRailThreadMain() noexcept
                     case RailCommand::Setup: SetupRail(1); break;
                     case RailCommand::ConnectAndHandshake: ConnectAndHandshakeRail(1); break;
                     case RailCommand::ProcessRemoteRound: ProcessRemoteRail(1, generation, deadlineNs); break;
+                    case RailCommand::ScatterLocalRound: ScatterSglRail(1, generation, deadlineNs); break;
                     case RailCommand::Finish: FinishRail(1); break;
                     case RailCommand::Teardown: TeardownRail(1); break;
                     case RailCommand::None: throw std::runtime_error("empty secondary rail command");

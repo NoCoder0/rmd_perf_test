@@ -167,6 +167,7 @@ void PrintUsage(std::ostream &stream)
            << "SGL K comes from RDMA_600_SGL_ITEMS (default 16, design range 1..30).\n"
            << "SGL measure also requires RDMA_600_QP_MAX_SEND_SGE=<cap0[,cap1]>.\n"
            << "SGL: --notify-every-wrs G (default 1, range 1..9600), per rail; flush the tail group.\n"
+           << "SGL scatter: one persistent app thread per rail, pinned by --app-cpus in rail order.\n"
            << "Singular --rdma-ip/--app-cpu/--worker-cpu remain aliases for links=1.\n"
            << "Options: --kind verify|measure|trace --verify-rounds N --warmup N --rounds N\n"
            << "         --trace-rounds N (1..64 for trace) --timeout-sec N\n"

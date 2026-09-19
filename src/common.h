@@ -436,12 +436,15 @@ enum class RailCommand : uint8_t {
     Setup,
     ConnectAndHandshake,
     ProcessRemoteRound,
+    ScatterLocalRound,
     Finish,
     Teardown,
 };
 
-// B2 keeps rail 0 on the original application thread and gives rail 1 one
-// persistent application thread. A release/acquire command sequence publishes
+// Two-link runs keep rail 0 on the original application thread and give rail 1
+// one persistent application thread, including local SGL scatter. Each scatter
+// thread exclusively writes its own rail's destination and consumed generations.
+// A release/acquire command sequence publishes
 // all command arguments and makes command-side counter writes visible before
 // the coordinator consumes them. No HCOM operation is dispatched through a
 // transient thread.

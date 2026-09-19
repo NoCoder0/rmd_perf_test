@@ -97,6 +97,7 @@ private:
     void ProcessRemoteSglRail(uint16_t rail, uint64_t generation, uint64_t deadlineNs);
     void BuildRemoteSglRequests(uint16_t rail);
     void ScatterChunk(uint16_t rail, uint32_t chunk, uint64_t generation);
+    void ScatterSglRail(uint16_t rail, uint64_t generation, uint64_t deadlineNs);
     bool AllChunksReady(uint64_t generation) const noexcept;
     void WaitAndScatterSgl(uint64_t generation, uint64_t expectedRequestSend, uint64_t deadlineNs);
     void BuildRemotePutRequests(uint16_t rail);

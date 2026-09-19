@@ -1,5 +1,7 @@
 # 实施进度
 
+> 2026-09-19后续：SGL scatter改为每rail一个固定应用线程，rail 0由主线程执行，rail 1复用第二应用线程。off保留全部rail就绪屏障，计时等待全部scatter和请求回调；实现及验证见 [PARALLEL_SCATTER_REPORT_CN.md](PARALLEL_SCATTER_REPORT_CN.md)。
+
 > 2026-09-19：v8新增 `--notify-every-wrs G`，SGL默认1，可选1～9600；每rail按G个数据PutV合并一次CHUNK_DONE并补齐尾组，接收端一次发布整组ready。两端握手、请求、矩阵校验G，结果记录实际分组通知数。实现与本地验证见 [NOTIFY_GROUP_REPORT_CN.md](NOTIFY_GROUP_REPORT_CN.md)。
 
 > 2026-09-18默认矩阵调整：块数改为100、200、400、600、800、1200、1600、2400、3200、4800、6400、9600，分别运行1024B和656B，共24个case；显式列表及范围扫描保留。下文192-case默认矩阵属于历史记录。

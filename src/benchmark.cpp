@@ -98,6 +98,8 @@ void SparseCopyBenchmark::NegotiateMatrix()
 
 void SparseCopyBenchmark::SelectCase(size_t index)
 {
+    if (mSecondary.completed.load(std::memory_order_acquire) != mSecondary.issued.load(std::memory_order_acquire))
+        throw std::logic_error("case transition before secondary rail completed");
     // Both app threads are quiescent, and previous case callbacks are drained.
     // The mutex also excludes unexpected late control/data handlers during mutation.
     std::lock_guard<std::mutex> caseLock(mCaseMutex);

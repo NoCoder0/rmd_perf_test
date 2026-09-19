@@ -1,5 +1,7 @@
 # SGL分组完成通知
 
+> 后续scatter已改为每rail一个应用线程，见 [PARALLEL_SCATTER_REPORT_CN.md](PARALLEL_SCATTER_REPORT_CN.md)。本报告保留通知分组提交时的实现与验证记录。
+
 日期：2026-09-19。分支：`duo_card_sgl`；修改前HEAD：`c7b428e`。本次只修改demo，未修改ubs-comm依赖。优化对象是CHUNK_DONE通知频率。
 
 ## 参数与运行
