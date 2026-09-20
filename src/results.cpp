@@ -93,7 +93,9 @@ std::string SparseCopyBenchmark::FormatLocalResult() const
         << ",\"verify_rounds\":" << mParams.verifyRounds << ",\"warmup_rounds\":" << mParams.warmupRounds
         << ",\"measure_rounds\":" << mParams.measureRounds << ",\"trace_rounds\":" << mParams.traceRounds
         << ",\"first_generation\":" << mCaseFirstGeneration << ",\"last_generation\":" << mCaseLastGeneration
-        << ",\"source_format\":\"" << (mOptions.mode == CopyMode::Direct ? "direct-pairs" : "sparse-pairs")
+        << ",\"source_order\":\"" << (mOptions.mode == CopyMode::Sgl && SequentialSglSourceOrder()
+            ? "sequential-stride" : "permuted-stride")
+        << "\",\"source_format\":\"" << (mOptions.mode == CopyMode::Direct ? "direct-pairs" : "sparse-pairs")
         << "\",\"source_address_count\":" << mParams.blocks
         << ",\"destination_address_count\":" << mParams.blocks
         << ",\"request_descriptor_bytes\":" << mParams.blocks * kCopyEntryWireBytes

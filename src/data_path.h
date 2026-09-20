@@ -9,6 +9,7 @@ inline uint16_t RailForRequestIndex(uint32_t index, const CaseParameters &params
     return static_cast<uint16_t>(index / params.RailCapacity());
 }
 
+bool SequentialSglSourceOrder();
 void MakeCopyEntries(uint64_t seed, const CaseParameters &params, std::vector<CopyEntry> &entries);
 
 bool ValidateCopyEntries(const std::vector<CopyEntry> &entries, const CaseParameters &params,

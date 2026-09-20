@@ -4,14 +4,26 @@
 
 namespace rdma_bench {
 
+bool SequentialSglSourceOrder()
+{
+    static const bool enabled = [] {
+        const char *value = std::getenv("RDMA_600_SOURCE_SEQUENTIAL");
+        if (value == nullptr || std::strcmp(value, "0") == 0) return false;
+        if (std::strcmp(value, "1") == 0) return true;
+        throw std::runtime_error("RDMA_600_SOURCE_SEQUENTIAL must be 0 or 1");
+    }();
+    return enabled;
+}
+
 void MakeCopyEntries(uint64_t seed, const CaseParameters &params, std::vector<CopyEntry> &entries)
 {
+    const bool sequentialSource = params.mode == kModeSgl && SequentialSglSourceOrder();
     for (uint32_t index = 0; index < params.blocks; ++index) {
         const uint16_t rail = RailForRequestIndex(index, params);
         const uint32_t count = params.RailBlocks(rail);
         const uint32_t localIndex = index - rail * params.RailCapacity();
         const uint32_t shift = static_cast<uint32_t>(seed % count);
-        const uint32_t sourceSlot = (localIndex * 7U + shift * 13U) % count;
+        const uint32_t sourceSlot = sequentialSource ? localIndex : (localIndex * 7U + shift * 13U) % count;
         // A reverse rotation is a permutation for EVERY count, including multiples of 11.
         const uint32_t destinationSlot = (count - 1 - localIndex + shift) % count;
         entries[index] = {static_cast<uint64_t>(sourceSlot) * kStrideBytes,

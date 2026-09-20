@@ -29,6 +29,21 @@ SGL scatter现在由每条链接的固定应用线程独立执行：rail 0使用
 
 mode、links、K、notify-every-wrs、pipeline在一次运行中固定，程序不扫描它们的组合。单case：`--blocks 600 --block-bytes 1024`。两端必须提供相同矩阵顺序、mode/links/K/notify-every-wrs/pipeline和轮数；启动后逐项核对完整矩阵，差异会失败退出。
 
+## MF 源地址顺序对照
+
+local 设置 `RDMA_600_SOURCE_SEQUENTIAL=1`，SGL 每条 rail 的源地址改为按
+`0, 4096, 8192, ...` 顺序取块，跨轮保持这一顺序。未设置或设置为 `0` 保留原来的
+seed 相关排列。仅影响 SGL，direct 不变；环境变量在进程内只读取一次。
+
+只需在原来的 local 启动命令前加 `RDMA_600_SOURCE_SEQUENTIAL=1`，remote 启动命令不变。
+local 将实际源偏移写入请求，remote 按请求执行，无需在 remote 设置此变量。
+对照时保持 `1600 × 656 B`、K=30、G=32、pipeline=on 以及 IP/绑核/轮数等原参数。
+两组均使用同一个新编译的程序，分别设置 `0` 和 `1`；local 结果 JSON 的 `source_order`
+分别为 `permuted-stride` 和 `sequential-stride`。
+
+此开关仅改变请求中的源偏移；目标地址排列、每轮源数据更新、PutV 分组、通知、scatter、
+HCOM 配置及计时范围均保持原实现。仍需运行原有 verify 轮次，再比较 measure 的 e2e。
+
 ## 构建与能力
 
 在目标Linux/RDMA机器、此worktree源码目录构建：
