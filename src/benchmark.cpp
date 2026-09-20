@@ -49,6 +49,17 @@ SparseCopyBenchmark::SparseCopyBenchmark(Options options) : mOptions(std::move(o
 int SparseCopyBenchmark::Run()
 {
     try {
+        if (TraceEnabled()) {
+            size_t operations = 0;
+            for (const auto &item : mCases) {
+                for (uint16_t rail = 0; rail < item.links; ++rail)
+                    operations += static_cast<size_t>(item.traceRounds) *
+                        (mOptions.mode == CopyMode::Sgl ?
+                            ChunkCount(item.RailBlocks(rail), mOptions.sglItems) : item.RailBlocks(rail));
+            }
+            InitializeDetailedTrace(RoleName(mOptions.role).c_str(), operations,
+                mOptions.role == Role::Remote && mOptions.mode == CopyMode::Sgl);
+        }
         PinCurrentThread(mOptions.appCpus[0]);
         StartSecondaryRailThread();
         SetupFixedRails();
@@ -65,9 +76,13 @@ int SparseCopyBenchmark::Run()
         if (!DrainUntilComplete()) throw std::runtime_error("callbacks did not drain before teardown");
         TeardownFixedRails();
         StopSecondaryRailThread();
+        const bool detailedTraceOk = !TraceEnabled() || FinishDetailedTrace();
+        if (!detailedTraceOk)
+            std::cerr << "ERROR: incomplete detailed trace; inspect hcom_trace_summary and rebuild HCOM if hooks are missing\n";
         if (mOptions.role == Role::Local) PrintBatchResult(); else PrintRemoteStatus();
-        return 0;
+        return detailedTraceOk ? 0 : 1;
     } catch (const std::exception &error) {
+        EndDetailedTrace();
         RecordFailure(error.what());
         std::cerr << "ERROR case=" << mCaseIndex + 1 << " blocks=" << mParams.blocks << " block_bytes=" << mParams.blockBytes << ": " << error.what() << std::endl;
         if (!QuiesceSecondaryNoThrow()) {
@@ -80,6 +95,7 @@ int SparseCopyBenchmark::Run()
         }
         TryTeardownFixedRails();
         StopSecondaryRailThread();
+        if (TraceEnabled()) FinishDetailedTrace(true);
         return 1;
     }
 }
@@ -152,6 +168,7 @@ void SparseCopyBenchmark::EndCase()
 {
     FinishAllRails();
     if (!DrainUntilComplete()) throw std::runtime_error("case callbacks did not drain");
+    if (TraceEnabled()) EndDetailedTrace();
     CheckFatal("case boundary");
     mCaseAcceptRequests.store(false, std::memory_order_release);
     if (TraceEnabled()) EmitTrace();

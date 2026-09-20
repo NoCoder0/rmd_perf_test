@@ -4,6 +4,7 @@
 #include "protocol.h"
 #include "data_path.h"
 #include "support.h"
+#include "detailed_trace.h"
 
 namespace rdma_bench {
 
@@ -52,7 +53,7 @@ private:
         uint16_t opcode, uint64_t &generation) noexcept;
     int OnFinish(uint16_t rail, UBSHcomServiceContext &context) noexcept;
     int OnFinishAck(uint16_t rail, UBSHcomServiceContext &context) noexcept;
-    Callback *NewDataCallback(uint16_t rail, uint64_t generation, uint64_t completionTarget);
+    Callback *NewDataCallback(uint16_t rail, uint64_t generation, uint64_t completionTarget, int chunk = -1);
     Callback *NewSendCallback(uint16_t rail);
     void NegotiateMatrix();
     uint32_t RailChunks(uint16_t rail) const

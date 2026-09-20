@@ -149,7 +149,8 @@ std::string SparseCopyBenchmark::FormatLocalResult() const
         << ",\"latency_clock\":\"local-CLOCK_MONOTONIC_RAW\",\"percentile_method\":\"floor(p*(n-1))\""
         << ",\"effective_GBps_basis\":\"effective-bytes/sum-sparse-copy-ns\""
         << ",\"wall_GBps_basis\":\"effective-bytes/measure-loop-wall-ns\""
-        << ",\"verbs_trace_status\":\"not-collected\"";
+        << ",\"verbs_trace_status\":\""
+        << (TraceEnabled() ? "see-hcom-trace-summary" : "not-collected") << "\"";
     if (mOptions.kind != RunKind::Measure) {
         out << ",\"sparse_copy_avg_us\":null,\"sparse_copy_p50_us\":null,\"sparse_copy_p95_us\":null,\"sparse_copy_p99_us\":null"
             << ",\"effective_GBps\":null,\"wall_effective_GBps\":null,\"measured_wall_seconds\":null";

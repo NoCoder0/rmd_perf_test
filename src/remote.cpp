@@ -37,6 +37,8 @@ void SparseCopyBenchmark::RunRemote()
         BeginCase();
         for (uint64_t generation = mCaseFirstGeneration; generation <= mCaseLastGeneration; ++generation) {
             try {
+                if (TraceEnabled() && generation == mCaseFirstGeneration + mParams.verifyRounds)
+                    BeginDetailedTrace(mCaseIndex + 1);
                 const uint64_t deadlineNs = DeadlineFrom(NowNs());
                 ReceivePendingCopyRequest(deadlineNs);
                 DecodeActiveCopyRequest(generation);
@@ -118,13 +120,18 @@ void SparseCopyBenchmark::ProcessRemoteSglRail(uint16_t rail, uint64_t generatio
     const uint64_t expectedSend = ExpectedSendCallbacks(rail) + RailNotifications(rail);
     const UBSHcomChannelPtr channel = ChannelCopyRequired(rail, "remote SGL copy");
     for (uint32_t chunk = 0; chunk < RailChunks(rail); ++chunk) {
-        Callback *callback = NewDataCallback(rail, generation, expectedData);
+        Callback *callback = NewDataCallback(rail, generation, expectedData, static_cast<int>(chunk));
         if (callback == nullptr) throw std::runtime_error("PutV callback allocation failed");
         ++state.appCounters.attemptedDataCallbacks;
-        const int rc = channel->PutV(state.sglRequests[chunk], callback);
-        if (rc != 0) throw std::runtime_error("PutV failed: " + std::to_string(rc));
         size_t trace = 0;
-        if (TraceIndex(generation, trace))
+        const bool tracing = TraceIndex(generation, trace);
+        int rc;
+        if (tracing) {
+            ock::hcom::UBSHcomRdmaTraceOperationScope operation(tracing, generation, rail, chunk);
+            rc = channel->PutV(state.sglRequests[chunk], callback);
+        } else rc = channel->PutV(state.sglRequests[chunk], callback);
+        if (rc != 0) throw std::runtime_error("PutV failed: " + std::to_string(rc));
+        if (tracing)
             mTrace[trace].remoteChunkPosted[rail][chunk].Publish(NowNs());
         if (EndsNotificationGroup(chunk, RailChunks(rail), mOptions.notifyEveryWrs)) {
             const uint32_t first = NotificationFirstChunk(chunk, mOptions.notifyEveryWrs);

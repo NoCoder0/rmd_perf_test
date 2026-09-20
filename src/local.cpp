@@ -25,6 +25,8 @@ int SparseCopyBenchmark::OnDataDone(uint16_t rail, UBSHcomServiceContext &contex
 
 int SparseCopyBenchmark::OnChunkDone(uint16_t rail, UBSHcomServiceContext &context) noexcept
 {
+    if (TraceEnabled()) ock::hcom::UBSHcomRdmaTraceMark(
+        ock::hcom::UBSHcomRdmaTraceKind::NOTIFY_HANDLER_BEGIN, 0, rail);
     if (mOptions.role != Role::Local || mOptions.mode != CopyMode::Sgl) {
         RecordFailure("CHUNK_DONE on wrong role/mode"); return -1;
     }
@@ -41,6 +43,8 @@ int SparseCopyBenchmark::OnChunkDone(uint16_t rail, UBSHcomServiceContext &conte
     std::atomic<uint64_t> &slot = mRails[rail].groupReadyGeneration[info.chunkId];
     size_t trace = 0;
     const bool traceEnabled = TraceIndex(info.generation, trace);
+    if (traceEnabled) ock::hcom::UBSHcomRdmaTraceMark(
+        ock::hcom::UBSHcomRdmaTraceKind::NOTIFY_DECODED, info.generation, rail, info.chunkId);
     if (!PublishChunkReadyAfterOptionalObserver(slot, info.generation, traceEnabled,
         [this, &info, rail, trace] {
             const uint32_t end = std::min(info.chunkId + mOptions.notifyEveryWrs, RailChunks(rail));
@@ -53,6 +57,10 @@ int SparseCopyBenchmark::OnChunkDone(uint16_t rail, UBSHcomServiceContext &conte
             " chunk=" + std::to_string(info.chunkId));
         return -1;
     }
+    // This observes publication AFTER the release store; a scatter thread may
+    // already have started before this timestamp is taken.
+    if (traceEnabled) ock::hcom::UBSHcomRdmaTraceMark(
+        ock::hcom::UBSHcomRdmaTraceKind::NOTIFY_READY_PUBLISHED, info.generation, rail, info.chunkId);
     return 0;
 }
 
@@ -99,6 +107,7 @@ void SparseCopyBenchmark::RunLocal()
                 throw std::runtime_error("invalid/non-positive measurement timing");
         }
         for (uint32_t i = 0; i < mParams.traceRounds; ++i, ++generation) {
+            if (i == 0) BeginDetailedTrace(mCaseIndex + 1);
             SparseCopy(generation, false);
             VerifyLocalMarkers(generation);
         }

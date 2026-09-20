@@ -5,6 +5,9 @@ namespace rdma_bench {
 
 int SparseCopyBenchmark::OnIncoming(uint16_t rail, UBSHcomServiceContext &context) noexcept
 {
+    // Before the case mutex: distinguish dispatch/lock delay from wire decoding.
+    if (TraceEnabled() && context.OpCode() == kOpChunkDone)
+        ock::hcom::UBSHcomRdmaTraceMark(ock::hcom::UBSHcomRdmaTraceKind::NOTIFY_INCOMING, 0, rail);
     ActiveCallbackGuard guard(mActiveCallbacks);
     std::lock_guard<std::mutex> caseLock(mCaseMutex);
     const UBSHcomChannelPtr expected = ChannelCopy(rail);
@@ -140,8 +143,27 @@ int SparseCopyBenchmark::OnFinishAck(uint16_t rail, UBSHcomServiceContext &conte
     return 0;
 }
 
-Callback *SparseCopyBenchmark::NewDataCallback(uint16_t rail, uint64_t generation, uint64_t completionTarget)
+Callback *SparseCopyBenchmark::NewDataCallback(uint16_t rail, uint64_t generation, uint64_t completionTarget, int chunk)
 {
+    // Preserve the original closure/callback work outside diagnostic rounds.
+    size_t trace = 0;
+    if (TraceIndex(generation, trace)) {
+        return UBSHcomNewCallback([this, rail, generation, completionTarget, chunk, trace](UBSHcomServiceContext &context) {
+            ActiveCallbackGuard guard(mActiveCallbacks);
+            ock::hcom::UBSHcomRdmaTraceMark(
+                ock::hcom::UBSHcomRdmaTraceKind::DATA_CALLBACK_BEGIN, generation, rail, chunk);
+            if (context.Result() != 0)
+                RecordFailure("Put callback failed rail " + std::to_string(rail) + ": " +
+                    std::to_string(context.Result()));
+            const uint64_t completed =
+                mRails[rail].callbackCounters.dataDoneCallbacks.fetch_add(1, std::memory_order_acq_rel) + 1;
+            if (completed == completionTarget)
+                PublishCallbackTrace(generation, mTrace[trace].remoteDataCallbacksDone[rail],
+                    "remote_data_callbacks_done");
+            ock::hcom::UBSHcomRdmaTraceMark(
+                ock::hcom::UBSHcomRdmaTraceKind::DATA_CALLBACK_END, generation, rail, chunk);
+        }, std::placeholders::_1);
+    }
     return UBSHcomNewCallback([this, rail, generation, completionTarget](UBSHcomServiceContext &context) {
         ActiveCallbackGuard guard(mActiveCallbacks);
         if (context.Result() != 0)

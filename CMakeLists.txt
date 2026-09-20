@@ -17,6 +17,9 @@ if(NOT HCOM_INCLUDE_DIR OR
         "HCOM_INCLUDE_DIR must contain hcom/hcom_service.h and hcom/hcom_service_context.h; "
         "pass -DHCOM_INCLUDE_DIR=... or run bash ./build.sh --ubs-root /path/to/ubs-comm")
 endif()
+if(NOT EXISTS "${HCOM_INCLUDE_DIR}/hcom/hcom_rdma_trace.h")
+    message(FATAL_ERROR "HCOM diagnostic trace header is missing. Rebuild/install the updated ubs-comm first.")
+endif()
 if(NOT HCOM_LIB_DIR)
     message(FATAL_ERROR "HCOM_LIB_DIR is required; pass -DHCOM_LIB_DIR=... or run bash ./build.sh --ubs-root /path/to/ubs-comm")
 endif()
@@ -89,6 +92,7 @@ add_executable(rdma_600
     src/control.cpp
     src/transport.cpp
     src/results.cpp)
+target_sources(rdma_600 PRIVATE src/detailed_trace.cpp)
 target_compile_features(rdma_600 PRIVATE cxx_std_17)
 target_compile_options(rdma_600 PRIVATE -Wall -Wextra -Wpedantic -Werror=return-type)
 target_compile_definitions(rdma_600 PRIVATE
