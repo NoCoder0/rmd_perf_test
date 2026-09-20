@@ -140,12 +140,18 @@ void SparseCopyBenchmark::SparseCopy(uint64_t generation, bool measure)
     EncodeCopyRequest(generation, mParams, mCopyEntries, mCopyReqPayload.data());
     if (NowNs() >= deadlineNs) throw std::runtime_error("deadline exceeded while preparing COPY_REQ");
     mExpectedGeneration.store(generation, std::memory_order_release);
+    if (TraceIndex(generation, trace)) mTrace[trace].localRequestSubmitBegin.Publish(NowNs());
     const uint64_t expectedSend = ExpectedSendCallbacks(0) + mParams.Fragments();
     const UBSHcomChannelPtr channel = ChannelCopyRequired(0, "COPY_REQ fragments");
     for (uint32_t part = 0, offset = 0; offset < mParams.RequestBytes(); ++part) {
         const uint32_t size = EncodeRequestFragment(generation, mParams.RequestBytes(), offset,
             mCopyReqPayload.data(), mRequestFragments[part].data());
-        PostAsyncSend(0, channel, mRequestFragments[part].data(), size, kOpCopyReq);
+        if (TraceIndex(generation, trace)) {
+            ock::hcom::UBSHcomRdmaTraceOperationScope operation(true, generation, 0, -1);
+            PostAsyncSend(0, channel, mRequestFragments[part].data(), size, kOpCopyReq);
+        } else {
+            PostAsyncSend(0, channel, mRequestFragments[part].data(), size, kOpCopyReq);
+        }
         offset += size - kFragmentHeaderBytes;
     }
 
@@ -173,7 +179,10 @@ void SparseCopyBenchmark::ScatterChunk(uint16_t rail, uint32_t chunk, uint64_t g
     if (state.chunkConsumedGeneration[chunk] == generation)
         throw std::runtime_error("chunk scattered twice");
     size_t trace = 0;
-    if (TraceIndex(generation, trace)) mTrace[trace].localScatterBegin[rail][chunk].Publish(NowNs());
+    if (TraceIndex(generation, trace)) {
+        mTrace[trace].localReadyObserved[rail][chunk].Publish(NowNs());
+        mTrace[trace].localScatterBegin[rail][chunk].Publish(NowNs());
+    }
     ScatterChunkPayload(rail, chunk, mBlocksPerRail, mParams.RailBlocks(rail), mOptions.sglItems, mCopyEntries, mParams.blockBytes,
         state.buffer.Data(), state.buffer.Size(), state.stageBuffer.Data(), state.stageBuffer.Size());
     state.chunkConsumedGeneration[chunk] = generation;

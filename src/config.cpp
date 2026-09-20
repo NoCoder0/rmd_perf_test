@@ -365,7 +365,7 @@ Options ParseOptions(int argc, char **argv)
             throw std::runtime_error("--rounds must be greater than zero for --kind measure");
         }
     } else {
-        options.warmupRounds = 0;
+        // Diagnostic rounds follow the same requested warmup as measurement.
         options.measureRounds = 0;
         if (options.traceRounds == 0) {
             throw std::runtime_error("--trace-rounds must be in [1,64] for --kind trace");

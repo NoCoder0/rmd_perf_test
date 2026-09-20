@@ -20,7 +20,7 @@ private:
     bool TraceIndex(uint64_t generation, size_t &index) const noexcept
     {
         if (!TraceEnabled()) return false;
-        const uint64_t first = mCaseFirstGeneration + mParams.verifyRounds;
+        const uint64_t first = mCaseFirstGeneration + mParams.verifyRounds + mParams.warmupRounds + mParams.measureRounds;
         if (generation < first || generation >= first + mParams.traceRounds) return false;
         index = static_cast<size_t>(generation - first);
         return true;
@@ -92,7 +92,7 @@ private:
     void SparseCopy(uint64_t generation, bool measure);
     void RunRemote();
     bool AllHellosSeen() const noexcept;
-    void ReceivePendingCopyRequest(uint64_t deadlineNs);
+    void ReceivePendingCopyRequest(uint64_t deadlineNs, uint64_t generation);
     void DecodeActiveCopyRequest(uint64_t generation);
     void ProcessRemoteRail(uint16_t rail, uint64_t generation, uint64_t deadlineNs);
     void ProcessRemoteSglRail(uint16_t rail, uint64_t generation, uint64_t deadlineNs);

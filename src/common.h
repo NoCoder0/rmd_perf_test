@@ -339,14 +339,21 @@ struct TracePoint {
 struct TraceRound {
     uint64_t generation = 0;
     TracePoint localBegin;
+    TracePoint localRequestSubmitBegin;
     TracePoint localRequestPosted;
     std::array<TracePoint, kMaxLinks> localDataDone;
     TracePoint localEnd;
     TracePoint remoteRequestReceived;
+    TracePoint remoteRequestObserved;
+    TracePoint remoteRequestCopied;
+    TracePoint remoteRequestDecoded;
+    std::array<TracePoint, kMaxLinks> remoteSourcePrepared;
+    std::array<TracePoint, kMaxLinks> remoteRequestsPrepared;
     std::array<TracePoint, kMaxLinks> remotePosted;
     std::array<TracePoint, kMaxLinks> remoteDataCallbacksDone;
     std::array<TracePoint, kMaxLinks> remoteDonePosted;
     std::array<std::array<TracePoint, kMaxBlocksPerRail>, kMaxLinks> localChunkReady;
+    std::array<std::array<TracePoint, kMaxBlocksPerRail>, kMaxLinks> localReadyObserved;
     std::array<std::array<TracePoint, kMaxBlocksPerRail>, kMaxLinks> localScatterBegin;
     std::array<std::array<TracePoint, kMaxBlocksPerRail>, kMaxLinks> localScatterEnd;
     std::array<std::array<TracePoint, kMaxBlocksPerRail>, kMaxLinks> remoteChunkPosted;

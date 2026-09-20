@@ -37,11 +37,16 @@ void SparseCopyBenchmark::RunRemote()
         BeginCase();
         for (uint64_t generation = mCaseFirstGeneration; generation <= mCaseLastGeneration; ++generation) {
             try {
-                if (TraceEnabled() && generation == mCaseFirstGeneration + mParams.verifyRounds)
+                if (TraceEnabled() && generation == mCaseFirstGeneration + mParams.verifyRounds +
+                    mParams.warmupRounds + mParams.measureRounds)
                     BeginDetailedTrace(mCaseIndex + 1);
                 const uint64_t deadlineNs = DeadlineFrom(NowNs());
-                ReceivePendingCopyRequest(deadlineNs);
+                ReceivePendingCopyRequest(deadlineNs, generation);
+                size_t trace = 0;
+                const bool tracing = TraceIndex(generation, trace);
+                if (tracing) mTrace[trace].remoteRequestCopied.Publish(NowNs());
                 DecodeActiveCopyRequest(generation);
+                if (tracing) mTrace[trace].remoteRequestDecoded.Publish(NowNs());
                 uint64_t sequence = 0;
                 if (mOptions.links == 2)
                     sequence = IssueSecondaryRailCommand(RailCommand::ProcessRemoteRound, generation, deadlineNs);
@@ -59,10 +64,12 @@ void SparseCopyBenchmark::RunRemote()
     }
 }
 
-void SparseCopyBenchmark::ReceivePendingCopyRequest(uint64_t deadlineNs)
+void SparseCopyBenchmark::ReceivePendingCopyRequest(uint64_t deadlineNs, uint64_t generation)
 {
     WaitDataUntil("COPY_REQ", deadlineNs,
         [this] { return mPendingCopyReqPublished.load(std::memory_order_acquire); });
+    size_t trace = 0;
+    if (TraceIndex(generation, trace)) mTrace[trace].remoteRequestObserved.Publish(NowNs());
     std::lock_guard<std::mutex> lock(mPendingMutex);
     mActiveCopyReqBytes = mPendingCopyReqBytes;
     if (mActiveCopyReqBytes <= mActiveCopyReqPayload.size())
@@ -84,6 +91,8 @@ void SparseCopyBenchmark::ProcessRemoteRail(uint16_t rail, uint64_t generation, 
 {
     RailState &state = mRails[rail];
     FillRemoteSourceRail(rail, generation);
+    size_t stageTrace = 0;
+    if (TraceIndex(generation, stageTrace)) mTrace[stageTrace].remoteSourcePrepared[rail].Publish(NowNs());
     if (mOptions.mode == CopyMode::Sgl) {
         ProcessRemoteSglRail(rail, generation, deadlineNs);
         return;
@@ -116,6 +125,8 @@ void SparseCopyBenchmark::ProcessRemoteSglRail(uint16_t rail, uint64_t generatio
 {
     RailState &state = mRails[rail];
     BuildRemoteSglRequests(rail);
+    size_t stageTrace = 0;
+    if (TraceIndex(generation, stageTrace)) mTrace[stageTrace].remoteRequestsPrepared[rail].Publish(NowNs());
     const uint64_t expectedData = state.appCounters.attemptedDataCallbacks + RailChunks(rail);
     const uint64_t expectedSend = ExpectedSendCallbacks(rail) + RailNotifications(rail);
     const UBSHcomChannelPtr channel = ChannelCopyRequired(rail, "remote SGL copy");
@@ -139,7 +150,12 @@ void SparseCopyBenchmark::ProcessRemoteSglRail(uint16_t rail, uint64_t generatio
                 mOptions.sglItems, mParams.blockBytes, mOptions.notifyEveryWrs);
             state.chunkDonePayloads[first] = EncodeChunkDone(done);
             // Ordered after all data WRs in this group on the same channel/QP.
-            PostAsyncSend(rail, channel, state.chunkDonePayloads[first].data(), kChunkDoneWireBytes, kOpChunkDone);
+            if (tracing) {
+                ock::hcom::UBSHcomRdmaTraceOperationScope operation(true, generation, rail, first);
+                PostAsyncSend(rail, channel, state.chunkDonePayloads[first].data(), kChunkDoneWireBytes, kOpChunkDone);
+            } else {
+                PostAsyncSend(rail, channel, state.chunkDonePayloads[first].data(), kChunkDoneWireBytes, kOpChunkDone);
+            }
             if (TraceIndex(generation, trace))
                 mTrace[trace].remoteChunkDonePosted[rail][first].Publish(NowNs());
         }

@@ -48,6 +48,8 @@ SparseCopyBenchmark::SparseCopyBenchmark(Options options) : mOptions(std::move(o
 
 int SparseCopyBenchmark::Run()
 {
+    std::cout << "{\"record_type\":\"hcom_build_identity\",\"id\":\""
+              << UBSHcomRdmaTraceBuildIdentityV1() << "\"}\n";
     try {
         if (TraceEnabled()) {
             size_t operations = 0;
@@ -135,7 +137,8 @@ void SparseCopyBenchmark::SelectCase(size_t index)
     if (TraceEnabled()) {
         mTrace.reset(new TraceRound[mParams.traceRounds]);
         for (uint32_t i = 0; i < mParams.traceRounds; ++i)
-            mTrace[i].generation = mCaseFirstGeneration + mParams.verifyRounds + i;
+            mTrace[i].generation = mCaseFirstGeneration + mParams.verifyRounds + mParams.warmupRounds +
+                mParams.measureRounds + i;
     }
     // Reset gaps before granting the remote permission to write the new case.
     if (mOptions.role == Role::Local)

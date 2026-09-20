@@ -24,6 +24,7 @@ void SparseCopyBenchmark::EmitTracePoint(const char *event, uint64_t generation,
               << CaseName(mOptions.mode, mOptions.links, mOptions.sglItems, mOptions.pipeline)
               << "\",\"case_index\":" << mCaseIndex + 1 << ",\"blocks\":" << mParams.blocks
               << ",\"block_bytes\":" << mParams.blockBytes << ",\"notify_every_wrs\":" << mParams.notifyEveryWrs
+              << ",\"sgl_items\":" << mOptions.sglItems
               << ",\"generation\":" << generation << ",\"rail\":";
     if (rail < 0) std::cout << "null"; else std::cout << rail;
     std::cout << ",\"chunk_id\":";
@@ -37,6 +38,7 @@ void SparseCopyBenchmark::EmitTrace() const
         const TraceRound &t = mTrace[i];
         if (mOptions.role == Role::Local) {
             EmitTracePoint("local_begin", t.generation, -1, t.localBegin);
+            EmitTracePoint("local_request_submit_begin", t.generation, 0, t.localRequestSubmitBegin);
             EmitTracePoint("local_request_posted", t.generation, 0, t.localRequestPosted);
             for (uint16_t rail = 0; rail < mOptions.links; ++rail) {
                 if (mOptions.mode == CopyMode::Direct) {
@@ -45,6 +47,8 @@ void SparseCopyBenchmark::EmitTrace() const
                     for (uint32_t chunk = 0; chunk < RailChunks(rail); ++chunk) {
                         EmitTracePoint("local_chunk_ready", t.generation, rail,
                             t.localChunkReady[rail][chunk], chunk);
+                        EmitTracePoint("local_ready_observed", t.generation, rail,
+                            t.localReadyObserved[rail][chunk], chunk);
                         EmitTracePoint("local_scatter_begin", t.generation, rail,
                             t.localScatterBegin[rail][chunk], chunk);
                         EmitTracePoint("local_scatter_end", t.generation, rail,
@@ -55,12 +59,19 @@ void SparseCopyBenchmark::EmitTrace() const
             EmitTracePoint("local_end", t.generation, -1, t.localEnd);
         } else {
             EmitTracePoint("remote_request_received", t.generation, 0, t.remoteRequestReceived);
+            EmitTracePoint("remote_request_observed", t.generation, 0, t.remoteRequestObserved);
+            EmitTracePoint("remote_request_copied", t.generation, 0, t.remoteRequestCopied);
+            EmitTracePoint("remote_request_decoded", t.generation, 0, t.remoteRequestDecoded);
             for (uint16_t rail = 0; rail < mOptions.links; ++rail) {
                 if (mOptions.mode == CopyMode::Direct) {
                     EmitTracePoint("remote_posted", t.generation, rail, t.remotePosted[rail]);
                     EmitTracePoint("remote_done_posted", t.generation, rail, t.remoteDonePosted[rail]);
                 } else {
                     for (uint32_t chunk = 0; chunk < RailChunks(rail); ++chunk) {
+                        if (chunk == 0) {
+                            EmitTracePoint("remote_source_prepared", t.generation, rail, t.remoteSourcePrepared[rail]);
+                            EmitTracePoint("remote_requests_prepared", t.generation, rail, t.remoteRequestsPrepared[rail]);
+                        }
                         EmitTracePoint("remote_chunk_posted", t.generation, rail,
                             t.remoteChunkPosted[rail][chunk], chunk);
                         if (chunk % mOptions.notifyEveryWrs == 0)

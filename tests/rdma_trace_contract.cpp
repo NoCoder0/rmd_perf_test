@@ -19,6 +19,8 @@ const UBSHcomRdmaTraceHooks hooks{Epoch, Record};
 }
 int main()
 {
+    assert(UBSHcomRdmaTraceConfigureV1(&hooks, sizeof(UBSHcomRdmaTraceEvent) - 1) != 0);
+    assert(UBSHcomRdmaTraceConfigureV1(nullptr, sizeof(UBSHcomRdmaTraceEvent)) == 0);
     assert(UBSHcomRdmaTraceEpoch() == 0);
     UBSHcomRdmaTraceConfigure(&hooks);
     UBSHcomRdmaTraceMark(UBSHcomRdmaTraceKind::DATA_CALLBACK_BEGIN, 21, 0, 0);
@@ -28,7 +30,7 @@ int main()
     epoch = 1;
     {
         UBSHcomRdmaTraceOperationScope outer(true, 21, 0, 3);
-        UBSHcomRdmaTracePost(1, 100, 110, 7, 99, 0, 30, 19680, 0);
+        UBSHcomRdmaTracePost(1, 100, 110, 7, 99, 0, 30, 19680, 0, 0x100, 0x200, 2, 0);
         { UBSHcomRdmaTraceOperationScope inner(true, 22, 1, 4);
           UBSHcomRdmaTracePost(1, 120, 130, 8, 100, 0, 10, 6560, 0); }
         UBSHcomRdmaTracePost(1, 140, 150, 7, 101, 0, 30, 19680, 0);
@@ -37,6 +39,7 @@ int main()
     assert(records[2].generation == 22 && records[2].rail == 1);
     assert(records[4].generation == 21 && records[4].chunk == 3);
     assert(records[0].timestampNs == 100 && records[1].timestampNs == 110);
+    assert(records[0].sendFlags == 2 && records[0].localAddress == 0x100 && records[0].remoteAddress == 0x200);
 
     UBSHcomRdmaTracePoll(1, 200, 210, 123, 0);
     UBSHcomRdmaTracePoll(1, 215, 225, 123, 0);
@@ -45,6 +48,7 @@ int main()
     UBSHcomRdmaTraceCqe(101, 7, 0, 0);
     assert(records[6].emptyPolls == 2 && records[6].maxPollGapNs == 55);
     assert(records[6].maxPollCallNs == 15 && records[6].previousPollEndNs == 225);
+    assert(records[6].pollCallBins[0] == 3 && records[6].pollGapBins[0] == 2);
     assert(records[7].timestampNs == 295 && records[8].timestampNs == 295);
     assert(records[7].batchId == records[8].batchId && records[7].generation == 0);
     {
@@ -65,6 +69,7 @@ int main()
     assert(records.size() == before); // previous case's batch cannot leak
     UBSHcomRdmaTracePoll(2, 1000, 1010, 123, 1);
     assert(records.back().maxPollGapNs == 0 && records.back().emptyPolls == 0);
+    assert(records.back().pollCallBins[0] == 1 && records.back().pollGapBins[0] == 0);
 
     std::thread producer([] {
         UBSHcomRdmaTraceOperationScope op(true, 23, 1, 26);

@@ -111,10 +111,19 @@ bool FinishDetailedTrace(bool aborted)
             std::cout << ",\"wr_id\":\"0x" << std::hex << e.wrId << "\",\"cq_id\":\"0x" << e.cqId
                 << std::dec << "\",\"qp_num\":" << e.qpNum << ",\"batch_id\":" << e.batchId
                 << ",\"opcode\":" << e.opcode << ",\"status\":" << e.status << ",\"count\":" << e.count
+                << ",\"send_flags\":" << e.sendFlags << ",\"post_call_status\":" << e.postCallStatus
                 << ",\"sge_count\":" << e.sgeCount << ",\"bytes\":" << e.bytes
                 << ",\"poll_begin_ns\":" << e.pollBeginNs << ",\"previous_poll_end_ns\":" << e.previousPollEndNs
                 << ",\"empty_polls\":" << e.emptyPolls << ",\"max_poll_gap_ns\":" << e.maxPollGapNs
-                << ",\"max_poll_call_ns\":" << e.maxPollCallNs << "}\n";
+                << ",\"max_poll_call_ns\":" << e.maxPollCallNs;
+            if (e.kind == ock::hcom::UBSHcomRdmaTraceKind::CQ_POLL_BATCH) {
+                std::cout << ",\"poll_call_bins\":[";
+                for (int bin = 0; bin < 8; ++bin) std::cout << (bin ? "," : "") << e.pollCallBins[bin];
+                std::cout << "],\"poll_gap_bins\":[";
+                for (int bin = 0; bin < 8; ++bin) std::cout << (bin ? "," : "") << e.pollGapBins[bin];
+                std::cout << "]";
+            }
+            std::cout << "}\n";
         }
     }
     const bool complete = !aborted && total != 0 && cqes != 0 && dropped == 0 && clockErrors == 0 &&

@@ -1,5 +1,10 @@
 # RDMA sparse_copy：可配置块数/块长与连接复用批量测试
 
+2026-09-20 同源阶段采集：trace 模式现在保留 `--warmup`，采集轮从 verify+warmup 之后开始；新增请求准备、
+remote请求观察/复制/解析/源准备、local consumer就绪边界。需要本次带动态接口/flags的740f0bb采集补丁，
+与MF共用同一次HCOM构建；完整设备命令见相邻仓库 `memfabric_hybrid/test/indirect_transport_test/STAGE_COMPARE_CN.md`。
+原 `--kind measure` 的 warmup、源更新和传输语义保留。新增代码尚待Linux全量构建与RDMA实机验证。
+
 在 `duo_card_sgl` 分支阶段3上扩展。local拥有最终destination/stage并统计完整请求往返和scatter；remote拥有稀疏source并发起WRITE。当前协议为 `sparse-copy-v8-group-notify`，两端必须使用同版二进制，不能混用v7及更早的旧程序。
 
 当前状态：`IMPLEMENTED / LOCAL_CPP_VALIDATION_PASS / TARGET_BUILD_AND_HW_PENDING`。本地检查不代表Linux链接、QP/DMA顺序、双NIC路由或真实性能通过。设计见 [BATCH_DESIGN_CN.md](BATCH_DESIGN_CN.md)，验证见 [BATCH_REPORT_CN.md](BATCH_REPORT_CN.md)。
