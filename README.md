@@ -105,6 +105,31 @@ G按每条rail的数据PutV调用计数，每个PutV在当前预期SGL路径对�
 
 并行scatter自动随 `--links` 生效，无需新增参数。local的 `--app-cpus A,B` 分别绑定rail 0/1的scatter线程，`--worker-cpus`继续用于HCOM通知处理。每个线程只扫描和复制自己的rail，使用已有的独立stage/destination；CPU应按对应NIC/内存的NUMA位置选择。`pipeline=on`下各rail独立处理已ready的chunk；`pipeline=off`仍先等待**全部rail**就绪，再并行scatter。建议先保持 `--pipeline on --notify-every-wrs 1` 和原有K，与修改前的 `e831745` 对比，再单独测试其他G。
 
+## 已有 trace 日志生成紧凑 JSON
+
+在本仓库根目录直接执行，不需要 MF 仓库、identity 文件、手填角色或重新编译：
+
+```bash
+python3 compact_trace.py sgl-local.log > sgl-local-compact.json
+python3 compact_trace.py sgl-remote.log > sgl-remote-compact.json
+```
+
+也接受与 MF 相同的 `--compact` 写法；默认就输出紧凑 JSON。脚本从日志内容自动识别 local/remote，
+文件名不影响角色判断。保留单次运行、单个 workload 的完整日志；真正混入两端或多次运行时会报错，
+不会静默丢弃另一端数据。多 case trace 请在运行时明确一个 `--blocks` 和一个 `--block-bytes`。
+
+输出保留配置、逐轮阶段耗时、WR 形态/数量、提交与完成尾部、poll/callback 和 scatter 汇总；
+不导出逐条事件、地址和每个 CQE 曲线。退出码 0 表示日志检查通过，1 表示 JSON 已生成但记录不完整，
+2 表示输入无法解析。缺 CQE、丢记录或字节覆盖不足时不会输出有效的完成尾部耗时。
+旧日志缺少的新阶段会标为 unavailable；不会补造运行退出码、库身份或轮数。
+remote 日志没有配置轮数时，只能检查现存轮次，JSON 会注明无法检测整轮丢失。
+
+这里的 `status=ok` 仅表示日志记录通过检查，不代表运行时库身份已验证，也不是关闭 trace 的性能结果。
+保留设备原始日志，回传两个 `*-compact.json`；有报错时一并回传 stderr。
+若此前只输出到终端而没有保存，原启动命令后追加 `> sgl-local.log 2>&1`（remote 使用对应文件名）。
+
+离线验证：`python3 -m unittest discover -s tests -p 'test_compact_trace.py'`。
+
 ## 计时、结果和失败
 
 每次logical COPY_REQ为`64+16N`字节，真实携带N个源偏移及N个目标偏移；最大153664B，当前矩阵每轮只需一次Send。保留32B应用分片头，最大Send为153696B。rail 0服务段为262144B，分片正文上限按`段大小−sizeof(HCOM传输头)−32`计算；另一rail仅收发控制消息，仍为16384B。构造、复制、Send、接收重组、解析的逐轮成本都在完整sparse_copy时延内。
