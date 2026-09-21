@@ -50,10 +50,11 @@ cmake --build build --parallel
 `git apply --check /path/to/sgl_hugetlb_20260921.patch`，通过后再执行相同命令去掉 `--check`，然后构建。
 拉取和应用补丁二选一；已有补丁时先保留本地改动，不重复应用，也不用reset清空现场。
 
-两端保留原 `APP_CPU`、`WORKER_CPU` 和已验证的 `RDMA_600_QP_MAX_SEND_SGE` 环境变量。
+两端保留原 `APP_CPU`、`WORKER_CPU` 和已有的 `RDMA_600_QP_MAX_SEND_SGE` 环境变量。
+当前只采集trace，不强制提供QP cap声明；未提供时仍按程序原有逻辑标为QP_CAP_PENDING。
 脚本使用之前示例remote=192.168.75.87、local=192.168.75.86、端口19000；实际基线不同则在各机设置
 `RDMA_IP` 和两端相同的 `REMOTE_ENDPOINT`。`HUGEPAGE_KB` 可留空使用机器默认值；指定时仅传给hugetlb进程。
-脚本只运行单口，以免同时引入双口因素；固定20 verify、100 warmup、1000 measure，随后另启进程采集2轮trace。
+脚本只运行单口，以免同时引入双口因素；固定20 verify、100 warmup，随后采集2轮trace，不运行measure。
 等待对端超时120秒；先运行remote，再运行local，同一组合结束后再开始下一组。
 
 | 组合 | remote命令 | local命令 |
@@ -62,17 +63,20 @@ cmake --build build --parallel
 | 仅remote大页 | `bash run_memory_compare.sh remote remote-huge` | `bash run_memory_compare.sh local remote-huge` |
 | 两端大页 | `bash run_memory_compare.sh remote both-huge` | `bash run_memory_compare.sh local both-huge` |
 
-每条命令自动保存measure原日志、trace原日志，再输出一份 `sgl-角色-组合-compact.json`。
-任一进程/解析失败就停止，不继续下一阶段；已存在日志会拒绝覆盖，重跑前另存上一轮文件。
+每条命令自动保存trace原日志，再输出一份 `sgl-角色-组合-compact.json`，无需measure.log。
+进程/解析失败就停止；已存在同名trace或compact会拒绝覆盖，重跑前另存上一轮文件。
 先回传 baseline 与 remote-huge 的两端JSON，共四份；确认remote实际生效后，再执行both-huge并回传新增两份。
 设备保留全部原始日志，失败时回传对应错误行。脚本不创建假的进程退出码证明，成功echo表示本机所有命令返回0。
 
 已有日志也可单独压缩：
 
 ```bash
-python3 compact_trace.py sgl-remote-remote-huge-trace.log \
-  --measure-log sgl-remote-remote-huge-measure.log > sgl-remote-remote-huge-compact.json
+python3 compact_trace.py sgl-remote-remote-huge-trace.log > sgl-remote-remote-huge-compact.json
+python3 compact_trace.py sgl-local-remote-huge-trace.log > sgl-local-remote-huge-compact.json
 ```
+
+只读取指定的trace文件，保留该进程的大页/NUMA身份和阶段指标，不查找或要求measure.log。
+以后需要正式性能对照时，再单独运行measure并显式加上可选参数 `--measure-log 对应的measure.log`。
 
 双rail继续用原先两端完整启动命令（两项IP/endpoint/app CPU/worker CPU和QP cap），各进程只追加
 `--memory-backend aligned` 或 `--memory-backend hugetlb`；每rail均独立覆盖全部对应缓冲区。

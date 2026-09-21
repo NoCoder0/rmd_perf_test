@@ -2,7 +2,8 @@
 
 2026-09-21：新增按进程选择的有效载荷分配 `--memory-backend aligned|hugetlb`，默认aligned保持原基线。
 Linux hugetlb严格失败不回退，可选`--hugepage-kb`；两端source/destination/staging均覆盖。
-分配身份和页/NUMA摘要纳入compact，正式measure可附入同一份JSON。
+分配身份和页/NUMA摘要纳入compact；当前运行脚本只采集并压缩trace，无需measure.log。
+以后正式measure可通过可选的 `--measure-log` 附入同一份JSON。
 三组对照及最少设备命令见[大页测试说明](HUGEPAGE_TEST_CN.md)。Linux/RDMA实机结果待采集。
 窗口8已实施且实测无加速，本次保持max-inflight=0，不重复扫描。
 

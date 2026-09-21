@@ -564,10 +564,14 @@ def attach_measure(output, records):
 
 
 def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("log", help="one host's complete trace stdout/stderr log")
+    parser = argparse.ArgumentParser(
+        description=__doc__,
+        epilog="Trace only: python3 compact_trace.py sgl-remote-trace.log > sgl-remote-compact.json. "
+               "No measure log is required; trace memory/page/NUMA evidence is retained.",
+    )
+    parser.add_argument("log", help="one host's complete trace stdout/stderr log (the only required input)")
     parser.add_argument("--compact", action="store_true", help="accepted for MF-style usage; already the default")
-    parser.add_argument("--measure-log", help="attach matching trace-off measure result and memory snapshots")
+    parser.add_argument("--measure-log", help="optional: also attach a matching trace-off measure log; omitted by default")
     args = parser.parse_args()
     try:
         result = compact(read_records(args.log))
