@@ -97,6 +97,8 @@ std::string SparseCopyBenchmark::FormatLocalResult() const
         << "\",\"kind\":\"" << KindName(mOptions.kind) << "\",\"mode\":\""
         << (mOptions.mode == CopyMode::Sgl ? "sgl" : "direct")
         << "\",\"links\":" << mOptions.links << ",\"sgl_items\":" << mOptions.sglItems
+        << ",\"memory_backend\":\"" << MemoryBackendName(mOptions.memoryBackend)
+        << "\",\"hugepage_kb_requested\":" << mOptions.hugePageBytes / 1024
         << ",\"notify_every_wrs\":" << mParams.notifyEveryWrs
         << ",\"pipeline\":\"" << (mOptions.pipeline == PipelineMode::On ? "on" : "off")
         << "\",\"blocks\":" << mParams.blocks << ",\"block_bytes\":" << mParams.blockBytes
@@ -220,7 +222,12 @@ void SparseCopyBenchmark::PrintRemoteStatus() const
         << ",\"mode\":\"" << (mOptions.mode == CopyMode::Direct ? "direct" : "sgl")
         << "\",\"sgl_items\":" << mOptions.sglItems
         << ",\"max_inflight\":" << mOptions.maxInflight
+        << ",\"kind\":\"" << KindName(mOptions.kind) << "\",\"blocks\":" << mParams.blocks
+        << ",\"block_bytes\":" << mParams.blockBytes << ",\"warmup_rounds\":" << mParams.warmupRounds
+        << ",\"measure_rounds\":" << mParams.measureRounds << ",\"trace_rounds\":" << mParams.traceRounds
         << ",\"inflight_limit_unit\":\"data-PutV-per-rail\""
+        << ",\"memory_backend\":\"" << MemoryBackendName(mOptions.memoryBackend)
+        << "\",\"hugepage_kb_requested\":" << mOptions.hugePageBytes / 1024
         << ",\"notify_every_wrs\":" << mOptions.notifyEveryWrs << ",\"pipeline\":\""
         << (mOptions.pipeline == PipelineMode::On ? "on" : "off")
         << "\",\"hcom_multiservice_contract\":\""

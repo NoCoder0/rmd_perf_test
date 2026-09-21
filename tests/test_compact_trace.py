@@ -12,7 +12,7 @@ import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from compact_trace import compact, read_records  # noqa: E402
+from compact_trace import attach_measure, compact, read_records  # noqa: E402
 
 
 def ev(name, time, wr="0x1", **kw):
@@ -332,6 +332,53 @@ class CompactTests(unittest.TestCase):
         self.assertNotIn("wr_id", data)
         self.assertNotIn("timestamp_ns", data)
         self.assertLess(len(data), 6000)
+
+    def with_memory(self, role="remote", links=1, backend="hugetlb"):
+        records = fixture(role)
+        records[-1].update(memory_backend=backend, hugepage_kb_requested=0, links=links)
+        if links == 2 and role == "local":
+            for r in records:
+                if r.get("chunk_id") == 1:
+                    r.update(rail=1, chunk_id=0)
+        for rail in range(links):
+            for purpose in (("source",) if role == "remote" else ("destination", "staging")):
+                for phase in ("init", "exit"):
+                    records.append(dict(record_type="memory_identity", role=role, rail=rail, purpose=purpose,
+                                        phase=phase, requested=backend, actual=backend, fallback=False,
+                                        logical_bytes=656, mapping_bytes=2097152 if backend == "hugetlb" else None,
+                                        hugetlb_page_bytes=2097152 if backend == "hugetlb" else None,
+                                        evidence="MAP_HUGETLB-success" if backend == "hugetlb" else "allocator-only",
+                                        mapping={"status": "unknown"}))
+        return records
+
+    def test_memory_preserved_for_roles_rails_and_backends(self):
+        for role in ("local", "remote"):
+            for links in (1, 2):
+                for backend in ("aligned", "hugetlb"):
+                    result = compact(self.with_memory(role, links, backend))
+                    self.assertEqual(result["status"], "ok", result)
+                    self.assertEqual(len(result["memory"]), links * (4 if role == "local" else 2))
+                    self.assertEqual(result["memory"][0]["actual"], backend)
+        self.assertEqual(compact(fixture())["memory"], [])
+
+    def test_missing_or_false_memory_evidence(self):
+        for mutation in ({"actual": "aligned"}, {"fallback": True}, {"hugetlb_page_bytes": 3},
+                         {"mapping_bytes": 656}, {"role": "local"}):
+            records = self.with_memory()
+            records[-1].update(mutation)
+            self.assertEqual(compact(records)["status"], "incomplete")
+        self.assertEqual(compact(self.with_memory()[:-1])["status"], "incomplete")
+
+    def test_measure_attachment_checks_identity_and_retains_snapshots(self):
+        records = self.with_memory()
+        measure = [dict(r) for r in records if r.get("record_type") == "memory_identity" or r.get("schema_version") == 8]
+        next(r for r in measure if r.get("schema_version") == 8).update(kind="measure", measure_rounds=1000)
+        result = attach_measure(compact(records), measure)
+        self.assertEqual(result["status"], "ok", result)
+        self.assertEqual(len(result["measure"]["memory"]), 2)
+        next(r for r in measure if r.get("schema_version") == 8)["memory_backend"] = "aligned"
+        with self.assertRaisesRegex(ValueError, "mismatch"):
+            attach_measure(compact(records), measure)
 
     def test_standalone_cli_auto_role_noise_whitespace_and_bom(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -57,6 +57,7 @@ class InflightTests(unittest.TestCase):
         declarations += "\nconstexpr uint32_t kCompiledSgeMax = 30;\n"  # Mock provider capability only.
         declarations += body(common, "struct Options {") + ";\n"
         headers = """
+#include "aligned_buffer.h"
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -226,6 +227,18 @@ int main() {
             result = self.parse(extra=("--max-inflight", value))
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("--max-inflight", result.stderr)
+
+    def test_memory_options_are_process_local_and_strict(self):
+        for role in ("local", "remote"):
+            for extra in (("--memory-backend", "aligned"), ("--memory-backend", "hugetlb"),
+                          ("--memory-backend", "hugetlb", "--hugepage-kb", "32768")):
+                result = self.parse(role=role, extra=extra)
+                self.assertEqual(result.returncode, 0, result.stderr)
+        for extra in (("--memory-backend", "auto"), ("--hugepage-kb", "2048"),
+                      ("--memory-backend", "hugetlb", "--hugepage-kb", "0"),
+                      ("--memory-backend", "hugetlb", "--hugepage-kb", "3072"),
+                      ("--memory-backend", "hugetlb", "--hugepage-kb", "18446744073709551615")):
+            self.assertNotEqual(self.parse(extra=extra).returncode, 0)
 
     def test_reject_wrong_role_mode_and_duplicate(self):
         for role, mode in (("local", "sgl"), ("remote", "direct")):

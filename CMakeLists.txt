@@ -82,6 +82,8 @@ endif()
 
 add_executable(rdma_600
     rdma_600.cpp
+    src/aligned_buffer.cpp
+    src/mapping_snapshot.cpp
     src/config.cpp
     src/support.cpp
     src/protocol.cpp

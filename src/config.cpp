@@ -168,6 +168,8 @@ void PrintUsage(std::ostream &stream)
            << "SGL measure also requires RDMA_600_QP_MAX_SEND_SGE=<cap0[,cap1]>.\n"
            << "SGL: --notify-every-wrs G (default 1, range 1..9600), per rail; flush the tail group.\n"
            << "Remote SGL: --max-inflight N (default 0=unlimited, range 0..9600), data PutV requests per rail.\n"
+           << "Payload: --memory-backend aligned|hugetlb (default aligned; Linux hugetlb has no fallback).\n"
+           << "         --hugepage-kb N (hugetlb only; default from /proc/meminfo; power-of-two KiB).\n"
            << "SGL scatter: one persistent app thread per rail, pinned by --app-cpus in rail order.\n"
            << "Singular --rdma-ip/--app-cpu/--worker-cpu remain aliases for links=1.\n"
            << "Options: --kind verify|measure|trace --verify-rounds N --warmup N --rounds N\n"
@@ -200,11 +202,12 @@ Options ParseOptions(int argc, char **argv)
     }
 
     Options options;
-    static const std::array<std::string, 25> kAllowedOptions = {
+    static const std::array<std::string, 27> kAllowedOptions = {
         "--role", "--rdma-ip", "--rdma-ips", "--listen", "--peer", "--kind", "--verify-rounds", "--warmup",
         "--rounds", "--trace-rounds", "--timeout-sec", "--app-cpu", "--app-cpus", "--worker-cpu",
         "--worker-cpus", "--links", "--mode", "--pipeline", "--blocks", "--block-bytes",
-        "--block-start", "--block-end", "--block-step", "--notify-every-wrs", "--max-inflight"};
+        "--block-start", "--block-end", "--block-step", "--notify-every-wrs", "--max-inflight",
+        "--memory-backend", "--hugepage-kb"};
     for (const auto &entry : values) {
         if (std::find(kAllowedOptions.begin(), kAllowedOptions.end(), entry.first) == kAllowedOptions.end()) {
             throw std::runtime_error("unknown option: " + entry.first);
@@ -222,6 +225,18 @@ Options ParseOptions(int argc, char **argv)
         const auto it = values.find(name);
         return it == values.end() ? fallback : it->second;
     };
+
+    const std::string backend = optional("--memory-backend", "aligned");
+    if (backend == "hugetlb") options.memoryBackend = MemoryBackend::Hugetlb;
+    else if (backend != "aligned") throw std::runtime_error("--memory-backend must be aligned or hugetlb");
+    if (values.count("--hugepage-kb")) {
+        if (options.memoryBackend != MemoryBackend::Hugetlb)
+            throw std::runtime_error("--hugepage-kb requires --memory-backend hugetlb");
+        const auto kb = ParseStrictDecimal("--hugepage-kb", values.at("--hugepage-kb"), 1,
+            std::numeric_limits<size_t>::max() / 1024);
+        if (kb & (kb - 1)) throw std::runtime_error("--hugepage-kb must be a power of two");
+        options.hugePageBytes = static_cast<size_t>(kb) * 1024;
+    }
 
     options.links = static_cast<uint16_t>(ParseUnsigned("--links", optional("--links", "1"), kMaxLinks));
     if (options.links == 0) {

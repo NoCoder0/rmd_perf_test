@@ -1,5 +1,11 @@
 # RDMA sparse_copy：可配置块数/块长与连接复用批量测试
 
+2026-09-21：新增按进程选择的有效载荷分配 `--memory-backend aligned|hugetlb`，默认aligned保持原基线。
+Linux hugetlb严格失败不回退，可选`--hugepage-kb`；两端source/destination/staging均覆盖。
+分配身份和页/NUMA摘要纳入compact，正式measure可附入同一份JSON。
+三组对照及最少设备命令见[大页测试说明](HUGEPAGE_TEST_CN.md)。Linux/RDMA实机结果待采集。
+窗口8已实施且实测无加速，本次保持max-inflight=0，不重复扫描。
+
 2026-09-20 同源阶段采集：trace 模式现在保留 `--warmup`，采集轮从 verify+warmup 之后开始；新增请求准备、
 remote请求观察/复制/解析/源准备、local consumer就绪边界。需要本次带动态接口/flags的740f0bb采集补丁，
 与MF共用同一次HCOM构建；完整设备命令见相邻仓库 `memfabric_hybrid/test/indirect_transport_test/STAGE_COMPARE_CN.md`。

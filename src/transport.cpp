@@ -155,9 +155,11 @@ void SparseCopyBenchmark::SetupRail(uint16_t rail)
     RequireOk(state.service->Start(), ("Start rail " + std::to_string(rail)).c_str());
 
     const size_t railBytes = static_cast<size_t>(mMaxRailBlocks) * kStrideBytes;
-    state.buffer.Allocate(railBytes);
+    state.buffer.Allocate(railBytes, mOptions.memoryBackend, mOptions.hugePageBytes);
     std::memset(state.buffer.Data(),
         mOptions.role == Role::Remote ? kSourceGapSentinel : kDstGapSentinel, state.buffer.Size());
+    std::cout << state.buffer.IdentityJson(RoleName(mOptions.role), rail,
+        mOptions.role == Role::Remote ? "source" : "destination", "init") << std::endl;
     RequireOk(state.service->RegisterMemoryRegion(
         reinterpret_cast<uintptr_t>(state.buffer.Data()), state.buffer.Size(), state.memoryRegion),
         ("RegisterMemoryRegion rail " + std::to_string(rail)).c_str());
@@ -170,8 +172,9 @@ void SparseCopyBenchmark::SetupRail(uint16_t rail)
 
     if (mOptions.role == Role::Local && mOptions.mode == CopyMode::Sgl) {
         const size_t stageBytes = mMaxStageBytes;
-        state.stageBuffer.Allocate(stageBytes);
+        state.stageBuffer.Allocate(stageBytes, mOptions.memoryBackend, mOptions.hugePageBytes);
         std::memset(state.stageBuffer.Data(), 0, state.stageBuffer.Size());
+        std::cout << state.stageBuffer.IdentityJson("local", rail, "staging", "init") << std::endl;
         RequireOk(state.service->RegisterMemoryRegion(reinterpret_cast<uintptr_t>(state.stageBuffer.Data()),
             state.stageBuffer.Size(), state.stageMemoryRegion),
             ("Register stage memory region rail " + std::to_string(rail)).c_str());
@@ -363,6 +366,15 @@ void SparseCopyBenchmark::TeardownRail(uint16_t rail) noexcept
 {
     mTearingDown.store(true, std::memory_order_release);
     RailState &state = mRails[rail];
+    try {
+        if (state.buffer.Data())
+            std::cout << state.buffer.IdentityJson(RoleName(mOptions.role), rail,
+                mOptions.role == Role::Remote ? "source" : "destination", "exit") << std::endl;
+        if (state.stageBuffer.Data())
+            std::cout << state.stageBuffer.IdentityJson("local", rail, "staging", "exit") << std::endl;
+    } catch (const std::exception &error) {
+        std::cerr << "WARNING: memory exit snapshot unavailable: " << error.what() << std::endl;
+    }
     UBSHcomChannelPtr channel;
     { std::lock_guard<std::mutex> lock(mChannelsMutex); channel = state.channel; state.channel.Set(nullptr); }
     if (state.service != nullptr && channel != nullptr) state.service->Disconnect(channel);

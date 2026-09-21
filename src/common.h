@@ -42,6 +42,7 @@
 #include <sched.h>
 #include <time.h>
 
+#include "aligned_buffer.h"
 #include "hcom/hcom_service.h"
 // This HCOM release only forward-declares UBSHcomServiceContext in hcom_service.h.
 #include "hcom/hcom_service_context.h"
@@ -187,6 +188,8 @@ struct Options {
     PipelineMode pipeline = PipelineMode::Off;
     uint16_t sglItems = 0;
     uint32_t notifyEveryWrs = 0; // SGL: 1..kMaxBlocks; direct: 0 (not applicable).
+    MemoryBackend memoryBackend = MemoryBackend::Aligned;
+    size_t hugePageBytes = 0; // 0 = discover Linux default; no fallback.
     uint32_t maxInflight = 0; // Remote SGL only: outstanding data PutV requests per rail; 0 = unlimited.
     std::vector<uint32_t> qpMaxSendSge;
     bool qpCapDeclared = false;
@@ -264,56 +267,6 @@ struct ChunkDoneInfo {
     uint32_t itemCount = 0;
     uint32_t payloadBytes = 0;
     uint32_t chunkCount = 0;
-};
-
-class AlignedBuffer {
-public:
-    AlignedBuffer() = default;
-    AlignedBuffer(const AlignedBuffer &) = delete;
-    AlignedBuffer &operator=(const AlignedBuffer &) = delete;
-
-    ~AlignedBuffer()
-    {
-        Reset();
-    }
-
-    void Allocate(size_t size)
-    {
-        Reset();
-#if defined(_WIN32)
-        void *memory = _aligned_malloc(size, 4096);
-        const int rc = memory == nullptr ? errno : 0;
-#else
-        void *memory = nullptr;
-        const int rc = posix_memalign(&memory, 4096, size);
-#endif
-        if (rc != 0 || memory == nullptr) {
-            throw std::runtime_error("posix_memalign failed for " + std::to_string(size) + " bytes: " +
-                std::strerror(rc == 0 ? errno : rc));
-        }
-        mData = static_cast<uint8_t *>(memory);
-        mSize = size;
-    }
-
-    void Reset()
-    {
-        if (mData != nullptr) {
-#if defined(_WIN32)
-            _aligned_free(mData);
-#else
-            std::free(mData);
-#endif
-            mData = nullptr;
-            mSize = 0;
-        }
-    }
-
-    uint8_t *Data() const { return mData; }
-    size_t Size() const { return mSize; }
-
-private:
-    uint8_t *mData = nullptr;
-    size_t mSize = 0;
 };
 
 constexpr uint64_t kChunkReadyPublishing = std::numeric_limits<uint64_t>::max();

@@ -308,6 +308,8 @@ def configuration(records, apps, role, errors, warnings):
             "warmup_rounds",
             "trace_rounds",
             "source_order",
+            "memory_backend",
+            "hugepage_kb_requested",
         )
         if k in config
     }
@@ -416,6 +418,48 @@ def normalize_events(records, role):
     return events
 
 
+def memory_identity(records, role, config, errors, warnings):
+    identities = [r for r in records if r.get("record_type") == "memory_identity"]
+    if not identities:
+        warnings.add("memory identity unavailable (legacy log or missing metadata)")
+        if "memory_backend" in config:
+            errors.append("missing_memory_identity")
+        return []
+    purposes = ("source",) if role == "remote" else ("destination", "staging")
+    expected = {(rail, purpose, phase) for rail in range(config["links"])
+                for purpose in purposes for phase in ("init", "exit")}
+    keys = C.Counter((r.get("rail"), r.get("purpose"), r.get("phase")) for r in identities)
+    if keys != C.Counter({key: 1 for key in expected}):
+        errors.append("memory_identity_coverage")
+    for r in identities:
+        requested, actual = r.get("requested"), r.get("actual")
+        if (r.get("role") != role or requested not in ("aligned", "hugetlb") or actual != requested
+                or r.get("fallback") is not False or requested != config.get("memory_backend")):
+            errors.append("memory_identity_backend_or_role")
+        if actual == "hugetlb":
+            page, mapped, logical = (r.get(k) for k in ("hugetlb_page_bytes", "mapping_bytes", "logical_bytes"))
+            if (not all(isinstance(n, int) and n > 0 for n in (page, mapped, logical))
+                    or page & (page - 1) or mapped % page or not logical <= mapped < logical + page
+                    or r.get("evidence") != "MAP_HUGETLB-success"):
+                errors.append("memory_identity_hugetlb_evidence")
+            requested_kb = config.get("hugepage_kb_requested", 0)
+            if requested_kb and page != requested_kb * 1024:
+                errors.append("memory_identity_page_size_mismatch")
+        mapping = r.get("mapping", {})
+        if actual == "hugetlb" and any(v.get("hugetlb_flag") is False for v in mapping.get("vmas", [])):
+            errors.append("memory_identity_mapping_contradiction")
+        if mapping.get("status") != "covered":
+            warnings.add("memory mapping snapshot unavailable or partial; NUMA/page details unknown")
+    for rail, purpose in {(rail, purpose) for rail, purpose, _ in expected}:
+        pair = [r for r in identities if r.get("rail") == rail and r.get("purpose") == purpose]
+        fields = ("requested", "actual", "logical_bytes", "mapping_bytes", "hugetlb_page_bytes", "address")
+        if len(pair) == 2 and any(pair[0].get(f) != pair[1].get(f) for f in fields):
+            errors.append("memory_identity_changed")
+    # Retain both snapshots (THP/NUMA can change), omit process virtual addresses.
+    return [{k: v for k, v in r.items() if k not in ("record_type", "address")}
+            for r in sorted(identities, key=lambda r: (r["rail"], r["purpose"], r["phase"]))]
+
+
 def compact(records):
     role = detect_role(records)
     events = normalize_events(records, role)
@@ -429,6 +473,7 @@ def compact(records):
     rows, match_errors = match(events)
     errors += match_errors
     config = configuration(records, apps, role, errors, warnings)
+    memory = memory_identity(records, role, config, errors, warnings)
     generations = {r["generation"] for r in apps}
     if any(not isinstance(n, int) or n <= 0 for n in generations):
         raise ValueError("invalid application generation")
@@ -446,6 +491,7 @@ def compact(records):
         "format": "sgl-compact-v1",
         "role": role,
         "config": config,
+        "memory": memory,
         "hcom_build": next((r.get("id") for r in records if r.get("record_type") == "hcom_build_identity"), None),
         "collector": collector,
         "errors": histogram(errors),
@@ -490,13 +536,43 @@ def compact(records):
     return output
 
 
+def attach_measure(output, records):
+    role = detect_role(records)
+    if role != output["role"]:
+        raise ValueError("measure/trace roles differ")
+    errors, warnings = [], set()
+    config = configuration(records, [], role, errors, warnings)
+    results = [r for r in records if r.get("schema_version") == 8 and r.get("role") == role]
+    if len(results) != 1 or results[0].get("kind") != "measure":
+        raise ValueError("--measure-log requires one successful --kind measure case from this build")
+    for field in ("commit", "mode", "links", "blocks", "block_bytes", "sgl_items", "notify_every_wrs",
+                  "max_inflight", "pipeline", "warmup_rounds", "source_order", "memory_backend",
+                  "hugepage_kb_requested"):
+        if config.get(field) != output["config"].get(field):
+            raise ValueError(f"measure/trace config mismatch: {field}")
+    if any(r.get("record_type") in ("trace", "hcom_trace") for r in records):
+        errors.append("measure_contains_trace")
+    build = next((r.get("id") for r in records if r.get("record_type") == "hcom_build_identity"), None)
+    if build != output["hcom_build"]:
+        raise ValueError("measure/trace HCOM build mismatch")
+    memory = memory_identity(records, role, config, errors, warnings)
+    output["measure"] = {"result": results[0], "memory": memory, "errors": histogram(errors)}
+    output["warnings"] = sorted(set(output["warnings"]) | warnings)
+    if errors:
+        output["status"] = "incomplete"
+    return output
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("log", help="one host's complete trace stdout/stderr log")
     parser.add_argument("--compact", action="store_true", help="accepted for MF-style usage; already the default")
+    parser.add_argument("--measure-log", help="attach matching trace-off measure result and memory snapshots")
     args = parser.parse_args()
     try:
         result = compact(read_records(args.log))
+        if args.measure_log:
+            result = attach_measure(result, read_records(args.measure_log))
     except (OSError, ValueError, KeyError, TypeError) as error:
         print(f"ERROR: invalid/incomplete SGL trace: {error}", file=sys.stderr)
         return 2
