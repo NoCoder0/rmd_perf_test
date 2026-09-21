@@ -12,7 +12,7 @@ import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from compact_trace import attach_measure, compact, read_records  # noqa: E402
+from compact_trace import compact, read_records  # noqa: E402
 
 
 def ev(name, time, wr="0x1", **kw):
@@ -368,17 +368,6 @@ class CompactTests(unittest.TestCase):
             records[-1].update(mutation)
             self.assertEqual(compact(records)["status"], "incomplete")
         self.assertEqual(compact(self.with_memory()[:-1])["status"], "incomplete")
-
-    def test_measure_attachment_checks_identity_and_retains_snapshots(self):
-        records = self.with_memory()
-        measure = [dict(r) for r in records if r.get("record_type") == "memory_identity" or r.get("schema_version") == 8]
-        next(r for r in measure if r.get("schema_version") == 8).update(kind="measure", measure_rounds=1000)
-        result = attach_measure(compact(records), measure)
-        self.assertEqual(result["status"], "ok", result)
-        self.assertEqual(len(result["measure"]["memory"]), 2)
-        next(r for r in measure if r.get("schema_version") == 8)["memory_backend"] = "aligned"
-        with self.assertRaisesRegex(ValueError, "mismatch"):
-            attach_measure(compact(records), measure)
 
     def test_standalone_cli_auto_role_noise_whitespace_and_bom(self):
         with tempfile.TemporaryDirectory() as directory:

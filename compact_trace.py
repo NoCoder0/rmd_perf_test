@@ -536,33 +536,6 @@ def compact(records):
     return output
 
 
-def attach_measure(output, records):
-    role = detect_role(records)
-    if role != output["role"]:
-        raise ValueError("measure/trace roles differ")
-    errors, warnings = [], set()
-    config = configuration(records, [], role, errors, warnings)
-    results = [r for r in records if r.get("schema_version") == 8 and r.get("role") == role]
-    if len(results) != 1 or results[0].get("kind") != "measure":
-        raise ValueError("--measure-log requires one successful --kind measure case from this build")
-    for field in ("commit", "mode", "links", "blocks", "block_bytes", "sgl_items", "notify_every_wrs",
-                  "max_inflight", "pipeline", "warmup_rounds", "source_order", "memory_backend",
-                  "hugepage_kb_requested"):
-        if config.get(field) != output["config"].get(field):
-            raise ValueError(f"measure/trace config mismatch: {field}")
-    if any(r.get("record_type") in ("trace", "hcom_trace") for r in records):
-        errors.append("measure_contains_trace")
-    build = next((r.get("id") for r in records if r.get("record_type") == "hcom_build_identity"), None)
-    if build != output["hcom_build"]:
-        raise ValueError("measure/trace HCOM build mismatch")
-    memory = memory_identity(records, role, config, errors, warnings)
-    output["measure"] = {"result": results[0], "memory": memory, "errors": histogram(errors)}
-    output["warnings"] = sorted(set(output["warnings"]) | warnings)
-    if errors:
-        output["status"] = "incomplete"
-    return output
-
-
 def main():
     parser = argparse.ArgumentParser(
         description=__doc__,
@@ -571,12 +544,9 @@ def main():
     )
     parser.add_argument("log", help="one host's complete trace stdout/stderr log (the only required input)")
     parser.add_argument("--compact", action="store_true", help="accepted for MF-style usage; already the default")
-    parser.add_argument("--measure-log", help="optional: also attach a matching trace-off measure log; omitted by default")
     args = parser.parse_args()
     try:
         result = compact(read_records(args.log))
-        if args.measure_log:
-            result = attach_measure(result, read_records(args.measure_log))
     except (OSError, ValueError, KeyError, TypeError) as error:
         print(f"ERROR: invalid/incomplete SGL trace: {error}", file=sys.stderr)
         return 2

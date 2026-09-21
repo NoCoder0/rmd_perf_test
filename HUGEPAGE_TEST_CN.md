@@ -50,37 +50,59 @@ cmake --build build --parallel
 `git apply --check /path/to/sgl_hugetlb_20260921.patch`，通过后再执行相同命令去掉 `--check`，然后构建。
 拉取和应用补丁二选一；已有补丁时先保留本地改动，不重复应用，也不用reset清空现场。
 
-两端保留原 `APP_CPU`、`WORKER_CPU` 和已有的 `RDMA_600_QP_MAX_SEND_SGE` 环境变量。
-当前只采集trace，不强制提供QP cap声明；未提供时仍按程序原有逻辑标为QP_CAP_PENDING。
-脚本使用之前示例remote=192.168.75.87、local=192.168.75.86、端口19000；实际基线不同则在各机设置
-`RDMA_IP` 和两端相同的 `REMOTE_ENDPOINT`。`HUGEPAGE_KB` 可留空使用机器默认值；指定时仅传给hugetlb进程。
-脚本只运行单口，以免同时引入双口因素；固定20 verify、100 warmup，随后采集2轮trace，不运行measure。
-等待对端超时120秒；先运行remote，再运行local，同一组合结束后再开始下一组。
+手动启动程序，然后手动压缩日志，不提供运行包装脚本，不附加measure日志。
+以下是“仅remote大页”的单口示例。保留各机原有 `APP_CPU`、`WORKER_CPU` 和已有的
+`RDMA_600_QP_MAX_SEND_SGE` 环境变量；IP/端口不同则沿用实际基线地址。
+trace不强制提供QP cap声明，未提供时仍标为QP_CAP_PENDING。
 
-| 组合 | remote命令 | local命令 |
-|---|---|---|
-| 原分配 | `bash run_memory_compare.sh remote baseline` | `bash run_memory_compare.sh local baseline` |
-| 仅remote大页 | `bash run_memory_compare.sh remote remote-huge` | `bash run_memory_compare.sh local remote-huge` |
-| 两端大页 | `bash run_memory_compare.sh remote both-huge` | `bash run_memory_compare.sh local both-huge` |
-
-每条命令自动保存trace原日志，再输出一份 `sgl-角色-组合-compact.json`，无需measure.log。
-进程/解析失败就停止；已存在同名trace或compact会拒绝覆盖，重跑前另存上一轮文件。
-先回传 baseline 与 remote-huge 的两端JSON，共四份；确认remote实际生效后，再执行both-huge并回传新增两份。
-设备保留全部原始日志，失败时回传对应错误行。脚本不创建假的进程退出码证明，成功echo表示本机所有命令返回0。
-
-已有日志也可单独压缩：
+先在remote手动执行：
 
 ```bash
-python3 compact_trace.py sgl-remote-remote-huge-trace.log > sgl-remote-remote-huge-compact.json
-python3 compact_trace.py sgl-local-remote-huge-trace.log > sgl-local-remote-huge-compact.json
+RDMA_600_SGL_ITEMS=30 ./build/rdma_600 \
+  --role remote --rdma-ip 192.168.75.87 --listen 192.168.75.87:19000 \
+  --app-cpu "$APP_CPU" --worker-cpu "$WORKER_CPU" \
+  --links 1 --mode sgl --pipeline on --blocks 1600 --block-bytes 656 \
+  --notify-every-wrs 32 --max-inflight 0 --memory-backend hugetlb \
+  --kind trace --verify-rounds 20 --warmup 100 --trace-rounds 2 --timeout-sec 120 \
+  > sgl-remote-trace.log 2>&1
+```
+
+随后在local手动执行：
+
+```bash
+RDMA_600_SGL_ITEMS=30 RDMA_600_SOURCE_SEQUENTIAL=1 ./build/rdma_600 \
+  --role local --rdma-ip 192.168.75.86 --peer 192.168.75.87:19000 \
+  --app-cpu "$APP_CPU" --worker-cpu "$WORKER_CPU" \
+  --links 1 --mode sgl --pipeline on --blocks 1600 --block-bytes 656 \
+  --notify-every-wrs 32 --memory-backend aligned \
+  --kind trace --verify-rounds 20 --warmup 100 --trace-rounds 2 --timeout-sec 120 \
+  > sgl-local-trace.log 2>&1
+```
+
+只修改两端各自的 `--memory-backend` 即可做三组对照；需要指定大页大小时，在hugetlb端追加
+`--hugepage-kb N`，不指定则使用机器默认大页大小。每组另存日志，避免覆盖上一组。
+
+| 组合 | remote后端 | local后端 |
+|---|---|---|
+| 原分配 | `aligned` | `aligned` |
+| 仅remote大页 | `hugetlb` | `aligned` |
+| 两端大页 | `hugetlb` | `hugetlb` |
+
+两端程序正常结束后，在对应机器分别手动压缩日志。先回传原分配与仅remote大页的两端JSON，共四份；
+确认remote实际生效后，再对照两端大页。设备保留完整原始日志，失败时回传错误行及退出码。
+
+已有日志直接执行以下命令即可，无需重新运行程序：
+
+```bash
+python3 compact_trace.py sgl-remote-trace.log > sgl-remote-compact.json
+python3 compact_trace.py sgl-local-trace.log > sgl-local-compact.json
 ```
 
 只读取指定的trace文件，保留该进程的大页/NUMA身份和阶段指标，不查找或要求measure.log。
-以后需要正式性能对照时，再单独运行measure并显式加上可选参数 `--measure-log 对应的measure.log`。
 
 双rail继续用原先两端完整启动命令（两项IP/endpoint/app CPU/worker CPU和QP cap），各进程只追加
 `--memory-backend aligned` 或 `--memory-backend hugetlb`；每rail均独立覆盖全部对应缓冲区。
-不要把单口脚本直接当成双口脚本。现有S2的HCOM多service契约诊断限制仍保留。
+现有S2的HCOM多service契约诊断限制仍保留。
 
 只读查看系统页大小和池，不自动调整：
 
@@ -112,8 +134,7 @@ Private/Shared_Hugetlb、VmFlags.ht以及每NUMA节点页数和其页单位。�
 
 compact保持原 `sgl-compact-v1`及既有阶段指标，新添 `memory`，旧日志继续解析并明确缺少页证据。
 新日志检查单/双rail用途和init/exit覆盖、后端一致性、映射取整和hugetlb成功证据；缺失或矛盾标incomplete。
-`--measure-log`附加同角色、同workload/后端/提交/HCOM身份的trace-off结果及那次进程自己的页证据，
-不以trace进程的页证据替代measure进程。页类型/NUMA可能随运行变化，归因前逐份核对。
+只压缩当前trace进程的证据，不合并其他运行。页类型/NUMA可能随运行变化，归因前逐份核对。
 保留原首次post→最后CQE、完成25/50/75/100%、在途WR、最后组可消费、scatter及e2e指标。
 所有/proc读取只在初始化和退出，无逐WR输出或测量热路径读取。
 
@@ -142,15 +163,14 @@ python3 /path/to/perf_test_duo_card_sgl/mapping_check.py "$PID" "$PAYLOAD_ADDR" 
 
 ```bash
 python3 -m unittest discover -s tests -p 'test_*.py'
-bash -n run_memory_compare.sh
 ```
 
-本Windows环境已通过30项CPU/解析检查及全C++翻译单元兼容头语法检查。
+本Windows环境已通过29项CPU/解析检查；核心C++此前通过全翻译单元兼容头语法检查。
 涵盖普通分配、默认页解析、非4KiB基础页、取整/溢出、失败后所有权、严格不回退、RAII/重复Reset/
-munmap完整长度、参数、窗口回归、单/双rail身份、旧日志及measure/trace配对、只读映射解析。
+munmap完整长度、参数、窗口回归、单/双rail身份、旧trace日志兼容及只读映射解析。
 Linux mmap分支由替身系统调用编译执行；不是Linux hugetlb成功、目标机完整链接或RDMA验证。
 实机第一轮仍需构建成功、完整verify、两端退出0及各自actual/evidence匹配。
 
-正式收益看trace-off的1000轮local avg/p50/p95/p99；少量trace用于解释完成曲线与末组就绪时间。
+当前只采集trace，用于解释完成曲线与末组就绪时间，trace耗时不等同于关闭采集的正式性能。
 若仅remote大页有变化，再与两端大页比较接收侧增量；同时核对NUMA分布，不能把位置变化误当纯页大小效果。
 大页是否缩小MF/SGL差距留待设备结果，不预先承诺加速。
