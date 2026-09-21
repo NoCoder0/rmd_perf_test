@@ -187,6 +187,7 @@ struct Options {
     PipelineMode pipeline = PipelineMode::Off;
     uint16_t sglItems = 0;
     uint32_t notifyEveryWrs = 0; // SGL: 1..kMaxBlocks; direct: 0 (not applicable).
+    uint32_t maxInflight = 0; // Remote SGL only: outstanding data PutV requests per rail; 0 = unlimited.
     std::vector<uint32_t> qpMaxSendSge;
     bool qpCapDeclared = false;
     std::vector<std::string> rdmaIps;

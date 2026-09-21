@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: MulanPSL-2.0
 #include "benchmark.h"
+#include "inflight_window.h"
 
 namespace rdma_bench {
 
@@ -121,6 +122,17 @@ void SparseCopyBenchmark::ProcessRemoteRail(uint16_t rail, uint64_t generation, 
     });
 }
 
+void SparseCopyBenchmark::WaitForSglWindow(uint16_t rail, uint64_t deadlineNs)
+{
+    const RailState &state = mRails[rail];
+    const uint64_t submitted = state.appCounters.attemptedDataCallbacks;
+    const auto hasCredit = [&state, submitted, this] {
+        return HasSglWindowCredit(submitted,
+            state.callbackCounters.dataDoneCallbacks.load(std::memory_order_acquire), mOptions.maxInflight);
+    };
+    if (!hasCredit()) WaitDataUntil("SGL inflight window", deadlineNs, hasCredit);
+}
+
 void SparseCopyBenchmark::ProcessRemoteSglRail(uint16_t rail, uint64_t generation, uint64_t deadlineNs)
 {
     RailState &state = mRails[rail];
@@ -131,6 +143,8 @@ void SparseCopyBenchmark::ProcessRemoteSglRail(uint16_t rail, uint64_t generatio
     const uint64_t expectedSend = ExpectedSendCallbacks(rail) + RailNotifications(rail);
     const UBSHcomChannelPtr channel = ChannelCopyRequired(rail, "remote SGL copy");
     for (uint32_t chunk = 0; chunk < RailChunks(rail); ++chunk) {
+        // Disabled path: no extra atomic load or clock read.
+        if (mOptions.maxInflight != 0) WaitForSglWindow(rail, deadlineNs);
         Callback *callback = NewDataCallback(rail, generation, expectedData, static_cast<int>(chunk));
         if (callback == nullptr) throw std::runtime_error("PutV callback allocation failed");
         ++state.appCounters.attemptedDataCallbacks;

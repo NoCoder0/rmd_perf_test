@@ -107,6 +107,9 @@ G按每条rail的数据PutV调用计数，每个PutV在当前预期SGL路径对�
 
 ## 已有 trace 日志生成紧凑 JSON
 
+在途窗口实验：remote新增`--max-inflight 0|4|8`，默认0不限制；
+完整构建、运行和比较命令见[在途窗口测试](INFLIGHT_WINDOW_TEST_CN.md)。local不要添加该选项。
+
 在本仓库根目录直接执行，不需要 MF 仓库、identity 文件、手填角色或重新编译：
 
 ```bash

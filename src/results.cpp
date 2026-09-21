@@ -219,6 +219,8 @@ void SparseCopyBenchmark::PrintRemoteStatus() const
         << "\",\"processed_calls\":" << mCaseLastGeneration << ",\"case_count\":" << mCases.size() << ",\"links\":" << mOptions.links
         << ",\"mode\":\"" << (mOptions.mode == CopyMode::Direct ? "direct" : "sgl")
         << "\",\"sgl_items\":" << mOptions.sglItems
+        << ",\"max_inflight\":" << mOptions.maxInflight
+        << ",\"inflight_limit_unit\":\"data-PutV-per-rail\""
         << ",\"notify_every_wrs\":" << mOptions.notifyEveryWrs << ",\"pipeline\":\""
         << (mOptions.pipeline == PipelineMode::On ? "on" : "off")
         << "\",\"hcom_multiservice_contract\":\""

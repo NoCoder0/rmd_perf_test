@@ -260,6 +260,13 @@ class CompactTests(unittest.TestCase):
         self.assertTrue(any("round count absent" in w for w in result["warnings"]))
         self.assertNotIn("identity", result)
 
+    def test_remote_window_setting_preserved_without_inventing_local_setting(self):
+        for window in (0, 4, 8):
+            records = fixture()
+            records[-1].update(max_inflight=window, inflight_limit_unit="data-PutV-per-rail")
+            self.assertEqual(compact(records)["config"]["max_inflight"], window)
+        self.assertNotIn("max_inflight", compact(fixture("local"))["config"])
+
     def test_poll_histograms_absent_vs_recorded(self):
         records = fixture()
         self.assertNotIn("poll_call_bins", compact(records)["rounds"][0])

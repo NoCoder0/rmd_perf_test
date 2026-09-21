@@ -167,6 +167,7 @@ void PrintUsage(std::ostream &stream)
            << "SGL K comes from RDMA_600_SGL_ITEMS (default 16, design range 1..30).\n"
            << "SGL measure also requires RDMA_600_QP_MAX_SEND_SGE=<cap0[,cap1]>.\n"
            << "SGL: --notify-every-wrs G (default 1, range 1..9600), per rail; flush the tail group.\n"
+           << "Remote SGL: --max-inflight N (default 0=unlimited, range 0..9600), data PutV requests per rail.\n"
            << "SGL scatter: one persistent app thread per rail, pinned by --app-cpus in rail order.\n"
            << "Singular --rdma-ip/--app-cpu/--worker-cpu remain aliases for links=1.\n"
            << "Options: --kind verify|measure|trace --verify-rounds N --warmup N --rounds N\n"
@@ -199,11 +200,11 @@ Options ParseOptions(int argc, char **argv)
     }
 
     Options options;
-    static const std::array<std::string, 24> kAllowedOptions = {
+    static const std::array<std::string, 25> kAllowedOptions = {
         "--role", "--rdma-ip", "--rdma-ips", "--listen", "--peer", "--kind", "--verify-rounds", "--warmup",
         "--rounds", "--trace-rounds", "--timeout-sec", "--app-cpu", "--app-cpus", "--worker-cpu",
         "--worker-cpus", "--links", "--mode", "--pipeline", "--blocks", "--block-bytes",
-        "--block-start", "--block-end", "--block-step", "--notify-every-wrs"};
+        "--block-start", "--block-end", "--block-step", "--notify-every-wrs", "--max-inflight"};
     for (const auto &entry : values) {
         if (std::find(kAllowedOptions.begin(), kAllowedOptions.end(), entry.first) == kAllowedOptions.end()) {
             throw std::runtime_error("unknown option: " + entry.first);
@@ -277,6 +278,13 @@ Options ParseOptions(int argc, char **argv)
         }
     } else {
         throw std::runtime_error("--role must be local or remote");
+    }
+
+    if (values.count("--max-inflight")) {
+        if (options.role != Role::Remote || options.mode != CopyMode::Sgl)
+            throw std::runtime_error("--max-inflight is only applicable to --role remote --mode sgl");
+        options.maxInflight = static_cast<uint32_t>(ParseStrictDecimal(
+            "--max-inflight", values.at("--max-inflight"), 0, kMaxBlocks));
     }
 
     if (values.count("--rdma-ip") != 0 && values.count("--rdma-ips") != 0) {

@@ -302,6 +302,8 @@ def configuration(records, apps, role, errors, warnings):
             "block_bytes",
             "sgl_items",
             "notify_every_wrs",
+            "max_inflight",
+            "inflight_limit_unit",
             "pipeline",
             "warmup_rounds",
             "trace_rounds",
