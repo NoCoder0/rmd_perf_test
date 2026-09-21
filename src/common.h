@@ -100,6 +100,7 @@ constexpr uint16_t kPipelineOff = 0;
 constexpr uint16_t kPipelineOn = 1;
 constexpr uint16_t kSourceFormatDirectPairs = 1;
 constexpr uint16_t kSourceFormatSparsePairs = 2;
+constexpr uint16_t kSourceFormatStaticFlag = 0x8000; // Negotiated content policy; wire size unchanged.
 constexpr uint16_t kDefaultSglItems = 16;
 constexpr uint16_t kDesignMaxSglItems = 30;
 constexpr uint32_t kCompiledSgeMax = ock::hcom::NET_SGE_MAX_IOV;
@@ -181,6 +182,7 @@ enum class CopyMode : uint16_t { Direct = kModeDirect, Sgl = kModeSgl };
 enum class PipelineMode : uint16_t { Off = kPipelineOff, On = kPipelineOn };
 
 struct Options {
+    std::string sourceUpdate = "markers";
     Role role = Role::Local;
     RunKind kind = RunKind::Measure;
     uint16_t links = 1;
@@ -301,6 +303,7 @@ struct TraceRound {
     TracePoint remoteRequestObserved;
     TracePoint remoteRequestCopied;
     TracePoint remoteRequestDecoded;
+    std::array<TracePoint, kMaxLinks> remoteSourcePrepareBegin;
     std::array<TracePoint, kMaxLinks> remoteSourcePrepared;
     std::array<TracePoint, kMaxLinks> remoteRequestsPrepared;
     std::array<TracePoint, kMaxLinks> remotePosted;

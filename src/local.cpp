@@ -252,13 +252,14 @@ void SparseCopyBenchmark::ScatterSglRail(uint16_t rail, uint64_t generation, uin
 
 void SparseCopyBenchmark::VerifyLocalMarkers(uint64_t generation)
 {
+    const uint64_t seed = MarkerSeed(generation); // Payload seed only; control generation keeps advancing.
     for (uint32_t index = 0; index < mParams.blocks; ++index) {
         const uint16_t rail = RailForRequestIndex(index, mParams);
         const CopyEntry &entry = mCopyEntries[index];
         const uint32_t source = rail * mBlocksPerRail + static_cast<uint32_t>(entry.remoteSourceOffset / kStrideBytes);
         const auto *words = reinterpret_cast<const uint64_t *>(mRails[rail].buffer.Data() + entry.localDestinationOffset);
         const uint32_t last = mParams.blockBytes / 8 - 1;
-        if (words[0] != PatternWord(generation, source, 0) || words[last] != PatternWord(generation, source, last))
+        if (words[0] != PatternWord(seed, source, 0) || words[last] != PatternWord(seed, source, last))
             throw std::runtime_error("stale/missing data at generation=" + std::to_string(generation) +
                 " request=" + std::to_string(index));
     }
@@ -276,7 +277,8 @@ void SparseCopyBenchmark::VerifyLocalDestination(const std::vector<CopyEntry> &e
                 entries[index].localDestinationOffset, kStrideBytes, mRails[rail].buffer.Size(), destinationAddress))
             throw std::runtime_error("verification address overflow/out of range");
         const auto *destination = reinterpret_cast<const uint8_t *>(static_cast<uintptr_t>(destinationAddress));
-        if (!VerifyBlock(destination, generation, globalBlock, mParams.blockBytes, BodySeed(generation), error) ||
+        if (!VerifyBlock(destination, MarkerSeed(generation), globalBlock, mParams.blockBytes,
+                BodySeed(generation), error) ||
             !VerifyGap(destination, mParams.blockBytes, error))
             throw std::runtime_error("request " + std::to_string(index) + ": " + error);
     }

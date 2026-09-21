@@ -69,6 +69,8 @@ void SparseCopyBenchmark::EmitTrace() const
                 } else {
                     for (uint32_t chunk = 0; chunk < RailChunks(rail); ++chunk) {
                         if (chunk == 0) {
+                            EmitTracePoint("remote_source_prepare_begin", t.generation, rail,
+                                t.remoteSourcePrepareBegin[rail]);
                             EmitTracePoint("remote_source_prepared", t.generation, rail, t.remoteSourcePrepared[rail]);
                             EmitTracePoint("remote_requests_prepared", t.generation, rail, t.remoteRequestsPrepared[rail]);
                         }
@@ -98,6 +100,7 @@ std::string SparseCopyBenchmark::FormatLocalResult() const
         << (mOptions.mode == CopyMode::Sgl ? "sgl" : "direct")
         << "\",\"links\":" << mOptions.links << ",\"sgl_items\":" << mOptions.sglItems
         << ",\"memory_backend\":\"" << MemoryBackendName(mOptions.memoryBackend)
+        << "\",\"source_update\":\"" << mOptions.sourceUpdate
         << "\",\"hugepage_kb_requested\":" << mOptions.hugePageBytes / 1024
         << ",\"notify_every_wrs\":" << mParams.notifyEveryWrs
         << ",\"pipeline\":\"" << (mOptions.pipeline == PipelineMode::On ? "on" : "off")
@@ -226,6 +229,7 @@ void SparseCopyBenchmark::PrintRemoteStatus() const
         << ",\"block_bytes\":" << mParams.blockBytes << ",\"warmup_rounds\":" << mParams.warmupRounds
         << ",\"measure_rounds\":" << mParams.measureRounds << ",\"trace_rounds\":" << mParams.traceRounds
         << ",\"inflight_limit_unit\":\"data-PutV-per-rail\""
+        << ",\"source_update\":\"" << mOptions.sourceUpdate << "\""
         << ",\"memory_backend\":\"" << MemoryBackendName(mOptions.memoryBackend)
         << "\",\"hugepage_kb_requested\":" << mOptions.hugePageBytes / 1024
         << ",\"notify_every_wrs\":" << mOptions.notifyEveryWrs << ",\"pipeline\":\""

@@ -15,6 +15,7 @@ SparseCopyBenchmark::SparseCopyBenchmark(Options options) : mOptions(std::move(o
     mParams.notifyEveryWrs = mOptions.notifyEveryWrs;
     mParams.pipeline = static_cast<uint16_t>(mOptions.pipeline);
     mParams.sourceFormat = mOptions.mode == CopyMode::Direct ? kSourceFormatDirectPairs : kSourceFormatSparsePairs;
+    if (mOptions.sourceUpdate == "static") mParams.sourceFormat |= kSourceFormatStaticFlag;
     for (const uint32_t bytes : mOptions.blockLengths) {
         for (const uint32_t blocks : mOptions.blockCounts) {
             CaseParameters item = mParams;

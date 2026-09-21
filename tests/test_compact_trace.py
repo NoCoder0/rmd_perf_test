@@ -170,6 +170,24 @@ def fixture(role="remote"):
 
 
 class CompactTests(unittest.TestCase):
+    def test_source_update_and_separate_prepare_interval(self):
+        legacy = compact(fixture())
+        self.assertEqual(legacy["rounds"][0]["source_prepare_basis"], "legacy-decoded-to-prepared")
+        for mode in ("static", "markers"):
+            records = fixture()
+            records[-1]["source_update"] = mode
+            begin = dict(records[0], event="remote_source_prepare_begin", timestamp_ns=220)
+            records.append(begin)
+            current = compact(records)
+            self.assertEqual(current["status"], "ok", current)
+            self.assertEqual(current["config"]["source_update"], mode)
+            self.assertEqual(current["rounds"][0]["source_prepare_us"], 0.03)
+            self.assertEqual(current["rounds"][0]["source_prepare_basis"], "prepare-only")
+            self.assertEqual(current["rounds"][0]["first_data_post_to_last_cqe_us"],
+                             legacy["rounds"][0]["first_data_post_to_last_cqe_us"])
+            records.pop()
+            self.assertEqual(compact(records)["status"], "incomplete")
+
     def test_complete_remote_early_completion_reused_wr_and_tail(self):
         result = compact(fixture())
         self.assertEqual(result["status"], "ok", result)

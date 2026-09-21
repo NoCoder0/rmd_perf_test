@@ -91,9 +91,11 @@ void SparseCopyBenchmark::DecodeActiveCopyRequest(uint64_t generation)
 void SparseCopyBenchmark::ProcessRemoteRail(uint16_t rail, uint64_t generation, uint64_t deadlineNs)
 {
     RailState &state = mRails[rail];
-    FillRemoteSourceRail(rail, generation);
     size_t stageTrace = 0;
-    if (TraceIndex(generation, stageTrace)) mTrace[stageTrace].remoteSourcePrepared[rail].Publish(NowNs());
+    const bool tracing = TraceIndex(generation, stageTrace);
+    if (tracing) mTrace[stageTrace].remoteSourcePrepareBegin[rail].Publish(NowNs());
+    FillRemoteSourceRail(rail, generation);
+    if (tracing) mTrace[stageTrace].remoteSourcePrepared[rail].Publish(NowNs());
     if (mOptions.mode == CopyMode::Sgl) {
         ProcessRemoteSglRail(rail, generation, deadlineNs);
         return;
@@ -236,6 +238,8 @@ void SparseCopyBenchmark::BuildRemotePutRequests(uint16_t rail)
 
 void SparseCopyBenchmark::FillRemoteSourceRail(uint16_t rail, uint64_t generation)
 {
+    // Verify rounds initialize and fully validate the body. Static then retains the last verified content.
+    if (mOptions.sourceUpdate == "static" && generation >= mCaseFirstGeneration + mParams.verifyRounds) return;
     for (uint32_t slot = 0; slot < mParams.RailBlocks(rail); ++slot) {
         const uint32_t globalBlock = static_cast<uint32_t>(rail) * mBlocksPerRail + slot;
         uint8_t *address = mRails[rail].buffer.Data() + static_cast<size_t>(slot) * kStrideBytes;

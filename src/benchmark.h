@@ -85,6 +85,11 @@ private:
         return std::min(generation, mCaseFirstGeneration + mParams.verifyRounds - 1);
     }
 
+    uint64_t MarkerSeed(uint64_t generation) const
+    {
+        return mOptions.sourceUpdate == "static" ? BodySeed(generation) : generation;
+    }
+
     void SelectCase(size_t index);
     void BeginCase();
     void EndCase();

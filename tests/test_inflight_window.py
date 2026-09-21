@@ -80,7 +80,12 @@ class InflightTests(unittest.TestCase):
         parser = headers + "namespace rdma_bench {\n" + declarations + "}\n" + config_header + parser
         parser += """
 int main(int argc, char **argv) {
-    try { std::cout << rdma_bench::ParseOptions(argc, argv).maxInflight; return 0; }
+    try {
+        auto options = rdma_bench::ParseOptions(argc, argv);
+        if (std::getenv("TEST_SOURCE_UPDATE")) std::cout << options.sourceUpdate;
+        else std::cout << options.maxInflight;
+        return 0;
+    }
     catch (const std::exception &e) { std::cerr << e.what(); return 1; }
 }
 """
@@ -227,6 +232,15 @@ int main() {
             result = self.parse(extra=("--max-inflight", value))
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("--max-inflight", result.stderr)
+
+    def test_source_update_parser(self):
+        from unittest.mock import patch
+        with patch.dict(os.environ, TEST_SOURCE_UPDATE="1"):
+            self.assertEqual(self.parse().stdout, "markers")
+            for role in ("local", "remote"):
+                for mode in ("static", "markers"):
+                    self.assertEqual(self.parse(role=role, extra=("--source-update", mode)).stdout, mode)
+                self.assertNotEqual(self.parse(role=role, extra=("--source-update", "bad")).returncode, 0)
 
     def test_memory_options_are_process_local_and_strict(self):
         for role in ("local", "remote"):

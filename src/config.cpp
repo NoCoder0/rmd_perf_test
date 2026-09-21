@@ -170,6 +170,7 @@ void PrintUsage(std::ostream &stream)
            << "Remote SGL: --max-inflight N (default 0=unlimited, range 0..9600), data PutV requests per rail.\n"
            << "Payload: --memory-backend aligned|hugetlb (default aligned; Linux hugetlb has no fallback).\n"
            << "         --hugepage-kb N (hugetlb only; default from /proc/meminfo; power-of-two KiB).\n"
+           << "Source: --source-update static|markers (default markers; static freezes after verify rounds).\n"
            << "SGL scatter: one persistent app thread per rail, pinned by --app-cpus in rail order.\n"
            << "Singular --rdma-ip/--app-cpu/--worker-cpu remain aliases for links=1.\n"
            << "Options: --kind verify|measure|trace --verify-rounds N --warmup N --rounds N\n"
@@ -202,12 +203,12 @@ Options ParseOptions(int argc, char **argv)
     }
 
     Options options;
-    static const std::array<std::string, 27> kAllowedOptions = {
+    static const std::array<std::string, 28> kAllowedOptions = {
         "--role", "--rdma-ip", "--rdma-ips", "--listen", "--peer", "--kind", "--verify-rounds", "--warmup",
         "--rounds", "--trace-rounds", "--timeout-sec", "--app-cpu", "--app-cpus", "--worker-cpu",
         "--worker-cpus", "--links", "--mode", "--pipeline", "--blocks", "--block-bytes",
         "--block-start", "--block-end", "--block-step", "--notify-every-wrs", "--max-inflight",
-        "--memory-backend", "--hugepage-kb"};
+        "--memory-backend", "--hugepage-kb", "--source-update"};
     for (const auto &entry : values) {
         if (std::find(kAllowedOptions.begin(), kAllowedOptions.end(), entry.first) == kAllowedOptions.end()) {
             throw std::runtime_error("unknown option: " + entry.first);
@@ -226,6 +227,9 @@ Options ParseOptions(int argc, char **argv)
         return it == values.end() ? fallback : it->second;
     };
 
+    options.sourceUpdate = optional("--source-update", "markers");
+    if (options.sourceUpdate != "static" && options.sourceUpdate != "markers")
+        throw std::runtime_error("--source-update must be static or markers");
     const std::string backend = optional("--memory-backend", "aligned");
     if (backend == "hugetlb") options.memoryBackend = MemoryBackend::Hugetlb;
     else if (backend != "aligned") throw std::runtime_error("--memory-backend must be aligned or hugetlb");

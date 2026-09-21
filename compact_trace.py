@@ -308,6 +308,7 @@ def configuration(records, apps, role, errors, warnings):
             "warmup_rounds",
             "trace_rounds",
             "source_order",
+            "source_update",
             "memory_backend",
             "hugepage_kb_requested",
         )
@@ -329,11 +330,15 @@ def stage_metrics(apps, role, errors, warnings):
             ("callback_to_request_observed_us", "remote_request_received", "remote_request_observed"),
             ("request_copy_us", "remote_request_observed", "remote_request_copied"),
             ("request_parse_us", "remote_request_copied", "remote_request_decoded"),
-            ("source_prepare_us", "remote_request_decoded", "remote_source_prepared"),
+            ("source_prepare_us", "remote_source_prepare_begin" if times["remote_source_prepare_begin"]
+             else "remote_request_decoded", "remote_source_prepared"),
             ("requests_prepare_us", "remote_source_prepared", "remote_requests_prepared"),
         ],
     }
     row = {}
+    if role == "remote":
+        row["source_prepare_basis"] = ("prepare-only" if times["remote_source_prepare_begin"]
+                                       else "legacy-decoded-to-prepared")
     for metric, begin, end in pairs[role]:
         if not times[begin] or not times[end]:
             warnings.add("stage unavailable: " + metric)
@@ -505,6 +510,8 @@ def compact(records):
         if role == "local":
             row.update(scatter_metrics(selected, config, times, problems))
         else:
+            if "source_update" in config and not times["remote_source_prepare_begin"]:
+                problems.append("missing_source_prepare_begin")
             row.update(completion_metrics(posts, events, config["blocks"] * config["block_bytes"], problems))
             first = min((p["timestamp_ns"] for p, _, _ in posts if p["transfer_kind"] == "data"), default=None)
             for name, metric in (
